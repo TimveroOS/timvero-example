@@ -674,16 +674,6 @@
        foreign key (updated_by) 
        references auditor;
 
-    alter table if exists participant 
-       add constraint FKa8akyngsbkcpy4ev19q53x56h 
-       foreign key (application_id) 
-       references application;
-
-    alter table if exists participant 
-       add constraint FKcmejtugfqk653qthh0jalsx54 
-       foreign key (client_id) 
-       references client;
-
     alter table if exists user_account 
        add constraint FK6yeu84vklx3ex4omt5s7far5r 
        foreign key (created_by) 
