@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+    xmlns:th="http://www.thymeleaf.org">
+<div class="card-details" th:object="${entity}">
+
+<section>
+    <h4 th:text="#{participant.details}">Participant Details</h4>
+    <dl>
+        <dt th:text="#{participant.status}">Status</dt>
+        <dd th:text="*{#enums.name(status)}"></dd>
+        <dt th:text="#{participant.employment}">Employment</dt>
+        <dd th:text="*{#enums.name(employment)}"></dd>
+        <dt th:text="#{participant.howOftenIncomeIsPaid}">Income Frequency</dt>
+        <dd th:text="*{#enums.name(howOftenIncomeIsPaid)}"></dd>
+        <dt th:text="#{participant.githubUsername}">Income Frequency</dt>
+        <dd th:text="*{githubUsername}"></dd>
+    </dl>
+</section>
+<section>
+    <h4 th:text="#{participant.financialInfo}">Financial Information</h4>
+    <dl>
+        <th:block th:if="*{totalAnnualIncome}">
+            <dt th:text="#{participant.totalAnnualIncome}">Total Annual Income</dt>
+            <dd th:text="*{totalAnnualIncome}"></dd>
+        </th:block>
+        <th:block th:if="*{monthlyOutgoings}">
+            <dt th:text="#{participant.monthlyOutgoings}">Monthly Outgoings</dt>
+            <dd th:text="*{monthlyOutgoings}"></dd>
+        </th:block>
+    </dl>
+</section>
+<section>
+    <h4 th:text="#{participant.auditInfo}">Audit Information</h4>
+    <dl>
+        <dt th:text="#{common.createdAt}">Created At</dt>
+        <dd th:text="*{#ldates.format(createdAt)}"></dd>
+        <dt th:text="#{common.updatedAt}">Modified At</dt>
+        <dd th:text="*{#ldates.format(updatedAt)}"></dd>
+        <th:block th:if="*{createdBy}">
+            <dt th:text="#{common.createdBy}">Created By</dt>
+            <dd th:text="*{createdBy.name}"></dd>
+        </th:block>
+        <th:block th:if="*{updatedBy}">
+            <dt th:text="#{common.updatedBy}">Modified By</dt>
+            <dd th:text="*{updatedBy.name}"></dd>
+        </th:block>
+    </dl>
+</section>
+</div>
+
+</html>

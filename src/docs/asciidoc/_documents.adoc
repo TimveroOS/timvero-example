@@ -1,0 +1,153 @@
+= Document Management
+
+:sourcedir: ../../main/java
+
+This section describes how to implement document management functionality for entities in the platform, including document type associations and UI integration.
+
+== Document System Overview
+
+The document management system allows entities to have associated documents with configurable upload and requirement rules. The system consists of:
+
+* **`HasDocuments`** - Interface marking entities that can have documents
+* **`DocumentTypeAssociation`** - Configuration for document types per entity
+* **`EntityDocumentTabController`** - UI integration for document management tabs
+
+== Document Type Configuration
+
+Document types are configured using `DocumentTypeAssociation` with a builder pattern that allows defining uploadable and required document types with conditional logic.
+
+=== Document Type Associations
+
+==== Required Document Configuration
+
+Documents that must be uploaded based on entity conditions:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=23..33]
+----
+
+This configuration:
+* Makes `ID_SCAN` document required
+* Only applies when participant status is `NEW`
+* Only applies to participants with `GUARANTOR` or `BORROWER` roles
+
+==== Optional Document Configuration
+
+Documents that can be uploaded without restrictions:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=35..38]
+----
+
+This allows `OTHER` document type to be uploaded for any participant without conditions.
+
+=== Document Type Definitions
+
+Document types are defined as constants in the configuration:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=20..21]
+----
+
+== UI Integration
+
+=== Document Tab Implementation
+
+To display document management interface, create a tab controller extending `EntityDocumentTabController`:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/participant/tab/ParticipantDocumentsTab.java[]
+----
+
+Key features:
+* **`@Order(1500)`** - Controls tab display order in the UI
+* **`isVisible()`** - Determines when the tab should be shown
+* **Automatic functionality** - Upload, download, and delete operations are handled automatically
+
+=== Entity Requirements
+
+Entities must implement the `HasDocuments` interface:
+
+[source,java]
+----
+public interface HasDocuments extends Persistable<UUID> {
+    // No additional methods required
+}
+----
+
+== Builder Pattern Usage
+
+The `DocumentTypeAssociation` uses a fluent builder pattern:
+
+=== Available Methods
+
+* **`uploadable(EntityDocumentType)`** - Adds a document type that can be uploaded
+* **`required(EntityDocumentType)`** - Adds a document type that must be uploaded
+* **`predicate(Predicate<E>)`** - Adds conditional logic for when the association applies
+
+=== Predicate Chaining
+
+Multiple predicates can be combined:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=21..25]
+----
+
+Predicates are combined using AND logic - all conditions must be true.
+
+== Complete Implementation Example
+
+To implement document management for an entity:
+
+1. **Entity implements HasDocuments**:
+[source,java]
+----
+@Entity
+public class Participant implements HasDocuments {
+    // Entity implementation
+}
+----
+
+2. **Create document type configuration**:
+[source,java]
+----
+@Configuration
+public class ParticipantDocumentTypesConfiguration {
+    
+    @Bean
+    DocumentTypeAssociation<Participant> requiredDocuments() {
+        return DocumentTypeAssociation.forEntityClass(Participant.class)
+            .required(ID_SCAN)
+            .predicate(participant -> participant.getStatus() == ParticipantStatus.NEW)
+            .build();
+    }
+    
+    @Bean
+    DocumentTypeAssociation<Participant> optionalDocuments() {
+        return DocumentTypeAssociation.forEntityClass(Participant.class)
+            .uploadable(OTHER)
+            .build();
+    }
+}
+----
+
+3. **Create document tab controller**:
+[source,java]
+----
+@Controller
+@Order(1500)
+public class ParticipantDocumentsTab extends EntityDocumentTabController<Participant> {
+    
+    @Override
+    public boolean isVisible(Participant entity) {
+        return true; // Always show documents tab
+    }
+}
+----
+
+This provides a complete document management system with conditional requirements and integrated UI.

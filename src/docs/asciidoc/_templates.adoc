@@ -1,0 +1,495 @@
+= HTML Template Integration
+
+:templatedir: ../../main/resources/templates
+
+This section describes how form classes integrate with HTML templates using Thymeleaf for rendering user interfaces.
+
+== Template Structure
+
+The application uses Thymeleaf templates to render forms with automatic data binding and validation integration.
+
+=== Client Form Template
+
+The client edit form demonstrates nested form structure:
+
+[source,html]
+----
+include::{templatedir}/client/edit.html[tags=client-form-fields]
+----
+
+Key features:
+* **Nested field access**: Uses dot notation like `individualInfo.fullName`
+* **Validation classes**: CSS classes for client-side validation (`v-required`, `v-email`)
+* **Component reuse**: Uses Thymeleaf fragments for consistent field rendering
+
+=== Application Form Template
+
+The application edit form shows financial data handling:
+
+[source,html]
+----
+include::{templatedir}/application/edit.html[tags=application-form-fields]
+----
+
+Features:
+* **Enum handling**: Select dropdowns for `employment` and `periodicities`
+* **Monetary amounts**: Special `amount` component for financial fields
+* **Nested participant**: Access to `borrowerParticipant` fields
+
+== Form Component System
+
+The platform uses Thymeleaf fragments for consistent form rendering across all forms. These components are defined in `/form/components.html` and provide standardized UI elements with built-in validation support.
+
+=== Available Form Components
+
+==== Text Input Component
+[source,html]
+----
+~{/form/components :: text(name, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the input field (e.g., `#{client.individualInfo.fullName}`)
+
+|`fieldname`
+|String
+|Field path for data binding (e.g., `'individualInfo.fullName'`)
+
+|`inputclass`
+|String
+|CSS validation classes (e.g., `'v-required v-armenian-name'`)
+|===
+
+.Additional Variables
+* `maxlength` - Maximum character limit (default: 256)
+* `minlength` - Minimum character limit (default: 0)
+* `placeholder` - Placeholder text for the input field
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: text(
+    #{client.individualInfo.fullName},
+    'individualInfo.fullName', 
+    'v-required v-armenian-name')}"
+    th:with="maxlength = 120, placeholder = #{placeholder.fullName}" />
+----
+
+==== Select Dropdown Component
+[source,html]
+----
+~{/form/components :: select(name, fieldname, values)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the select field
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`values`
+|Collection/Map
+|Options data (Map for key-value pairs, Collection for simple lists)
+|===
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: select(
+    #{client.address.stateOfResidence},
+    'individualInfo.residenceCountry', 
+    ${countries})}" />
+----
+
+==== Date Picker Component
+[source,html]
+----
+~{/form/components :: date(name, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the date field
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`inputclass`
+|String
+|CSS validation classes (optional)
+|===
+
+.Additional Variables
+* `maxDate` - Maximum selectable date
+* `minDate` - Minimum selectable date
+* `startDate` - Default selected date
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: date(
+    #{client.individualInfo.birthDate},
+    'individualInfo.dateOfBirth', 
+    'v-required')}"
+    th:with="maxDate = ${#dates.format(#dates.createNow())}" />
+----
+
+==== Amount/Currency Component
+[source,html]
+----
+~{/form/components :: amount(name, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the amount field
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`inputclass`
+|String
+|CSS validation classes (e.g., `'v-required v-positive'`)
+|===
+
+.Additional Variables
+* `inputAmountPrefix` - Prefix for field IDs (optional)
+* `currencies` - Available currency options
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: amount(
+    #{participant.totalAnnualIncome},
+    'borrowerParticipant.totalAnnualIncome', 
+    'v-required v-armenian-tax-id')}" />
+----
+
+==== Checkbox Component
+[source,html]
+----
+~{/form/components :: checkbox(name, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the checkbox
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`inputclass`
+|String
+|CSS classes for styling/validation
+|===
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: checkbox(
+    #{client.agreeToTerms},
+    'agreeToTerms', 
+    'v-required')}" />
+----
+
+==== Textarea Component
+[source,html]
+----
+~{/form/components :: textarea(name, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the textarea
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`inputclass`
+|String
+|CSS validation classes
+|===
+
+.Additional Variables
+* `rows` - Number of textarea rows (default: 5)
+* `maxlength` - Maximum character limit
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: textarea(
+    #{application.comments},
+    'comments', 
+    'v-required')}"
+    th:with="rows = 3, maxlength = 500" />
+----
+
+==== Radio Button Component
+[source,html]
+----
+~{/form/components :: radio(name, fieldname, params)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the radio group
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`params`
+|Map
+|Key-value pairs for radio options
+|===
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: radio(
+    #{client.gender},
+    'gender', 
+    ${genderOptions})}" />
+----
+
+==== File Upload Component
+[source,html]
+----
+~{/form/components :: fileInput(name, filelabel, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the file input
+
+|`filelabel`
+|String
+|Button text for file selection
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`inputclass`
+|String
+|CSS classes for styling/validation
+|===
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: fileInput(
+    #{document.upload},
+    #{button.chooseFile},
+    'documentFile', 
+    'v-required')}" />
+----
+
+==== Read-only Component
+[source,html]
+----
+~{/form/components :: readonly(name, fieldname, inputclass)}
+----
+
+.Parameters
+[cols="1,2,3"]
+|===
+|Parameter |Type |Description
+
+|`name`
+|String (i18n key)
+|Label text for the read-only field
+
+|`fieldname`
+|String
+|Field path for data binding
+
+|`inputclass`
+|String
+|CSS classes for styling
+|===
+
+.Usage Example
+[source,html]
+----
+<th:block th:insert="~{/form/components :: readonly(
+    #{client.id},
+    'id', 
+    '')}" />
+----
+
+=== Component Benefits
+
+This component system ensures:
+* **Consistency**: All forms use the same styling and behavior
+* **Maintainability**: Changes to form components affect all forms
+* **Validation Integration**: Client-side validation works seamlessly
+* **Accessibility**: Standard form components ensure accessibility compliance
+* **Internationalization**: Built-in support for i18n message keys
+* **Reusability**: Components can be used across different forms and contexts
+
+== Client-Side Validation Classes
+
+The platform provides CSS-based validation classes that integrate with jQuery Validation for client-side form validation:
+
+=== Standard Validation Classes
+
+.Built-in Validation Rules
+[cols="1,3,2"]
+|===
+|CSS Class |Description |Usage Example
+
+|`v-required`
+|Field is mandatory and cannot be empty
+|`'individualInfo.fullName', 'v-required v-name'`
+
+|`v-number`
+|Field must contain a valid number
+|`'amount', 'v-number'`
+
+|`v-digits`
+|Field must contain only digits (0-9)
+|`'quantity', 'v-digits'`
+
+|`v-email`
+|Field must contain a valid email address
+|`'contactInfo.email', 'v-required v-email'`
+
+|`v-url`
+|Field must contain a valid URL
+|`'website', 'v-url'`
+
+|`v-phone`
+|Field must contain a valid phone number
+|`'contactInfo.phone', 'v-required v-phone'`
+
+|`v-positive`
+|Field must contain a positive number (> 0)
+|`'totalAnnualIncome', 'v-required v-positive'`
+
+|`v-name`
+|Field must contain valid name characters (letters, spaces, hyphens, apostrophes), max 256 characters
+|`'individualInfo.fullName', 'v-required v-name'`
+|===
+
+=== Custom Validation Methods
+
+The platform extends jQuery Validation with custom validation methods:
+
+.Custom Validators
+[source,javascript]
+----
+// Armenian name validation (Armenian letters, spaces, hyphens only)
+$.validator.addMethod('armenianName', function(value, element) {
+  const ARMENIAN_NAME_REGEX = /^[\u0531-\u0556\u0561-\u0587\s\-']+$/;
+  return this.optional(element) || ARMENIAN_NAME_REGEX.test(value);
+});
+
+// Tax identification number validation (Armenian format)
+$.validator.addMethod('armenianTaxId', function(value, element) {
+  const TAX_ID_REGEX = /^\d{8}$/;
+  return this.optional(element) || TAX_ID_REGEX.test(value);
+});
+
+// Armenian postal code validation
+$.validator.addMethod('armenianPostal', function(value, element) {
+  const POSTAL_REGEX = /^\d{4}$/;
+  return this.optional(element) || POSTAL_REGEX.test(value);
+});
+----
+
+=== Validation Class Rules Mapping
+
+The CSS classes are mapped to validation rules using jQuery Validation:
+
+.Class Rules Configuration
+[source,javascript]
+----
+$.validator.addClassRules({
+  'v-armenian-name': {armenianName: true, maxlength: 256},
+  'v-armenian-tax-id': {armenianTaxId: true},
+  'v-armenian-postal': {armenianPostal: true},
+});
+----
+
+=== Usage in Templates
+
+Validation classes are applied as the third parameter in form component calls:
+
+.Template Usage Examples
+[source,html]
+----
+<!-- Required text field with name validation -->
+<th:block th:insert="~{/form/components :: text(
+  #{client.individualInfo.fullName},
+  'individualInfo.fullName', 
+  'v-required v-name')}" />
+
+<!-- Required email field -->
+<th:block th:insert="~{/form/components :: text(
+  #{client.contactInfo.email},
+  'contactInfo.email', 
+  'v-required v-email')}" />
+
+<!-- Required positive amount field -->
+<th:block th:insert="~{/form/components :: amount(
+  #{participant.totalAnnualIncome},
+  'borrowerParticipant.totalAnnualIncome', 
+  'v-required v-positive')}" />
+----
+
+=== Combining Validation Classes
+
+Multiple validation classes can be combined using space separation:
+
+* `'v-required v-email'` - Required email field
+* `'v-required v-name'` - Required name field with character validation
+* `'v-required v-positive'` - Required positive number field
+* `'v-number v-positive'` - Optional positive number field

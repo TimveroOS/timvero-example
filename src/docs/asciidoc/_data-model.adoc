@@ -1,0 +1,109 @@
+= Data model setup
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:migrationdir: ../../main/resources/db/migration
+
+This section describes how to set up and manage the data model using SQL file autogeneration and Flyway migrations.
+
+== SQL File Autogeneration
+
+The platform automatically generates SQL files based on your entity definitions. This process creates the necessary database schema files that can be used with Flyway for database migrations.
+
+=== Automatic Generation Process
+
+After the class is configured, run the application. The system will analyze changes in the data model of Java classes and generate an SQL script with the necessary changes `V241012192920.sql` in the project's home directory (`application.home=_path_`), in the subdirectory `hbm2ddl`.
+
+The generation process works as follows:
+
+1. **Entity Analysis**: The system scans all JPA entity classes for changes
+2. **Schema Comparison**: Compares current entity definitions with the existing database schema
+3. **SQL Generation**: Creates appropriate DDL statements (CREATE, ALTER, DROP) for detected changes
+4. **File Creation**: Generates timestamped migration files in the `hbm2ddl` directory
+5. **Migration Integration**: Files can be moved to Flyway migration directory for deployment
+
+=== Entity Definition Example
+
+Let's look at the `Participant` entity as an example:
+
+[source,java]
+----
+include::{sourcedir}/participant/entity/Participant.java[tags=entity]
+    // getters and setters...
+}
+----
+
+=== Enum Definitions
+
+The entity uses several enums that define the possible values:
+
+.ParticipantStatus enum
+[source,java]
+----
+include::{sourcedir}/participant/entity/ParticipantStatus.java[tags=enum]
+----
+
+.Employment enum
+[source,java]
+----
+include::{sourcedir}/participant/entity/Employment.java[tags=enum]
+----
+
+.Periodicity enum
+[source,java]
+----
+include::{sourcedir}/participant/entity/Periodicity.java[tags=enum]
+----
+
+== Flyway Migration Integration
+
+=== Migration File Structure
+
+Flyway migration files are stored in the `src/main/resources/db/migration/` directory and follow the naming convention:
+
+----
+V{version}__{description}.sql
+----
+
+For example:
+----
+V250530170222__init.sql
+V250609220043__participantStatus.sql
+----
+
+=== Generated SQL Example
+
+Based on the `Participant` entity definition, the system generates the following SQL:
+
+[source,sql]
+----
+include::{migrationdir}/V250530170222__init.sql[tags=participant-table]
+----
+
+=== Migration Workflow
+
+1. **Entity Definition**: Define your entity classes with appropriate JPA annotations
+2. **Application Execution**: Run the application to trigger the automatic analysis process
+3. **SQL Autogeneration**: The platform analyzes entity changes and generates SQL scripts in the `hbm2ddl` subdirectory
+4. **Migration File Preparation**: Move generated SQL files from `hbm2ddl` to the Flyway migration directory (`src/main/resources/db/migration/`)
+5. **File Naming**: Rename files to follow Flyway convention: `V{version}__{description}.sql`
+6. **Flyway Execution**: During application startup, Flyway executes pending migrations in version order
+7. **Schema Versioning**: Database schema version is tracked automatically in the `schema_version` table
+
+=== Best Practices
+
+* **Incremental Changes**: Create separate migration files for each schema change
+* **Descriptive Names**: Use clear, descriptive names for migration files
+* **Testing**: Test migrations on development environments before production
+* **Rollback Strategy**: Consider rollback scenarios when designing schema changes
+
+=== Migration File Example
+
+Here's an actual migration file that adds participant status functionality:
+
+.V250609220043__participantStatus.sql
+[source,sql]
+----
+include::{migrationdir}/V250609220043__participantStatus.sql[tags=add-status-column]
+----
+
+This approach ensures that your database schema evolves in a controlled, versioned manner while maintaining data integrity throughout the development lifecycle.

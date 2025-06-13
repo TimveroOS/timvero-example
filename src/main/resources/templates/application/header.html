@@ -1,0 +1,33 @@
+<th:block xmlns="http://www.w3.org/1999/xhtml"
+    xmlns:th="http://www.thymeleaf.org">
+    <div class="d-flex align-items-center justify-content-between">
+        <div class="d-flex align-items-center gap-20">
+            <h2 class="header__title" th:text="${entity.displayedName}"></h2>
+            <th:block
+                th:insert="~{/templates/copyButton :: copyButton('Copy ID', ${entity.id})}" />
+        </div>
+        <div class="header-right d-flex align-items-center">
+            <p class="participants__date"
+                th:text="${#ldates.format(entity.createdAt, 'dd MMM yyyy')}">Jan
+                9, 2024 12:23</p>
+            <button
+                class="dialog-btn js-toggle-notes d-flex justify-content-center align-items-center"
+                type="button">
+                <svg class="dialog-btn__icon"
+                    xmlns="http://www.w3.org/2000/svg" width="18"
+                    height="18" viewBox="0 0 18 18" fill="none">
+                  <path
+                        d="M3.96618 13.5054L4.56517 13.8677L4.85268 13.3922L4.45491 13.0043L3.96618 13.5054ZM2.527 15.8854L1.928 15.5231H1.928L2.527 15.8854ZM2.9897 16.4656L3.2095 17.1302L3.20951 17.1302L2.9897 16.4656ZM6.72161 15.2313L6.95889 14.5728L6.73139 14.4908L6.50181 14.5668L6.72161 15.2313ZM16.3 8.08284C16.3 11.8901 13.1879 14.9858 9.33728 14.9858V16.3858C13.9507 16.3858 17.7 12.6736 17.7 8.08284H16.3ZM9.33728 2.2C11.3288 2.2 13.0787 2.76141 14.3156 3.7612C15.5371 4.74852 16.3 6.19378 16.3 8.08284H17.7C17.7 5.7729 16.7475 3.92674 15.1957 2.6724C13.6592 1.43051 11.5777 0.8 9.33728 0.8V2.2ZM2.37456 8.08284C2.37456 6.19378 3.13745 4.74852 4.35895 3.7612C5.59587 2.76141 7.34572 2.2 9.33728 2.2V0.8C7.09683 0.8 5.01532 1.43051 3.47889 2.6724C1.92703 3.92674 0.974561 5.7729 0.974561 8.08284H2.37456ZM4.45491 13.0043C3.16938 11.7506 2.37456 10.0089 2.37456 8.08284H0.974561C0.974561 10.4033 1.93412 12.5015 3.47745 14.0066L4.45491 13.0043ZM3.12599 16.2476L4.56517 13.8677L3.36718 13.1432L1.928 15.5231L3.12599 16.2476ZM2.7699 15.801C3.03839 15.7122 3.27234 16.0056 3.12599 16.2476L1.928 15.5231C1.40136 16.394 2.24325 17.4498 3.2095 17.1302L2.7699 15.801ZM6.50181 14.5668L2.7699 15.801L3.20951 17.1302L6.94142 15.8959L6.50181 14.5668ZM9.33728 14.9858C8.50065 14.9858 7.70003 14.8398 6.95889 14.5728L6.48433 15.8899C7.37561 16.211 8.33669 16.3858 9.33728 16.3858V14.9858Z"
+                        fill="#8E8F92"></path>
+                </svg>
+            </button>
+            <div class="entity__actions">
+                <th:block
+                    th:insert="~{/common/action/bar :: buttons(${actions})}" />
+            </div>
+            <script
+                th:data-src="@{/assets/static/js/actions-handler.js}"></script>
+        </div>
+    </div>
+</th:block>
+

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org"
+>
+<body>
+<table class="rui-datatable table">
+    <thead class="table-small-cells">
+        <tr role="row">
+            <th data-sortField="id" th:text="#{symbol.id}">#</th>
+            <th data-sortField="login" th:text="#{user.login}">Логин</th>
+            <th data-sortField="fullName" th:text="#{user.fullName}">Имя</th>
+            <th data-sortField="email" th:text="#{user.email}">E-mail</th>
+            <th data-sortField="role" th:text="#{user.role}">Роль в системе</th>
+            <th data-sortField="active" th:text="#{user.status}">Статус</th>
+        </tr>
+    </thead>
+    <tbody class="table-small-cells" th:attr="data-page=${page.page},data-total=${page.total}">
+        <tr
+            th:each="entity,iterStat : ${page.rows}"
+            th:href="@{${rootPath}+'/'+${entity.id}}"
+            th:object="${entity}"
+            role="row"
+            class="clickable"
+        >
+            <td th:text="*{id}"></td>
+            <td th:text="*{login}"></td>
+            <td th:text="*{fullName}"></td>
+            <td th:text="*{email}"></td>
+            <td th:text="${entity.role.name}"></td>
+            <td th:text="*{active} ? #{mark.active} : #{mark.inactive}"></td>
+        </tr>
+    </tbody>
+</table>
+</body>
+</html>

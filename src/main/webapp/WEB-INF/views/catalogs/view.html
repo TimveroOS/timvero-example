@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html th:include="~{/templates/layout :: page}"
+      th:with="pageName = #{menu.catalog}"
+      xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:sec="http://www.thymeleaf.org/thymeleaf-extras-springsecurity5"
+      xmlns:th="http://www.thymeleaf.org"
+>
+<th:block th:fragment="content">
+    <div class="reference-rate-wrapper">
+        <ul class="nav nav-tabs js-tabs-sliding" role="tablist">
+            <li class="nav-item active" sec:authorize="hasRole('REFERENCE_RATE_VIEW')">
+                <a
+                    aria-controls="reference-rate-tab"
+                    class="nav-link rui-tabs-link active"
+                    data-toggle="tab"
+                    href="#reference-rate-tab"
+                    id="reference-rate"
+                    th:text="#{menu.referenceRate}"
+                >
+                    Decline reason
+                </a>
+            </li>
+        <li class="nav-item">
+            <a
+                aria-controls="product-category-tab"
+                class="nav-link rui-tabs-link"
+                data-toggle="tab"
+                href="#product-category-tab"
+                id="product-category"
+                th:text="#{menu.productCategory}"
+            >
+                Active Properties
+            </a>
+        </li>
+        </ul>
+        <div class="tab-content main-tab-content p-0">
+            <div
+                aria-labelledby="reference-rate-tab"
+                class="tab-pane show active"
+                data-url="/reference-rate"
+                id="reference-rate-tab"
+                role="tabpanel"
+                sec:authorize="hasRole('REFERENCE_RATE_VIEW')"
+        >
+        </div>
+        <div
+            aria-labelledby="product-category-tab"
+            class="tab-pane"
+            data-url="/product-category"
+            id="product-category-tab"
+            role="tabpanel"
+            sec:authorize="hasRole('PRODUCT_CATEGORY_VIEW')"
+            >
+            </div>
+        </div>
+    </div>
+</th:block>
+</html>

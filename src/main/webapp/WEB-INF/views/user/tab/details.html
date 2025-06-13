@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<th:block th:object="${entity}">
+    <div class="card-info-wrapper card-body d-flex">
+        <div class="card-info d-flex">
+            <ul class="card-info__body d-flex">
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{user.fullName}"
+                        th:title="#{user.fullName}"
+                    >Credit Product</span>
+                    <span class="card-info__value" th:text="*{fullName}"></span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{user.email}"
+                        th:title="#{user.email}"
+                    >Loan Amount</span>
+                    <span class="card-info__value" th:text="*{email}">USD15,000.00</span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{common.created.by}"
+                        th:title="#{common.created.by}"
+                    >Interest rate</span>
+                    <span class="card-info__value" th:text="*{createdBy?.name}">3.99 %</span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{user.role}"
+                        th:title="#{user.role}"
+                    >Interest rate</span>
+                    <span class="card-info__value" th:text="*{role.name}">3.99 %</span>
+                </li>
+            </ul>
+        </div>
+        <div class="card-info d-flex">
+            <ul class="card-info__body d-flex">
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{common.createdAt}"
+                        th:title="#{common.createdAt}"
+                    >Loan Amount</span>
+                    <span class="card-info__value" th:text="*{#ldates.format(createdAt)}">USD15,000.00</span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{user.login}"
+                        th:title="#{user.login}"
+                    >Interest rate</span>
+                    <span class="card-info__value" th:text="*{login}">3.99 %</span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span
+                        class="card-info__property"
+                        th:text="#{user.status}"
+                        th:title="#{user.status}"
+                    >Interest rate</span>
+                    <span class="card-info__value" th:text="*{active} ? #{mark.active} : #{mark.inactive}">3.99 %</span>
+                </li>
+            </ul>
+        </div>
+    </div>
+</th:block>
+</html>

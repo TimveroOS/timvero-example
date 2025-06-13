@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org"
+>
+<table class="rui-datatable table">
+    <thead>
+        <tr role="row">
+            <th data-sortField="id" th:text="#{common.id}"></th>
+            <th th:text="#{client.name}">Name</th>
+            <th th:text="#{client.individualInfo.nationalId}">National ID</th>
+            <th data-sortField="status" th:text="#{client.contactInfo.phone}">Phone</th>
+            <th th:text="#{client.contactInfo.email}">Email</th>
+            <th th:text="#{common.createdAt}">Created at</th>
+        </tr>
+    </thead>
+    <tbody th:attr="data-page=${page.page},data-total=${page.total}">
+        <tr
+            th:each="entity, iterStat : ${page.rows}"
+            th:href="@{${rootPath}+'/'+${entity.id}}"
+            th:object="${entity}"
+            role="row"
+            class="clickable"
+        >
+            <td>
+                <span class="d-flex justify-content-start" th:text="*{#strings.substring(id, 0, 6)}"></span>
+            </td>
+            <td th:text="*{displayedName}"></td>
+            <td th:text="*{individualInfo.nationalId}"></td>
+            <td th:text="*{mainNotificationPhone}"></td>
+            <td th:text="*{notificationEmail}"></td>
+            <td th:text="*{#ldates.format(createdAt)}"></td>
+        </tr>
+    </tbody>
+</table>
+</html>

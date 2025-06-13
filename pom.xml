@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.timvero.pumpkin</groupId>
+        <artifactId>pumpkin</artifactId>
+        <version>8.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>example</artifactId>
+    <version>8.0</version>
+    <packaging>war</packaging>
+
+    <name>Timvero SKD Example</name>
+    <description>An example project that demonstrates how to use Timvero SKD.</description>
+
+    <properties>
+        <build.number>_</build.number>
+        <build.version>${project.version}.{build.number}</build.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <asciidoctor.maven.plugin.version>3.1.1</asciidoctor.maven.plugin.version>
+        <asciidoctorj.version>3.0.0</asciidoctorj.version>
+        <jruby.version>9.4.9.0</jruby.version>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>maven.timvero.xyz</id>
+            <name>Timvero Repository</name>
+            <url>https://maven.timvero.xyz/releases</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <!-- Core-->
+        <dependency>
+            <groupId>com.timvero.pumpkin</groupId>
+            <artifactId>web</artifactId>
+            <version>${project.parent.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.timvero.pumpkin</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.parent.version}</version>
+        </dependency>
+        
+        <dependency>
+            <groupId>com.timvero.pumpkin</groupId>
+            <artifactId>origination</artifactId>
+            <version>${project.parent.version}</version>
+        </dependency>
+        
+        <!-- Core impl -->
+        <dependency>
+            <groupId>org.hibernate.search</groupId>
+            <artifactId>hibernate-search-mapper-orm</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.hibernate.search</groupId>
+            <artifactId>hibernate-search-backend-lucene</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.pebbletemplates</groupId>
+            <artifactId>pebble</artifactId>
+        </dependency>
+
+        <!-- Test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <defaultGoal>process-resources</defaultGoal>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+                            <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
+                        </manifest>
+                        <manifestEntries>
+                            <Implementation-Version>${build.version}</Implementation-Version>
+                        </manifestEntries>
+                    </archive>
+                    <warName>${project.artifactId}</warName>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.asciidoctor</groupId>
+                <artifactId>asciidoctor-maven-plugin</artifactId>
+                <version>${asciidoctor.maven.plugin.version}</version>
+                <dependencies>
+                    <!-- Comment this section to use the default jruby artifact
+                    provided by the plugin -->
+                    <dependency>
+                        <groupId>org.jruby</groupId>
+                        <artifactId>jruby</artifactId>
+                        <version>${jruby.version}</version>
+                    </dependency>
+                    <!-- Comment this section to use the default AsciidoctorJ
+                    artifact provided by the plugin -->
+                    <dependency>
+                        <groupId>org.asciidoctor</groupId>
+                        <artifactId>asciidoctorj</artifactId>
+                        <version>${asciidoctorj.version}</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <sourceDirectory>src/docs/asciidoc</sourceDirectory>
+                    <!-- If you set baseDir to ${project.basedir}, top-level
+                    includes are resolved relative to the project root -->
+                    <!--
+                    <baseDir>${project.basedir}</baseDir>
+                    -->
+                    <!-- Attributes common to all output formats -->
+                    <attributes>
+                        <endpoint-url>https://example.org</endpoint-url>
+                        <sourcedir>${project.build.sourceDirectory}</sourcedir>
+                        <project-version>${project.version}</project-version>
+                    </attributes>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>asciidoc-to-html</id>
+                        <phase>generate-resources</phase>
+                        <goals>
+                            <goal>process-asciidoc</goal>
+                        </goals>
+                        <configuration>
+                            <backend>html5</backend>
+                            <!--
+                            Scenarios for linking vs embedding assets:
+
+                            Link to both stylesheets and images::
+
+                              - don't set embedAssets option
+                              - set linkcss attribute to true
+                              - set imagesdir attribute to path relative to AsciiDoc source file
+
+                              <attributes>
+                                  <linkcss>true</linkcss>
+                                  <imagesdir>./images</imagesdir>
+                              </attributes>
+
+                            Embed stylesheets and images::
+
+                              - set embedAssets option to true
+                              - don't set linkcss attribute
+                              - set imagesdir attribute to path relative to project root
+
+                              <embedAssets>true</embedAssets>
+                              <attributes>
+                                  <imagesdir>src/docs/asciidoc/images</imagesdir>
+                              </attributes>
+
+                            Link to stylesheets but embed images::
+
+                              - set embedAssets option to true
+                              - set linkcss attribute to true
+                              - set imagesdir attribute to path relative to project root
+
+                              <embedAssets>true</embedAssets>
+                              <attributes>
+                                  <linkcss>true</linkcss>
+                                  <imagesdir>src/docs/asciidoc/images</imagesdir>
+                              </attributes>
+
+                            Embed stylesheets but link images (default)::
+
+                              - don't set embedAssets option
+                              - don't set linkcss attribute
+                              - set imagesdir attribute to path relative to AsciiDoc source file
+
+                              <attributes>
+                                  <imagesdir>./images</imagesdir>
+                              </attributes>
+
+                            IMPORTANT: When you enable image embedding, you must qualify the path with
+                            imagesdir, as shown above.
+                            -->
+                            <attributes>
+                                <source-highlighter>rouge</source-highlighter>
+                                <imagesdir>./images</imagesdir>
+                                <toc>left</toc>
+                                <icons>font</icons>
+                                <sectanchors>true</sectanchors>
+                                <!-- set the idprefix to blank -->
+                                <idprefix />
+                                <idseparator>-</idseparator>
+                                <docinfo1>true</docinfo1>
+                            </attributes>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!--
+            NOTE: Use the maven-resources-plugin if there are assets outside the AsciiDoc
+            source folder
+                  that need to be copied to the generated-docs. The Maven plugin automatically
+            copies
+                  non-AsciiDoc files in the AsciiDoc source folder to generated-docs.
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>2.6</version>
+                <executions>
+                    <execution>
+                        <id>copy-asciidoc-resources</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <resources>
+                                <resource>
+                                    <directory>src/docs/resources</directory>
+                                    <includes>
+                                        <include>**/*.jpg</include>
+                                        <include>**/*.png</include>
+                                    </includes>
+                                </resource>
+                            </resources>
+                            <outputDirectory>target/generated-docs</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            -->
+        </plugins>
+    </build>
+</project>

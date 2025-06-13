@@ -1,0 +1,174 @@
+= Form classes setup and usage
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:templatedir: ../../main/resources/templates
+
+This section describes how to set up and manage form classes for data input validation and processing in the application.
+
+== Form Class Architecture
+
+The platform uses form classes to handle user input validation, data binding, and form processing. Form classes serve as DTOs (Data Transfer Objects) that define the structure and validation rules for user interfaces.
+
+=== Form Class Hierarchy
+
+The application uses a hierarchical form structure:
+
+* **Main Forms**: Top-level forms like `ClientForm` and `ApplicationForm`
+* **Nested Forms**: Component forms like `IndividualInfoForm` and `ContactInfoForm`
+* **Validation**: Bean Validation (JSR-303) annotations for field validation
+
+=== Form Class Examples
+
+==== ClientForm Structure
+
+The `ClientForm` class handles client registration and profile management:
+
+[source,java]
+----
+include::{sourcedir}/client/form/ClientForm.java[tags=client-form]
+----
+
+==== ApplicationForm Structure
+
+The `ApplicationForm` class manages loan application data:
+
+[source,java]
+----
+include::{sourcedir}/application/form/ApplicationForm.java[tags=application-form]
+----
+
+==== Nested Form Components
+
+===== IndividualInfoForm
+
+Personal information component:
+
+[source,java]
+----
+include::{sourcedir}/client/form/IndividualInfoForm.java[tags=individual-info-form]
+----
+
+===== ContactInfoForm
+
+Contact information component:
+
+[source,java]
+----
+include::{sourcedir}/client/form/ContactInfoForm.java[tags=contact-info-form]
+----
+
+===== ParticipantForm
+
+Financial participant information:
+
+[source,java]
+----
+include::{sourcedir}/participant/form/ParticipantForm.java[tags=participant-form]
+----
+
+=== Validation Annotations Used
+
+The form classes use standard Bean Validation (JSR-303) annotations:
+
+.Validation Annotations in Use
+[source,java]
+----
+@NotNull          // Field cannot be null
+@NotBlank         // String field cannot be null, empty, or whitespace only
+@Email            // Valid email format
+@PastOrPresent    // Date must be in the past or present
+@Valid            // Cascade validation to nested objects
+@Phone            // Custom phone validation (platform-specific)
+----
+
+== Form Processing Architecture
+
+=== Action Classes
+
+The platform uses generic action classes to handle form operations:
+
+.Generic Action Structure
+[source,java]
+----
+include::{sourcedir}/client/action/CreateClientAction.java[tags=action-class]
+include::{sourcedir}/client/action/EditClientAction.java[tags=action-class]
+----
+
+These actions are parameterized with:
+* **ID Type**: `UUID` - The entity identifier type
+* **Entity Type**: `Client` - The JPA entity class
+* **Form Type**: `ClientForm` - The form DTO class
+
+=== Form Service Layer
+
+Actions delegate form processing to specialized service classes:
+
+.EntityFormService Usage
+[source,java]
+----
+include::{sourcedir}/client/form/ClientFormService.java[tags=form-service]
+----
+
+The `EntityFormService` provides:
+* **Entity to Form mapping**: Converting entities to form objects for editing
+* **Form to Entity mapping**: Converting form submissions to entity objects
+* **Validation integration**: Coordinating with Bean Validation
+* **Persistence operations**: Saving and updating entities
+
+=== MapStruct Mappers
+
+Form-to-entity conversion is handled by MapStruct mappers:
+
+.Mapper Structure
+[source,java]
+----
+include::{sourcedir}/client/form/ClientFormMapper.java[tags=mapper]
+include::{sourcedir}/application/form/ApplicationFormMapper.java[tags=mapper]
+include::{sourcedir}/participant/form/ParticipantFormMapper.java[tags=mapper]
+----
+
+MapStruct automatically generates implementation classes that provide:
+* **Bidirectional mapping**: Entity ↔ Form conversion
+* **Nested object mapping**: Automatic handling of complex object structures
+* **Type conversion**: Automatic conversion between compatible types
+* **Null handling**: Safe mapping of optional fields
+
+For detailed information about MapStruct features and configuration, see the https://mapstruct.org/documentation/stable/reference/html/[official MapStruct documentation].
+
+=== Processing Flow
+
+The complete form processing flow:
+
+1. **Action Invocation**: `CreateClientAction` or `EditClientAction` is called
+2. **Service Delegation**: Action delegates to `ClientFormService`
+3. **Mapper Usage**: Service uses `ClientFormMapper` for conversions
+4. **Entity Operations**: Service performs database operations
+5. **Response Generation**: Converted data is returned to the controller
+
+.Example Flow for Edit Operation
+----
+EditClientAction<UUID, Client, ClientForm>
+    ↓
+ClientFormService.prepareEditModel(UUID id)
+    ↓
+ClientFormMapper.entityToForm(Client entity)
+    ↓
+ClientForm (ready for template rendering)
+----
+
+.Example Flow for Save Operation
+----
+CreateClientAction<UUID, Client, ClientForm>
+    ↓
+ClientFormService.save(ClientForm form)
+    ↓
+ClientFormMapper.formToEntity(ClientForm form)
+    ↓
+Client entity (persisted to database)
+----
+
+== Template Integration
+
+Form classes integrate with HTML templates using Thymeleaf for rendering user interfaces. The templates use nested field access (dot notation) and reusable form components for consistent styling and validation.
+
+For detailed information about HTML template integration, form components, and Thymeleaf usage, see <<_html_template_integration>>.

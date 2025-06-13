@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+    xmlns:th="http://www.thymeleaf.org">
+<div class="card-details" th:object="${entity}">
+    <section>
+        <h3 th:text="#{client.clientInfo}"></h3>
+        <dl>
+            <dt th:text="#{client.individualInfo.fullName}"></dt>
+            <dd th:text="*{individualInfo.fullName}"></dd>
+            <dt th:text="#{client.individualInfo.nationalId}"></dt>
+            <dd th:text="*{individualInfo.nationalId} "></dd>
+            <th:block th:if="*{individualInfo?.dateOfBirth}">
+                <dt th:text="#{client.individualInfo.birthDate}"></dt>
+                <dd
+                    th:text="*{#ldates.format(individualInfo?.dateOfBirth)}"></dd>
+            </th:block>
+        </dl>
+    </section>
+    <section>
+        <h3 th:text="#{client.contactInfo}"></h3>
+        <dl>
+            <dt th:text="#{client.contactInfo.email}"
+                th:title="#{client.contactInfo.email}"></dt>
+            <dd>
+                <a type="email"
+                    th:href="'mailto:' + *{contactInfo.email}"
+                    th:text="*{contactInfo.email}"></a>
+            </dd>
+
+            <dt th:text="#{client.contactInfo.phone}"
+                th:title="#{client.contactInfo.phone}"></dt>
+            <dd>
+                <a class="no-ajax"
+                    th:href="'tel:' + *{contactInfo.phone}"
+                    th:text="*{#phones.format(contactInfo.phone)}"></a>
+            </dd>
+        </dl>
+    </section>
+</div>
+
+</html>

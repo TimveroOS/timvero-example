@@ -1,0 +1,57 @@
+= DataSource Integration
+
+:sourcedir: ../../main/java
+
+This section describes how to implement and use DataSource interfaces for integrating external data sources into the Feature Store system.
+
+== DataSource Overview
+
+The DataSource framework provides a standardized way to fetch and process data from external sources. It consists of two main interfaces:
+
+* **`DataSource<E>`** - Basic interface for fetching raw data with `getData(E subject)` method
+* **`MappedDataSource<E, T>`** - Extended interface that adds automatic parsing to typed objects with `parseRecord(Content data)` and `getType()` methods
+
+When external data is unavailable or the service returns an error, implementations should throw `DataUnavaliableException` to indicate the data cannot be retrieved.
+
+== Implementation Example: GitHub DataSource
+
+The GitHub DataSource demonstrates a complete implementation that fetches user data from the GitHub API.
+
+=== Class Structure
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSource.java[lines=15..22]
+----
+
+=== Data Retrieval Implementation
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSource.java[lines=34..48]
+----
+
+=== Data Parsing Implementation
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSource.java[lines=50..53]
+----
+
+=== Subject and Target Objects
+
+The subject object defines what data to fetch. In this example, it's a simple wrapper for the GitHub username:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSourceSubject.java[lines=1..10]
+----
+
+The target object represents the parsed data structure:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/risk/github/GithubUser.java[lines=1..15]
+----
+
+NOTE: In the platform, `Participant` entity implements the DataSource Subject pattern and can be used directly as a subject for various data sources.

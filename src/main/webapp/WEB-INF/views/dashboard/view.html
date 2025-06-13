@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org"
+      xmlns:sec="http://www.thymeleaf.org/thymeleaf-extras-springsecurity5"
+      th:include="~{/templates/layout :: page}">
+<th:block th:fragment="content">
+    <div th:fragment="body(isSmall)">
+        <div class="markDashboard">
+            <div class="markDashboard__item" th:each="entity,iterStat : ${counterList}" th:object="${entity}">
+                <th:block th:insert="~{:: counterCard(${entity})}"/>
+                <section
+                    th:unless="${isSmall}"
+                    th:data-for-counter="${entity}"
+                    th:data-counter-url="'/counter/' + ${entity} + '?count=10'"
+                    style="margin-top: 5px;"></section>
+                <button class="markDashboard__item-btn js-show-full-counter-list">
+                    Show more
+                </button>
+            </div>
+        </div>
+    </div>
+    <script defer th:inline="javascript">
+        if (typeof (window.pumpkin || {}).dashboardInit !== 'undefined') {
+          window.pumpkin.dashboardInit();
+        }
+    </script>
+    <script th:data-src="@{/assets/static/js/dashboard.js}"></script>
+</th:block>
+
+<th:block th:fragment="counterCard(counterName)">
+    <div class="markDashboard__counterCard"
+         th:classappend="${isSmall} ? 'markDashboard__counterItem' : ''">
+        <div class="markDashboard__counterCardTitle">
+            <h4 th:text="#{'counter.' + ${counterName}}"></h4>
+            <div class="d-flex flex-column align-items-end" style="width: 70px;">
+                <span class="d-flex" th:classappend="${isSmall} ? 'counter-small' : counter">
+                    <span
+                        th:data-name="${counterName}"
+                        th:data-title="#{'counter.' + ${counterName}}"></span>
+                </span>
+            </div>
+        </div>
+        <button th:unless="${isSmall} or ${totalCount < 2}" class="btn border-0 pr-0">
+            <span class="text-1" th:text="#{common.viewAll}">View All</span>
+        </button>
+    </div>
+</th:block>
+</html>
