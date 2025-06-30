@@ -13,6 +13,8 @@ import org.mapstruct.MappingTarget;
 public interface ParticipantFormMapper extends EntityToFormMapper<Participant, ParticipantForm> {
 // end::mapper[]
 
+    @Mapping(target = "status", ignore = true)
+    @Mapping(target = "roles", ignore = true)
     @Mapping(target = "application", ignore = true)
     @Mapping(target = "client", ignore = true)
     @Override

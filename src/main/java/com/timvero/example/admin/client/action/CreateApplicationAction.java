@@ -11,6 +11,7 @@ import com.timvero.example.admin.participant.entity.Employment;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.ParticipantRole;
 import com.timvero.example.admin.participant.entity.Periodicity;
+import com.timvero.example.admin.participant.form.ParticipantFormMapper;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.ground.document.signable.SignableDocumentService;
 import com.timvero.web.common.action.EntityActionController;
@@ -40,10 +41,7 @@ public class CreateApplicationAction extends EntityActionController<UUID, Client
             .map(Application::getStatus).noneMatch(s -> s.equals(ApplicationStatus.NEW)))
             .then((client, form, user) -> {
                 Application application = mapper.createEntity(form);
-                application.getBorrowerParticipant().getRoles().add(ParticipantRole.BORROWER);
-                application.getBorrowerParticipant().setApplication(application);
                 application.getBorrowerParticipant().setClient(client);
-                entityManager.persist(application.getBorrowerParticipant());
                 entityManager.persist(application);
 
                 documentService.generate(application.getBorrowerParticipant(), ParticipantDocumentTypesConfiguration.APPLICATION_FORM);
@@ -58,7 +56,7 @@ public class CreateApplicationAction extends EntityActionController<UUID, Client
         model.addAttribute("isCreate", true);
         model.addAttribute("employmentTypes", Employment.values());
         model.addAttribute("periodicities", Periodicity.values());
-        return "application/edit";
+        return "/application/edit";
     }
 
     @Override

@@ -6,14 +6,14 @@ import static jakarta.persistence.FetchType.EAGER;
 
 import com.timvero.base.entity.AbstractAuditable;
 import com.timvero.example.admin.participant.entity.Participant;
+import com.timvero.example.admin.participant.entity.ParticipantRole;
 import com.timvero.example.admin.participant.entity.Participant_;
 import com.timvero.ground.entity.NamedEntity;
+import com.timvero.ground.util.Lang;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Enumerated;
-import jakarta.persistence.JoinColumn;
 import jakarta.persistence.OneToMany;
-import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
 import java.util.HashSet;
 import java.util.Set;
@@ -31,11 +31,7 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
     @Enumerated(STRING)
     private ApplicationStatus status = ApplicationStatus.NEW;
 
-    @OneToOne(fetch = EAGER, cascade = ALL)
-    @JoinColumn(unique = true, nullable = false, updatable = false)
-    private Participant borrowerParticipant;
-
-    @OneToMany(mappedBy = Participant_.APPLICATION, cascade = ALL)
+    @OneToMany(mappedBy = Participant_.APPLICATION, cascade = ALL, fetch = EAGER)
     private Set<Participant> participants;
 
     public ApplicationStatus getStatus() {
@@ -47,11 +43,13 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
     }
 
     public Participant getBorrowerParticipant() {
-        return borrowerParticipant;
+        return getParticipants().stream().filter(p -> p.getRoles().contains(ParticipantRole.BORROWER)).collect(Lang.exactlyOne());
     }
 
-    public void setBorrowerParticipant(Participant borrowerParticipant) {
-        this.borrowerParticipant = borrowerParticipant;
+    public void setBorrowerParticipant(Participant participant) {
+        participant.getRoles().add(ParticipantRole.BORROWER);
+        participant.setApplication(this);
+        getParticipants().add(participant);
     }
 
     public Set<Participant> getParticipants() {
