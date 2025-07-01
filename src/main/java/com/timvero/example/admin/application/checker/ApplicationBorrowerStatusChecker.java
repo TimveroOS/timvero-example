@@ -31,6 +31,7 @@ public class ApplicationBorrowerStatusChecker extends EntityChecker<Application,
         switch (application.getBorrowerParticipant().getStatus()) {
             case IN_PROCESS: {
                 application.setStatus(IN_UNDERWRITING);
+                break;
             }
             case VOID: {
                 application.setStatus(VOID);

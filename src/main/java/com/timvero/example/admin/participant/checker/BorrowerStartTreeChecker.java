@@ -1,10 +1,13 @@
 package com.timvero.example.admin.participant.checker;
 
+import static com.timvero.example.admin.CustomConfiguration.PARTICIPANT_TREE;
+
 import com.timvero.example.admin.participant.ParticipantDocumentTypesConfiguration;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.ParticipantRepository;
 import com.timvero.example.admin.participant.entity.ParticipantRole;
 import com.timvero.example.admin.participant.entity.ParticipantStatus;
+import com.timvero.flowable.internal.service.DecisionProcessStarter;
 import com.timvero.ground.checker.CheckerListenerRegistry;
 import com.timvero.ground.checker.EntityChecker;
 import com.timvero.ground.document.EntityDocument;
@@ -18,10 +21,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 @Component
-public class BorrowerSoftHitChecker extends EntityChecker<Participant, UUID> {
+public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
 
-    //@Autowired
-    //private DecisionProcessStarter decisionProcessStarter;
+    @Autowired
+    private DecisionProcessStarter decisionProcessStarter;
     @Autowired
     private EntityDocumentService documentService;
     @Autowired
@@ -55,6 +58,6 @@ public class BorrowerSoftHitChecker extends EntityChecker<Participant, UUID> {
     protected void perform(Participant participant) {
 
         participant.setStatus(ParticipantStatus.IN_PROCESS);
-        //decisionProcessStarter.start(participant.softHitProcessType(), participant.getId());
+        decisionProcessStarter.start(PARTICIPANT_TREE, participant.getId());
     }
 }

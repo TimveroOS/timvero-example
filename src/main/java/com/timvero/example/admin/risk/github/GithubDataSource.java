@@ -1,8 +1,11 @@
 package com.timvero.example.admin.risk.github;
 
+import static com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.timvero.loan.risk.datasource.DataUnavaliableException;
 import com.timvero.loan.risk.datasource.MappedDataSource;
+import java.io.IOException;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -19,6 +22,10 @@ public class GithubDataSource implements MappedDataSource<GithubDataSourceSubjec
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final String GITHUB_API_BASE_URL = "https://api.github.com";
+
+    {
+        objectMapper.configure(FAIL_ON_UNKNOWN_PROPERTIES, false);
+    }
 
     private HttpEntity<String> createHttpEntity() {
         HttpHeaders headers = new HttpHeaders();
@@ -48,7 +55,7 @@ public class GithubDataSource implements MappedDataSource<GithubDataSourceSubjec
     }
 
     @Override
-    public GithubUser parseRecord(Content data) throws Exception {
+    public GithubUser parseRecord(Content data) throws IOException {
         return objectMapper.readValue(data.getBody(), GithubUser.class);
     }
 }

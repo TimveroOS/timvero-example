@@ -1,6 +1,8 @@
 package com.timvero.example.admin;
 
 import com.timvero.base.TimveroEnableJpa;
+import com.timvero.example.admin.participant.entity.Participant;
+import com.timvero.flowable.internal.mapping.entity.DecisionProcessType;
 import com.timvero.ground.security.user.UserRoleConfiguration;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
@@ -15,6 +17,9 @@ import org.springframework.web.bind.annotation.ControllerAdvice;
 @ComponentScan(excludeFilters = @Filter({Controller.class, ControllerAdvice.class}))
 @TimveroEnableJpa
 public class CustomConfiguration {
+
+    public static final DecisionProcessType<Participant> PARTICIPANT_TREE =
+        new DecisionProcessType<>("PARTICIPANT_TREE", Participant.class);
 
     @Bean
     UserRoleConfiguration roleConfiguration() {

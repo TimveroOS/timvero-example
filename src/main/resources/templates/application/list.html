@@ -17,7 +17,7 @@
             th:object="${entity}" role="row" class="clickable">
             <td><span class="d-flex justify-content-start"
                 th:text="*{#strings.substring(id, 0, 6)}"></span></td>
-            <td th:text="*{status}"></td>
+            <td th:text="*{#enums.name(status)}"></td>
             <td th:text="*{borrowerParticipant?.displayedName}"></td>
             <td th:text="*{#ldates.format(createdAt)}"></td>
             <td th:text="*{#ldates.format(updatedAt)}"></td>

@@ -6,7 +6,7 @@
     <parent>
         <groupId>com.timvero.pumpkin</groupId>
         <artifactId>pumpkin</artifactId>
-        <version>8.0.0</version>
+        <version>8.0.1</version>
     </parent>
 
     <artifactId>example</artifactId>
@@ -51,7 +51,13 @@
             <artifactId>origination</artifactId>
             <version>${project.parent.version}</version>
         </dependency>
-        
+
+        <dependency>
+            <groupId>com.timvero.pumpkin</groupId>
+            <artifactId>flowable</artifactId>
+            <version>${project.parent.version}</version>
+        </dependency>
+
         <!-- Core impl -->
         <dependency>
             <groupId>org.hibernate.search</groupId>
@@ -67,6 +73,33 @@
             <groupId>io.pebbletemplates</groupId>
             <artifactId>pebble</artifactId>
         </dependency>
+
+        <dependency>
+            <groupId>com.auth0</groupId>
+            <artifactId>java-jwt</artifactId>
+        </dependency>
+
+        <!-- DocuSign Dependencies -->
+        <dependency>
+            <groupId>com.docusign</groupId>
+            <artifactId>docusign-esign-java</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.glassfish.jersey.core</groupId>
+            <artifactId>jersey-client</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.glassfish.jersey.media</groupId>
+            <artifactId>jersey-media-multipart</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.glassfish.jersey.media</groupId>
+            <artifactId>jersey-media-json-jackson</artifactId>
+        </dependency>
+        <!-- End of DocuSign Dependencies -->
 
         <!-- Test -->
         <dependency>

@@ -7,8 +7,10 @@ import com.timvero.base.entity.AbstractAuditable;
 import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.client.entity.Client;
 import com.timvero.example.admin.risk.github.GithubDataSourceSubject;
+import com.timvero.flowable.internal.execution.ProcessEntity;
 import com.timvero.ground.document.HasDocuments;
 import com.timvero.ground.entity.NamedEntity;
+import com.timvero.integration.docusign.DocusignSigner;
 import jakarta.persistence.Column;
 import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Embedded;
@@ -19,6 +21,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -31,7 +34,7 @@ import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 @Table
 @Audited
 @Indexed
-public class Participant extends AbstractAuditable<UUID> implements NamedEntity, GithubDataSourceSubject, HasDocuments {
+public class Participant extends AbstractAuditable<UUID> implements NamedEntity, GithubDataSourceSubject, HasDocuments, ProcessEntity, DocusignSigner {
 
     @Column(nullable = false)
     @Enumerated(value = EnumType.STRING)
@@ -140,5 +143,22 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @Override
     public String getDisplayedName() {
         return getClient().getDisplayedName();
+    }
+
+    @Transient
+    @Override
+    public String getPrimaryId() {
+        return getClient().getIndividualInfo().getNationalId();
+    }
+
+    @Transient
+    @Override
+    public String getSignerName() {
+        return getClient().getIndividualInfo().getFullName();
+    }
+
+    @Override
+    public String getSignerEmail() {
+        return getClient().getContactInfo().getEmail();
     }
 }
