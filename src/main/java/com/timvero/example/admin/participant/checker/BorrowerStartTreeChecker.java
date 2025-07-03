@@ -34,18 +34,23 @@ public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
 
     @Override
     protected void registerListeners(CheckerListenerRegistry<Participant> registry) {
+        // tag::signature-listener[]
         registry.entityChange(SignableDocument.class, d -> participantRepository.getReferenceById(d.getOwnerId()))
             .updated(SignableDocument_.STATUS)
             .and(d -> d.getStatus() == SignatureStatus.SIGNED && d.getDocumentType() == ParticipantDocumentTypesConfiguration.APPLICATION_FORM);
+        // end::signature-listener[]
 
+        // tag::document-listener[]
         registry.entityChange(EntityDocument.class, d -> participantRepository.getReferenceById(d.getOwnerId()))
             .inserted().and(d -> {
                 Participant participant = participantRepository.getReferenceById(d.getOwnerId());
                 return participant != null &&
                     documentService.getRequiredDocumentTypes(participant).contains(d.getDocumentType());
             });
+        // end::document-listener[]
     }
 
+    // tag::availability[]
     @Override
     protected boolean isAvailable(Participant participant) {
         return participant.getRoles().contains(ParticipantRole.BORROWER)
@@ -53,11 +58,13 @@ public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
             && documentFinder.isLatestSigned(participant, ParticipantDocumentTypesConfiguration.APPLICATION_FORM)
             && documentService.requiredDocumentsAdded(participant);
     }
+// end::availability[]
 
+    // tag::perform[]
     @Override
     protected void perform(Participant participant) {
-
         participant.setStatus(ParticipantStatus.IN_PROCESS);
         decisionProcessStarter.start(PARTICIPANT_TREE, participant.getId());
     }
+// end::perform[]
 }
