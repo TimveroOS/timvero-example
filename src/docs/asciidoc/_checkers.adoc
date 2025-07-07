@@ -1,0 +1,220 @@
+= Entity Checkers setup and usage
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:templatedir: ../../main/resources/templates
+
+This section describes how to set up and manage Entity Checkers for automated business rule validation and state management in the application.
+
+== Checker System Architecture
+
+The platform uses Entity Checkers to implement event-driven business logic that automatically responds to entity changes. Checkers serve as reactive components that monitor database changes and execute business rules when specific conditions are met.
+
+=== What are Entity Checkers?
+
+Entity Checkers are specialized components that:
+
+* **Monitor Entity Changes**: Automatically detect when entities are created, updated, or deleted
+* **Apply Business Rules**: Execute predefined logic when specific conditions are satisfied
+* **Maintain Data Consistency**: Ensure related entities remain synchronized
+* **Automate Workflows**: Trigger next steps in business processes without manual intervention
+
+=== Checker Class Hierarchy
+
+The application uses a structured checker architecture based on framework components:
+
+* **Base Checker Classes**: Framework-provided abstract classes (`EntityChecker`) that handle the infrastructure
+* **Custom Entity Checkers**: Application-specific implementations:
+  - `BorrowerStartTreeChecker` - manages borrower workflow initiation
+
+Each checker consists of three main parts:
+
+* **<<_listener_registration,Listener Registration>>** (`registerListeners` method) - defines what entity changes to monitor
+* **Availability Check** (`isAvailable` method) - determines when the checker should execute
+* **Business Logic** (`perform` method) - implements the actual business rule
+
+== Listener Registration
+
+The `registerListeners` method is the core mechanism for defining what entity changes a checker should monitor. This method uses the `CheckerListenerRegistry` to configure event listeners that will trigger the checker's business logic.
+
+=== CheckerListenerRegistry
+
+`CheckerListenerRegistry<E>` is a registry for configuring event listeners for entity changes. The generic type `E` represents the target entity type that the checker operates on (e.g., `Application`, `Participant`).
+
+==== Key Methods
+
+[cols="1,2,3", options="header"]
+|===
+|Method |Parameters |Description
+
+|`entityChange`
+|`Class<T> entityClass` - Type of entity being monitored +
+`Function<T, E> mapper` - Function to convert changed entity to target entity
+|Creates a listener for entity change events. See <<_using_entitychange_method,usage examples>>.
+
+|`entityChange`
+|_(no parameters)_
+|Monitors the same entity type as the checker (shorthand). See <<_using_entitychange_method,usage examples>>.
+
+|`updated`
+|`String... fields` - Names of fields to monitor for changes
+|Filters to field update events only.
+
+|`inserted`
+|_(no parameters)_
+|Filters to entity insertion events only.
+
+|`and`
+|`Predicate<T> predicate` - Custom condition that must be satisfied
+|Adds filtering conditions. Chain multiple conditions together.
+|===
+
+==== Using entityChange Method
+
+The `entityChange` method provides flexible entity-to-target mapping capabilities to solve different monitoring scenarios in checker implementations.
+
+===== Direct Entity Monitoring
+
+**Problem:** Your checker needs to monitor changes to the same entity type it operates on.
+
+For example, an `ApplicationChecker` that monitors `Application` entity changes directly.
+
+**Solution:**
+
+[source,java]
+----
+registry.entityChange().updated("status")
+----
+
+This monitors changes to the same entity type as the checker operates on.
+
+.When to Use
+* Simple checkers where trigger entity = target entity
+* Direct field monitoring without complex relationships
+* Most straightforward monitoring scenario
+
+===== Related Entity Monitoring
+
+**Problem:** Your checker needs to monitor changes to different entity types and map them to the target entity through relationships.
+
+For example, an `ApplicationChecker` that triggers when related `Participant` entities change, but needs to operate on the `Application`.
+
+**Solution:**
+
+[source,java]
+----
+registry.entityChange(Participant.class, Participant::getApplication).updated("status")
+----
+
+* `Participant.class` - the entity type being monitored for changes
+* `Participant::getApplication` - function that converts the changed `Participant` to the target `Application`
+
+.When to Use
+* Monitoring entities connected through direct JPA relationships
+* One-to-one or many-to-one relationships with getter methods
+* Related entities share the same transaction context
+
+===== Complex Repository-Based Mapping
+
+**Problem:** Your checker needs to monitor entities where the relationship requires repository lookup to resolve the target entity.
+
+For example, monitoring `SignableDocument` changes but needing to operate on the associated `Participant` through a complex relationship.
+
+**Solution:**
+
+[source,java]
+----
+registry.entityChange(SignableDocument.class, d -> participantRepository.getReferenceById(d.getOwnerId()))
+    .updated("status")
+----
+
+* `SignableDocument.class` - the entity type being monitored
+* `d -> participantRepository.getReferenceById(d.getOwnerId())` - repository-based mapping function
+
+.When to Use
+* Complex relationships not modeled as direct JPA associations
+* Cross-context entity lookups
+* Dynamic relationship resolution based on entity state
+
+[NOTE]
+====
+**Performance Consideration**: Repository-based mapping introduces additional database queries. Use this approach only when direct relationship mapping is not possible.
+====
+
+== Checker Implementation Examples
+
+=== BorrowerStartTreeChecker
+
+The `BorrowerStartTreeChecker` manages borrower workflow initiation when participants complete required documentation.
+
+.Checker Overview
+[cols="1,3", options="header"]
+|===
+|Component |Description
+
+|**Target Entity**
+|`Participant` - The entity this checker operates on
+
+|**Purpose**
+|Automatically start decision tree process when borrower completes all requirements
+
+|**Triggers**
+|Document signatures and uploads for required participant documents
+
+|**Business Logic**
+|Update participant status to `IN_PROCESS` and start automated decision tree
+|===
+
+==== Listener 1: Application Form Signature Monitor
+
+Monitors when application forms are signed and triggers workflow initiation.
+
+**Purpose:** Track completion of application form signatures +
+**Trigger:** `SignableDocument.status` changes to `SIGNED` for application forms +
+**Target Resolution:** Maps document changes to owning participant
+
+[source,java]
+----
+include::{sourcedir}/participant/checker/BorrowerStartTreeChecker.java[tags=signature-listener]
+----
+
+==== Listener 2: Required Document Upload Monitor
+
+Tracks when required documents are uploaded to the system.
+
+**Purpose:** Monitor completion of required document uploads +
+**Trigger:** New `EntityDocument` insertions for required document types +
+**Target Resolution:** Maps document uploads to owning participant
+
+[source,java]
+----
+include::{sourcedir}/participant/checker/BorrowerStartTreeChecker.java[tags=document-listener]
+----
+
+==== Availability Check
+
+Determines when the checker should execute its business logic.
+
+[source,java]
+----
+include::{sourcedir}/participant/checker/BorrowerStartTreeChecker.java[tags=availability]
+----
+
+.Availability Conditions
+* Participant must be a `BORROWER`
+* Participant status must be `NEW`
+* Application form must be signed
+* All required documents must be uploaded
+
+==== Business Logic
+
+Updates participant status and initiates the decision tree process.
+
+[source,java]
+----
+include::{sourcedir}/participant/checker/BorrowerStartTreeChecker.java[tags=perform]
+----
+
+.Business Operations
+1. **Status Update**: Change participant status from `NEW` to `IN_PROCESS`
+2. **Process Initiation**: Start the automated decision tree workflow
+3. **Transaction Safety**: Both operations occur within the same transaction
