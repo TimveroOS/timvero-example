@@ -23,14 +23,19 @@ import org.springframework.stereotype.Component;
 @Component
 public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
 
-    @Autowired
-    private DecisionProcessStarter decisionProcessStarter;
-    @Autowired
-    private EntityDocumentService documentService;
-    @Autowired
-    private ParticipantRepository participantRepository;
-    @Autowired
-    private EntityDocumentFinder documentFinder;
+    private final DecisionProcessStarter decisionProcessStarter;
+    private final EntityDocumentService documentService;
+    private final ParticipantRepository participantRepository;
+    private final EntityDocumentFinder documentFinder;
+
+    public BorrowerStartTreeChecker(DecisionProcessStarter decisionProcessStarter,
+        EntityDocumentService documentService, ParticipantRepository participantRepository,
+        EntityDocumentFinder documentFinder) {
+        this.decisionProcessStarter = decisionProcessStarter;
+        this.documentService = documentService;
+        this.participantRepository = participantRepository;
+        this.documentFinder = documentFinder;
+    }
 
     @Override
     protected void registerListeners(CheckerListenerRegistry<Participant> registry) {
@@ -44,8 +49,7 @@ public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
         registry.entityChange(EntityDocument.class, d -> participantRepository.getReferenceById(d.getOwnerId()))
             .inserted().and(d -> {
                 Participant participant = participantRepository.getReferenceById(d.getOwnerId());
-                return participant != null &&
-                    documentService.getRequiredDocumentTypes(participant).contains(d.getDocumentType());
+                return documentService.getRequiredDocumentTypes(participant).contains(d.getDocumentType());
             });
         // end::document-listener[]
     }

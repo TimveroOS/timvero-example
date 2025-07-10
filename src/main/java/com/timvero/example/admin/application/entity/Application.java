@@ -25,6 +25,7 @@ import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 @Table
 @Audited
 @Indexed
+//todo add application type
 public class Application extends AbstractAuditable<UUID> implements NamedEntity {
 
     @Column(nullable = false)
@@ -42,8 +43,10 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
         this.status = status;
     }
 
+
     public Participant getBorrowerParticipant() {
-        return getParticipants().stream().filter(p -> p.getRoles().contains(ParticipantRole.BORROWER)).collect(Lang.exactlyOne());
+        return getParticipants().stream().filter(p -> p.getRoles().contains(ParticipantRole.BORROWER))
+            .collect(Lang.exactlyOne());
     }
 
     public void setBorrowerParticipant(Participant participant) {

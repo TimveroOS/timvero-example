@@ -11,6 +11,9 @@ import com.timvero.flowable.internal.execution.ProcessEntity;
 import com.timvero.ground.document.HasDocuments;
 import com.timvero.ground.entity.NamedEntity;
 import com.timvero.integration.docusign.DocusignSigner;
+import com.timvero.loan.pending_decision.HasPendingDecisions;
+import com.timvero.loan.pending_decision.PendingDecisionHolder;
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Embedded;
@@ -20,6 +23,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
 import java.util.HashSet;
@@ -27,6 +31,7 @@ import java.util.Set;
 import java.util.UUID;
 import javax.money.MonetaryAmount;
 import org.hibernate.envers.Audited;
+import org.hibernate.envers.NotAudited;
 import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 
 // tag::entity[]
@@ -34,7 +39,11 @@ import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 @Table
 @Audited
 @Indexed
-public class Participant extends AbstractAuditable<UUID> implements NamedEntity, GithubDataSourceSubject, HasDocuments, ProcessEntity, DocusignSigner {
+public class Participant extends AbstractAuditable<UUID> implements NamedEntity, GithubDataSourceSubject, HasDocuments,
+    ProcessEntity, DocusignSigner,
+    HasPendingDecisions {
+
+    public static final String DECISION_OWNER_TYPE = "PARTICIPANT";
 
     @Column(nullable = false)
     @Enumerated(value = EnumType.STRING)
@@ -65,6 +74,11 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
 
     @Embedded
     private MonetaryAmount monthlyOutgoings;
+
+    @OneToOne(cascade = CascadeType.ALL)
+    @JoinColumn(nullable = false, updatable = false)
+    @NotAudited
+    private PendingDecisionHolder pendingDecisionHolder = new PendingDecisionHolder(DECISION_OWNER_TYPE);
 
 // end::entity[]
 
@@ -160,5 +174,10 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @Override
     public String getSignerEmail() {
         return getClient().getContactInfo().getEmail();
+    }
+
+    @Override
+    public PendingDecisionHolder getPendingDecisionHolder() {
+        return pendingDecisionHolder;
     }
 }

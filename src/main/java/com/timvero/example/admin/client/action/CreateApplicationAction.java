@@ -36,7 +36,7 @@ public class CreateApplicationAction extends EntityActionController<UUID, Client
     @Override
     protected EntityAction<Client, ApplicationForm> action() {
         return when(c -> c.getParticipants().stream().map(Participant::getApplication)
-            .map(Application::getStatus).noneMatch(s -> s.equals(ApplicationStatus.NEW)))
+            .map(Application::getStatus).noneMatch(s -> {return false;}))
             .then((client, form, user) -> {
                 Application application = mapper.createEntity(form);
                 application.getBorrowerParticipant().setClient(client);
