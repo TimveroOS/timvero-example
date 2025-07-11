@@ -1,6 +1,6 @@
 = Document Management
 
-:sourcedir: ../../main/java
+:sourcedir: ../../main/java/com/timvero/example/admin
 
 This section describes how to implement document management functionality for entities in the platform, including document type associations and UI integration.
 
@@ -24,7 +24,7 @@ Documents that must be uploaded based on entity conditions:
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=23..33]
+include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=23..33]
 ----
 
 This configuration:
@@ -38,7 +38,7 @@ Documents that can be uploaded without restrictions:
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=35..38]
+include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=35..38]
 ----
 
 This allows `OTHER` document type to be uploaded for any participant without conditions.
@@ -49,7 +49,7 @@ Document types are defined as constants in the configuration:
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=20..21]
+include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=20..21]
 ----
 
 == UI Integration
@@ -60,7 +60,7 @@ To display document management interface, create a tab controller extending `Ent
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/participant/tab/ParticipantDocumentsTab.java[]
+include::{sourcedir}/participant/tab/ParticipantDocumentsTab.java[]
 ----
 
 Key features:
@@ -95,7 +95,7 @@ Multiple predicates can be combined:
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/participant/ParticipantDocumentTypesConfiguration.java[lines=21..25]
+include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=21..25]
 ----
 
 Predicates are combined using AND logic - all conditions must be true.

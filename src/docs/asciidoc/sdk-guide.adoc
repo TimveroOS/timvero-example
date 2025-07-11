@@ -18,6 +18,8 @@ align perfectly with their business goals.
 
 For a complete working example, see the https://github.com/TimveroOS/timvero-example[timvero-example project^].
 
+include::_getting-started.adoc[leveloffset=+1]
+
 include::_data-model.adoc[leveloffset=+1]
 
 include::_forms.adoc[leveloffset=+1]
