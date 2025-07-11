@@ -1,11 +1,12 @@
 package com.timvero.example.admin.procuring;
 
+import com.timvero.application.procuring.ProcuringType;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
-public class ProcuringType {
+public class ExampleProcuringType {
 
     public static final String CODE_PENALTY = "PENALTY";
 
-    public static final com.timvero.application.procuring.ProcuringType PENALTY = new com.timvero.application.procuring.ProcuringType(CODE_PENALTY);
+    public static final ProcuringType PENALTY = new ProcuringType(CODE_PENALTY);
 }

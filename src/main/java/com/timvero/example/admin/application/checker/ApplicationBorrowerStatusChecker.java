@@ -1,5 +1,6 @@
 package com.timvero.example.admin.application.checker;
 
+import static com.timvero.example.admin.application.entity.ApplicationStatus.CONDITION_CHOOSING;
 import static com.timvero.example.admin.application.entity.ApplicationStatus.IN_UNDERWRITING;
 import static com.timvero.example.admin.application.entity.ApplicationStatus.VOID;
 import static com.timvero.example.admin.participant.entity.ParticipantRole.BORROWER;
@@ -31,6 +32,10 @@ public class ApplicationBorrowerStatusChecker extends EntityChecker<Application,
         switch (application.getBorrowerParticipant().getStatus()) {
             case IN_PROCESS: {
                 application.setStatus(IN_UNDERWRITING);
+                break;
+            }
+            case APPROVED: {
+                application.setStatus(CONDITION_CHOOSING);
                 break;
             }
             case VOID: {

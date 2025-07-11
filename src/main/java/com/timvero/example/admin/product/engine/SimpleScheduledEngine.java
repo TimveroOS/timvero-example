@@ -60,7 +60,6 @@ public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondi
         }
 
         int order = 0;
-        int orderDiscount = 0;
 
         LocalDate from = startInterest, to;
         while (order < length) {

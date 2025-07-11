@@ -1,12 +1,12 @@
 package com.timvero.example.admin.product.entity;
 
+import static com.timvero.ground.hibernate.type.ColumnDefenition.NUMERIC;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_PRECISION;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_SCALE;
 
 import com.timvero.example.admin.offer.entity.ExampleProductOffer;
 import com.timvero.loan.product.entity.CreditProduct;
 import com.timvero.loan.product.entity.CreditProductAdditive;
-import com.timvero.servicing.AmountConstants;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Transient;
@@ -30,11 +30,15 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
     @Column(name = "max_term", nullable = false)
     private Integer maxTerm;
 
-    @Column(name = "interest_rate", precision = 19, scale = AmountConstants.PERCENT_SCALE, nullable = false)
+    @Column(name = "interest_rate", columnDefinition = NUMERIC)
     private BigDecimal interestRate;
 
     protected ExampleCreditProductAdditive() {
         super();
+    }
+
+    public ExampleCreditProductAdditive(CreditProduct product) {
+        super(product);
     }
 
     public String getName() {
@@ -43,10 +47,6 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
 
     public void setName(String name) {
         this.name = name;
-    }
-
-    public ExampleCreditProductAdditive(CreditProduct product) {
-        super(product);
     }
 
     public BigDecimal getMinAmount() {

@@ -1,0 +1,79 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+
+<form
+    class="modal-form"
+    id="submit"
+    method="post"
+    th:action="@{${actionPath}}"
+    th:data-title="#{application.dialog.title.submit}"
+    th:object="${conditionForm}"
+>
+    <input type="hidden" th:value="${securedOffer.offerKey}" name="securedOfferKey"></input>
+    <div class="form-body">
+        <div>
+            <a class="h3 form-group__title d-flex" th:href="@{'/product/' + ${productOffer.creditProduct.id}}" th:target="_blank"
+              th:text="${productOffer.creditProduct.title}"></a>
+
+            <div class="offerFormRow">
+                <span th:text="#{application.offer.minAmount}">Min Amount</span>
+                <b><span th:text="${productOffer.minAmount.toPlainString()}"></span></b>
+            </div>
+            <div class="offerFormRow">
+                <span th:text="#{application.offer.maxAmount}">Max Amount</span>
+                <b><span th:text="${productOffer.maxAmount.toPlainString()}"></span></b>
+            </div>
+            <div class="offerFormRow">
+                <span th:text="#{application.offer.minTerm}">Min Term</span>
+                <b><span th:text="${productOffer.minTerm}"></span></b>
+            </div>
+            <div class="offerFormRow">
+                <span th:text="#{application.offer.maxTerm}">Max Term</span>
+                <b><span th:text="${productOffer.maxTerm}"></span></b>
+            </div>
+        </div>
+
+        <hr/>
+
+        <div>
+            <h3 class="h4 form-group__title" th:text="#{application.offer.selectedProcuring}"></h3>
+            <div class="offerFormRow" th:if="${#enums.equals(securedOffer.procuringType, 'SINGLE_GUARANTOR')}">
+                <span th:text="${#enums.name(securedOffer.procuringType)}">Guarantor</span>
+                <span th:text="${securedOffer.guarantorOffer.participant.displayedName}"></span>
+            </div>
+            <div class="offerFormRow" th:if="${#enums.equals(securedOffer.procuringType, 'PENALTY')}">
+                <span th:text="${#enums.name(securedOffer.procuringType)}">Penalty</span>
+            </div>
+        </div>
+
+        <hr/>
+
+        <th:block
+            th:with="currencies=${{ productOffer.currency }}, readonly=true"
+            th:insert="~{/form/components :: amount(#{application.condition.amount}, 'principal', 'v-required condition')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{application.condition.term}, 'term', 'app_digits v-required condition')}"/>
+
+        <th:block
+            th:insert="~{/form/components :: date (#{application.condition.startFinancingDate}, 'start', 'v-required')}"/>
+
+    </div>
+    <div class="modal-footer">
+        <button
+            type="button"
+            class="btn btn-secondary"
+            data-dismiss="modal"
+            th:text="#{button.close}"
+        >
+            Close
+        </button>
+        <button
+            type="submit"
+            class="btn btn-success"
+            th:text="#{button.save}"
+        >
+            Add
+        </button>
+    </div>
+</form>
+</html>

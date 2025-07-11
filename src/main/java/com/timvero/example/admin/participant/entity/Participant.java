@@ -5,6 +5,7 @@ import static jakarta.persistence.FetchType.EAGER;
 import static org.hibernate.envers.RelationTargetAuditMode.NOT_AUDITED;
 
 import com.timvero.base.entity.AbstractAuditable;
+import com.timvero.base.exception.ExceptionEntity;
 import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.client.entity.Client;
 import com.timvero.example.admin.offer.entity.ExampleProductOffer;
@@ -30,6 +31,7 @@ import jakarta.persistence.OneToMany;
 import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
+import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -79,10 +81,8 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @Embedded
     private MonetaryAmount monthlyOutgoings;
 
-    @OneToMany(fetch = FetchType.EAGER, mappedBy = ExampleProductOffer_.PARTICIPANT)
-    @Audited(targetAuditMode = NOT_AUDITED)
-    private Set<ExampleProductOffer> offers;
-
+    @Column
+    private String githubUsername;
     // end::entity[]
 
     @OneToOne(cascade = CascadeType.ALL)
@@ -90,8 +90,16 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @NotAudited
     private PendingDecisionHolder pendingDecisionHolder = new PendingDecisionHolder(DECISION_OWNER_TYPE);
 
+    @OneToMany(fetch = FetchType.EAGER, mappedBy = ExampleProductOffer_.PARTICIPANT)
+    @Audited(targetAuditMode = NOT_AUDITED)
+    private Set<ExampleProductOffer> offers;
+
+    @ManyToOne(fetch = FetchType.LAZY, cascade = {CascadeType.MERGE, CascadeType.REFRESH})
+    @Audited(targetAuditMode = NOT_AUDITED)
+    private ExceptionEntity offerGenerationException;
+
     @Column
-    private String githubUsername;
+    private Instant offersGeneratedAt;
 
     public ParticipantStatus getStatus() {
         return status;
@@ -195,5 +203,21 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
 
     public void setOffers(Set<ExampleProductOffer> offers) {
         this.offers = offers;
+    }
+
+    public ExceptionEntity getOfferGenerationException() {
+        return offerGenerationException;
+    }
+
+    public void setOfferGenerationException(ExceptionEntity offerGenerationException) {
+        this.offerGenerationException = offerGenerationException;
+    }
+
+    public Instant getOffersGeneratedAt() {
+        return offersGeneratedAt;
+    }
+
+    public void setOffersGeneratedAt(Instant offersGeneratedAt) {
+        this.offersGeneratedAt = offersGeneratedAt;
     }
 }

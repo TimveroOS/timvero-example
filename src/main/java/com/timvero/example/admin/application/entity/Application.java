@@ -3,17 +3,24 @@ package com.timvero.example.admin.application.entity;
 import static jakarta.persistence.CascadeType.ALL;
 import static jakarta.persistence.EnumType.STRING;
 import static jakarta.persistence.FetchType.EAGER;
+import static org.hibernate.envers.RelationTargetAuditMode.NOT_AUDITED;
 
 import com.timvero.base.entity.AbstractAuditable;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.ParticipantRole;
 import com.timvero.example.admin.participant.entity.Participant_;
+import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.ground.entity.NamedEntity;
 import com.timvero.ground.util.Lang;
+import com.timvero.scheduled.entity.PaymentSchedule;
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.JoinColumn;
 import jakarta.persistence.OneToMany;
+import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
 import java.util.HashSet;
 import java.util.Set;
@@ -34,10 +41,15 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
     @OneToMany(mappedBy = Participant_.APPLICATION, cascade = ALL, fetch = EAGER)
     private Set<Participant> participants;
 
-/*    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
-    @JoinColumn(name = "condition")
-    @Fetch(FetchMode.JOIN)
-    private ExampleCreditCondition condition;*/
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn
+    @Audited(targetAuditMode = NOT_AUDITED)
+    private ExampleCreditCondition condition;
+
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn
+    @Audited(targetAuditMode = NOT_AUDITED)
+    private PaymentSchedule paymentSchedule;
 
     public ApplicationStatus getStatus() {
         return status;
@@ -68,11 +80,19 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
         return getBorrowerParticipant().getDisplayedName();
     }
 
-  /*  public ExampleCreditCondition getCondition() {
+    public ExampleCreditCondition getCondition() {
         return condition;
     }
 
     public void setCondition(ExampleCreditCondition condition) {
         this.condition = condition;
-    }*/
+    }
+
+    public PaymentSchedule getPaymentSchedule() {
+        return paymentSchedule;
+    }
+
+    public void setPaymentSchedule(PaymentSchedule paymentSchedule) {
+        this.paymentSchedule = paymentSchedule;
+    }
 }

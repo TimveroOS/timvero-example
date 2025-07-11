@@ -1,7 +1,6 @@
 package com.timvero.example.admin.product.form;
 
 import com.timvero.application.procuring.ProcuringType;
-import com.timvero.example.admin.application.entity.ApplicationType;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
 import com.timvero.example.admin.product.entity.ExampleCreditProductAdditive;
 import com.timvero.example.admin.product.repository.ExampleCreditProductAdditiveRepository;
@@ -57,11 +56,19 @@ public class ExampleCreditProductAdditiveFormServiceImpl implements ExampleCredi
 
         model.addAttribute("productId", product.getId());
         model.addAttribute("form",
-            additive != null ? formMapper.toForm(additive) : new ExampleCreditProductAdditiveForm());
+            additive != null ? formMapper.toForm(additive) : newForm(product));
         model.addAttribute("offerEngineTypes", requiredEngineTypes);
         model.addAttribute("offerEngineDescriptors", Lazy.of(() -> getEngineDescriptorMap(requiredEngineTypes)));
         model.addAttribute("procuringTypes", ProcuringType.values());
-        model.addAttribute("applicationType", ApplicationType.NORMAL);
+    }
+
+    private ExampleCreditProductAdditiveForm newForm(ExampleCreditProduct product) {
+        ExampleCreditProductAdditiveForm form = new ExampleCreditProductAdditiveForm();
+        form.setMaxAmount(product.getMaxAmount());
+        form.setMinAmount(product.getMinAmount());
+        form.setMaxTerm(product.getMaxTerm());
+        form.setMinTerm(product.getMinTerm());
+        return form;
     }
 
     @Override

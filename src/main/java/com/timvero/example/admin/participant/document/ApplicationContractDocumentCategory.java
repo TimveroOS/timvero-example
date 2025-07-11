@@ -25,16 +25,14 @@ public class ApplicationContractDocumentCategory
 
     @Override
     protected ContractDocumentModel getModel(Participant participant) {
-        //ExampleCreditCondition condition = participant.getApplication().getCondition();
-        PaymentSchedule paymentSchedule = null; // TODO
-        //    creditScheduledService.getPaymentSchedule(condition, condition.getPrincipal(), LocalDate.now());
+        PaymentSchedule paymentSchedule = participant.getApplication().getPaymentSchedule();
         return new ContractDocumentModel(participant.getApplication(), paymentSchedule);
     }
 
     @Override
     protected boolean isSuitableTestEntity(Participant participant) {
         return participant.getStatus() == ParticipantStatus.APPROVED
-            /* TODO && participant.getApplication().getCondition() != null*/;
+            && participant.getApplication().getPaymentSchedule() != null;
     }
 
     public static class ContractDocumentModel extends DocumentModel {

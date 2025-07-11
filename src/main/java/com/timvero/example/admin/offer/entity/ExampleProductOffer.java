@@ -7,13 +7,13 @@ import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
 import com.timvero.example.admin.product.entity.ExampleCreditProductAdditive;
-import com.timvero.ground.entity.NamedEntity;
 import com.timvero.ground.util.EntityUtils;
 import com.timvero.loan.offer.entity.ProductOffer;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
 import java.math.BigDecimal;
@@ -28,10 +28,10 @@ import org.hibernate.envers.RelationTargetAuditMode;
 @Table(name = "product_offer")
 @Audited
 @AuditOverride(forClass = ProductOffer.class)
-public class ExampleProductOffer extends ProductOffer implements NamedEntity {
+public class ExampleProductOffer extends ProductOffer {
 
     @NotAudited
-    @Column(name = "uuid", nullable = false, updatable = false, columnDefinition = "uuid default gen_random_uuid()")
+    @Column(name = "uuid", nullable = false, updatable = false)
     private UUID uuid;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
@@ -118,10 +118,9 @@ public class ExampleProductOffer extends ProductOffer implements NamedEntity {
         return getCreditProduct().getCurrency();
     }
 
-    @Transient
-    @Override
-    public String getDisplayedName() {
-        return getCreditProduct().getDisplayedName();
+    @PrePersist
+    protected void prePersist() {
+        uuid = UUID.randomUUID();
     }
 
     @Override

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<table class="table">
+    <thead>
+    <tr>
+        <th th:text="#{schedule.date}"></th>
+        <th th:text="#{schedule.interest}"></th>
+        <th th:text="#{schedule.principal}"></th>
+        <th th:text="#{schedule.amount}"></th>
+        <th th:text="#{schedule.remainingPrincipal}"></th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr
+        th:each="payment,iterStat : ${schedule.payments.values()}"
+        th:object="${payment}"
+    >
+        <td th:text="*{#ldates.format(date)}"></td>
+        <td th:text="*{#monetary.format(interest)}"></td>
+        <td th:text="*{#monetary.format(principal)}"></td>
+        <td th:text="*{#monetary.format(amount)}"></td>
+        <td th:text="*{#monetary.format(remainingPrincipal)}"></td>
+    </tr>
+    </tbody>
+</table>
+</html>

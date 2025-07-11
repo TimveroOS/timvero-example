@@ -1,5 +1,6 @@
 package com.timvero.example.admin.participant;
 
+import com.timvero.example.admin.participant.document.ApplicationContractDocumentCategory;
 import com.timvero.example.admin.participant.document.ApplicationFormDocumentCategory;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.ParticipantRole;
@@ -16,6 +17,8 @@ public class ParticipantDocumentTypesConfiguration {
 
     public static final SignableDocumentType APPLICATION_FORM =
         new SignableDocumentType("APPLICATION_FORM", ApplicationFormDocumentCategory.TYPE);
+    public static final SignableDocumentType APPLICATION_CONTRACT =
+        new SignableDocumentType("APPLICATION_CONTRACT", ApplicationContractDocumentCategory.TYPE);
 
     public static final EntityDocumentType OTHER = new EntityDocumentType("OTHER");
     public static final EntityDocumentType ID_SCAN = new EntityDocumentType("ID_SCAN");

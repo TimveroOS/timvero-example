@@ -22,7 +22,7 @@ public class ExampleProductOfferViewService extends ProductOfferViewService {
 
         return new OfferView(offer.getProductAdditive().getName(),
             offer.getProductAdditive().getInterestRate().toString(),
-            offer.getProductAdditive().toString(),
+            offer.getProductAdditive().getInterestRate().toString(),
             MonetaryUtil.of(offer.getMinAmount(), offer.getCurrency()),
             MonetaryUtil.of(offer.getMaxAmount(), offer.getCurrency()), offer.getMinTerm(), offer.getMaxTerm(),
             details);
@@ -31,12 +31,13 @@ public class ExampleProductOfferViewService extends ProductOfferViewService {
     @Override
     protected OfferView map(SecuredOffer securedOffer, Locale locale) {
         ExampleSecuredOffer offer = (ExampleSecuredOffer) securedOffer;
+        ExampleProductOffer originalOffer = offer.getOriginalOffer();
         String details = EnumUtils.getLocalizedValue(offer.getProcuringType(), locale);
-        return new OfferView(offer.getOriginalOffer().getProductAdditive().getName(),
-            offer.getOriginalOffer().getProductAdditive().getInterestRate().toString(),
-            offer.getOriginalOffer().getProductAdditive().toString(),
-            MonetaryUtil.of(offer.getMinAmount(), offer.getCurrency()),
-            MonetaryUtil.of(offer.getMaxAmount(), offer.getCurrency()), offer.getMinTerm(), offer.getMaxTerm(),
+        return new OfferView(originalOffer.getProductAdditive().getName(),
+            originalOffer.getProductAdditive().getInterestRate().toString(),
+            originalOffer.getProductAdditive().getInterestRate().toString(),
+            MonetaryUtil.of(originalOffer.getMinAmount(), originalOffer.getCurrency()),
+            MonetaryUtil.of(originalOffer.getMaxAmount(), originalOffer.getCurrency()), originalOffer.getMinTerm(), originalOffer.getMaxTerm(),
             details);
     }
 }

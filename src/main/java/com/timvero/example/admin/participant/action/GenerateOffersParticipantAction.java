@@ -22,13 +22,18 @@ public class GenerateOffersParticipantAction extends SimpleActionController<UUID
 
     @Override
     protected EntityAction<? super Participant, Object> action() {
-        return when(this::isAvailable)
-            .then((participant, f, u) -> {
-                productOfferService.generateOffers(participant);
-            });
+        return when(this::isAvailable).then((participant, f, u) -> {
+            productOfferService.generateOffers(participant);
+        });
     }
 
     private boolean isAvailable(Participant participant) {
-        return participant.getStatus().in(ParticipantStatus.APPROVED);
+        return participant.getStatus().in(ParticipantStatus.APPROVED)
+            && (participant.getOffersGeneratedAt() == null || participant.getOfferGenerationException() != null);
+    }
+
+    @Override
+    public String getHighlighted() {
+        return BTN_PRIMARY;
     }
 }

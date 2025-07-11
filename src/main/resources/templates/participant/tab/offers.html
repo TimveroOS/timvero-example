@@ -1,0 +1,32 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+xmlns:th="http://www.thymeleaf.org">
+    <div class="offers">
+        <h3 class="card-info__title">
+            <span th:text="#{participant.offers.generatedAt}">Generated at: </span>
+            <span th:text="${#ldates.format(entity.offersGeneratedAt)}"></span>
+        </h3>
+
+        <div th:if="${entity.offerGenerationException}">
+            <h3 class="offers__text" th:text="#{participant.offers.offerGenerationExceptionOccured}"></h3>
+            <h4 class="offers__text">
+                <span th:text="#{participant.offers.offerGenerationException.message}"
+                ></span>: <span th:text="${entity.offerGenerationException.message}"></span>
+            </h4>
+            <a th:href="@{'/exception-entity/' + ${entity.offerGenerationException.id}}"
+               th:text="#{process.execution.exceptionDetails}">
+            </a>
+        </div>
+        <div class="conditions">
+            <table class="table">
+                <tbody>
+                    <th:block
+                        th:each="productOffer, iterStat : ${entity.offers}"
+                        th:with="product=${productOffer.creditProduct}, idProduct=${iterStat.index}"
+                    >
+                        <th:block th:replace="~{/application/tab/offer-details :: productOffer(${productOffer})}"/>
+                    </th:block>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</html>

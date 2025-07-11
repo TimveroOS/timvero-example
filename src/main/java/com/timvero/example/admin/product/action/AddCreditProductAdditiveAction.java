@@ -43,4 +43,9 @@ public class AddCreditProductAdditiveAction extends
         model.addAttribute("engineName", creditProduct.getEngineName());
         return "/product/action/add-product-additive";
     }
+
+    @Override
+    public String getHighlighted() {
+        return BTN_LIGHT;
+    }
 }
