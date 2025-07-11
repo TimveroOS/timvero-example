@@ -95,15 +95,15 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
         return new ExampleProductOffer();
     }
 
-/*    @Override
+    @Override
     public String toString() {
         return "Product Proposal #" + getId() + " ["
-            + "minAmount=" + getMinAmount() + ", "
-            + "maxAmount=" + getMaxAmount() + ", "
-            + "minTerm=" + getMinTerm() + ", "
-            + "maxTerm=" + getMaxTerm() + ", "
+            + "minAmount=" + minAmount + ", "
+            + "maxAmount=" + maxAmount + ", "
+            + "minTerm=" + minTerm + ", "
+            + "maxTerm=" + maxTerm + ", "
             + "procuring=" + getProcuringType() + "]";
-    }*/
+    }
 
     @Override
     public String getDisplayedName() {

@@ -126,6 +126,13 @@ public class ExampleProductOffer extends ProductOffer implements NamedEntity {
 
     @Override
     public String toString() {
-        return "ProductOffer";
+        return "ProductOffer ["
+            + "minAmount=" + minAmount + ", "
+            + "maxAmount=" + maxAmount + ", "
+            + "minTerm=" + minTerm + ", "
+            + "maxTerm=" + maxTerm + ", "
+            + "currency=" + getCurrency().getCurrencyCode() + ", "
+            + "additive=" + getProductAdditive().toString() + ", "
+            + "product=" + getCreditProduct().getDisplayedName() + "]";
     }
 }
