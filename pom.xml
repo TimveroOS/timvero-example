@@ -28,7 +28,7 @@
         <repository>
             <id>maven.timvero.xyz</id>
             <name>Timvero Repository</name>
-            <url>https://maven.timvero.xyz/releases</url>
+            <url>https://maven.timvero.xyz/private</url>
         </repository>
     </repositories>
 
@@ -55,6 +55,12 @@
         <dependency>
             <groupId>com.timvero.pumpkin</groupId>
             <artifactId>flowable</artifactId>
+            <version>${project.parent.version}</version>
+        </dependency>
+        
+        <dependency>
+            <groupId>com.timvero.pumpkin</groupId>
+            <artifactId>loan</artifactId>
             <version>${project.parent.version}</version>
         </dependency>
 

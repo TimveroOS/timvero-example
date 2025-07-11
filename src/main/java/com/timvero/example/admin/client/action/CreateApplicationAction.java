@@ -2,13 +2,11 @@ package com.timvero.example.admin.client.action;
 
 import com.timvero.example.admin.application.controller.ApplicationController;
 import com.timvero.example.admin.application.entity.Application;
-import com.timvero.example.admin.application.entity.ApplicationStatus;
 import com.timvero.example.admin.application.form.ApplicationForm;
 import com.timvero.example.admin.application.form.ApplicationFormMapper;
 import com.timvero.example.admin.client.entity.Client;
 import com.timvero.example.admin.participant.ParticipantDocumentTypesConfiguration;
 import com.timvero.example.admin.participant.entity.Employment;
-import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.Periodicity;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.ground.document.signable.SignableDocumentService;
@@ -35,8 +33,8 @@ public class CreateApplicationAction extends EntityActionController<UUID, Client
 
     @Override
     protected EntityAction<Client, ApplicationForm> action() {
-        return when(c -> c.getParticipants().stream().map(Participant::getApplication)
-            .map(Application::getStatus).noneMatch(s -> {return false;}))
+        return when(c -> true /*c.getParticipants().stream().map(Participant::getApplication)
+            .map(Application::getStatus).noneMatch(s -> s.equals(ApplicationStatus.NEW))*/)
             .then((client, form, user) -> {
                 Application application = mapper.createEntity(form);
                 application.getBorrowerParticipant().setClient(client);

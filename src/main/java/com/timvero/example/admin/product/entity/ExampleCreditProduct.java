@@ -3,21 +3,14 @@ package com.timvero.example.admin.product.entity;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_PRECISION;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_SCALE;
 
-import com.timvero.example.admin.application.entity.ApplicationType;
 import com.timvero.loan.product.entity.CreditProduct;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
 import java.math.BigDecimal;
 import javax.money.CurrencyUnit;
 
 @Entity
 public class ExampleCreditProduct extends CreditProduct {
-
-    @Column(name = "application_type", nullable = false, length = 31)
-    @Enumerated(EnumType.STRING)
-    private ApplicationType applicationType;
 
     @Column(name = "currency", updatable = false)
     private CurrencyUnit currency;
@@ -33,14 +26,6 @@ public class ExampleCreditProduct extends CreditProduct {
 
     @Column(name = "max_term", nullable = false)
     private Integer maxTerm;
-
-    public ApplicationType getApplicationType() {
-        return applicationType;
-    }
-
-    public void setApplicationType(ApplicationType applicationType) {
-        this.applicationType = applicationType;
-    }
 
     public ExampleCreditProduct() {
         super();

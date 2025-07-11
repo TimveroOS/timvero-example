@@ -1,14 +1,28 @@
 package com.timvero.example.admin.product.form;
 
+import com.timvero.base.form.EntityToFormMapper;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
-import com.timvero.loan.product.form.BaseCreditProductMapper;
+import org.mapstruct.InheritConfiguration;
+import org.mapstruct.InheritInverseConfiguration;
 import org.mapstruct.Mapper;
+import org.mapstruct.MappingTarget;
 import org.mapstruct.ReportingPolicy;
 
 @Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
-public abstract class ExampleCreditProductFormMapper implements
-    BaseCreditProductMapper<ExampleCreditProduct, CreditProductForm> {
+public interface ExampleCreditProductFormMapper extends EntityToFormMapper<ExampleCreditProduct, CreditProductForm> {
 
-    public abstract ExampleCreditProduct copy(ExampleCreditProduct creditProduct);
+    //ExampleCreditProduct copy(ExampleCreditProduct creditProduct);
+
+    @Override
+    void toEntity(CreditProductForm form, @MappingTarget ExampleCreditProduct entity);
+
+    @Override
+    @InheritInverseConfiguration(name = "toEntity")
+    CreditProductForm toForm(ExampleCreditProduct entity);
+
+    @Override
+    @InheritConfiguration
+    ExampleCreditProduct createEntity(CreditProductForm form);
+
 
 }

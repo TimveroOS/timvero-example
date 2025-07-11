@@ -75,12 +75,12 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @Embedded
     private MonetaryAmount monthlyOutgoings;
 
+ // end::entity[]
+
     @OneToOne(cascade = CascadeType.ALL)
     @JoinColumn(nullable = false, updatable = false)
     @NotAudited
     private PendingDecisionHolder pendingDecisionHolder = new PendingDecisionHolder(DECISION_OWNER_TYPE);
-
-// end::entity[]
 
     @Column
     private String githubUsername;

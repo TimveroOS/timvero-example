@@ -7,9 +7,7 @@
             <th data-sortField="id" th:text="#{symbol.id}">Id</th>
             <th data-sortField="code" th:text="#{credit.product.code}">Code</th>
             <th data-sortField="title" th:text="#{credit.product.title}">Title</th>
-            <th th:text="#{credit.product.applicationType}">Application Type</th>
             <th th:text="#{credit.product.additives}">Has an active additive</th>
-            <th th:text="#{credit.product.forOriginationProcess}">For origination process</th>
         </tr>
     </thead>
     <tbody th:attr="data-page=${page.page},data-total=${page.total}">
@@ -22,7 +20,6 @@
             </td>
             <td th:text="*{code}"></td>
             <td th:text="*{title}"></td>
-            <td th:text="*{#enums.name(applicationType)}"></td>
             <td>
                 <div class="d-flex">
                     <th:block th:if="*{additives.size() > 0}">
@@ -40,7 +37,6 @@
                     </th:block>
                 </div>
             </td>
-
         </tr>
     </tbody>
 </table>

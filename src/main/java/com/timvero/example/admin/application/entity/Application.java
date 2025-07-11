@@ -25,7 +25,6 @@ import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 @Table
 @Audited
 @Indexed
-//todo add application type
 public class Application extends AbstractAuditable<UUID> implements NamedEntity {
 
     @Column(nullable = false)

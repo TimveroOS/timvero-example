@@ -18,13 +18,13 @@ import java.util.stream.Collectors;
 import org.springframework.stereotype.Component;
 
 @Component
-public class ExampleOfferEngineData extends OfferEngineDataProcessor<UUID, Participant> {
+public class ExampleDataProcessor extends OfferEngineDataProcessor<UUID, Participant> {
 
     public static final ExecutionResultType TYPE = new ExecutionResultType("EXAMPLE");
 
     private final ProcessExecutionService processExecutionService;
 
-    public ExampleOfferEngineData(ProcessExecutionService processExecutionService) {
+    public ExampleDataProcessor(ProcessExecutionService processExecutionService) {
         this.processExecutionService = processExecutionService;
     }
 

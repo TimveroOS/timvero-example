@@ -3,9 +3,6 @@
        add column dtype varchar(31) not null;
 
     alter table if exists credit_product 
-       add column application_type varchar(31) not null;
-
-    alter table if exists credit_product 
        add column currency varchar(255);
 
     alter table if exists credit_product 

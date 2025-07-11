@@ -8,14 +8,6 @@
             <li class="card-info__item d-flex">
                 <span
                     class="card-info__property"
-                    th:text="#{credit.product.applicationType}"
-                    th:title="#{credit.product.applicationType}"
-                >Credit Type</span>
-                <span class="card-info__value" th:text="*{#enums.name(applicationType)}"></span>
-            </li>
-            <li class="card-info__item d-flex">
-                <span
-                    class="card-info__property"
                     th:text="#{credit.product.title}"
                     th:title="#{credit.product.title}"
                 >Title</span>
@@ -48,8 +40,8 @@
             <li class="card-info__item d-flex">
                 <span
                     class="card-info__property"
-                    th:text="#{credit.product.createdAt}"
-                    th:title="#{credit.product.createdAt}"
+                    th:text="#{common.createdAt}"
+                    th:title="#{common.createdAt}"
                 >Created at</span>
                 <span class="card-info__value" th:text="*{#ldates.format(createdAt)}"></span>
             </li>
@@ -101,26 +93,10 @@
             <li class="card-info__item d-flex">
                 <span
                     class="card-info__property"
-                    th:text="#{credit.product.issueDateCalculation}"
-                    th:title="#{credit.product.issueDateCalculation}"
-                >Issue Date Calculation</span>
-                <span class="card-info__value" th:text="*{issueDateCalculation}"></span>
-            </li>
-            <li class="card-info__item d-flex">
-                <span
-                    class="card-info__property"
-                    th:text="#{credit.product.createdBy}"
-                    th:title="#{credit.product.createdBy}"
+                    th:text="#{common.createdBy}"
+                    th:title="#{common.createdBy}"
                 >Created by</span>
                 <span class="card-info__value" th:text="*{createdBy.name}"></span>
-            </li>
-            <li class="card-info__item d-flex">
-                <span
-                    class="card-info__property"
-                    th:text="#{credit.product.requirements}"
-                    th:title="#{credit.product.requirements}"
-                >Min Term</span>
-                <span class="card-info__value" th:text="*{requirements}"></span>
             </li>
         </ul>
     </div>
