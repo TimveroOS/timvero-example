@@ -20,6 +20,6 @@
 
     <logger name="com.timvero" level="DEBUG"/>
 
-    <logger name="org.springframework" level="TRACE"/>
+    <logger name="org.springframework" level="INFO"/>
 
 </configuration>

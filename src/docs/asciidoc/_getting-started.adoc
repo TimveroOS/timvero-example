@@ -1,0 +1,447 @@
+= Getting Started
+
+This section provides a quick introduction to building applications with the Timvero SDK. Follow this guide to get up and running in minutes and understand the core concepts through practical examples.
+
+== Prerequisites
+
+Before you begin, ensure you have the following installed:
+
+* **Java 21 or later** - The platform requires modern Java features
+* **Maven 3.8+** - For dependency management and building
+* **PostgreSQL 16+** - Primary database for the platform
+* **IDE with Spring Boot support** - IntelliJ IDEA, Eclipse, or VS Code
+
+== Quick Setup (5 minutes)
+
+=== Step 1: Clone and Configure
+
+1. **Clone the example project**:
++
+[source,bash]
+----
+git clone https://github.com/TimveroOS/timvero-example.git
+cd timvero-example
+----
+
+2. **Configure database connection** in `src/main/resources/application.properties`:
++
+[source,properties]
+----
+spring.datasource.url=jdbc:postgresql://localhost:5432/your_database
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+----
+
+3. **Run the application**:
++
+[source,bash]
+----
+mvn spring-boot:run
+----
+
+4. **Access the application**:
+   - Admin UI: http://localhost:8081
+   - Portal API: http://localhost:8082
+
+=== Step 2: Verify Installation
+
+Once running, you should see:
+
+* Database tables automatically created via Flyway migrations
+* Admin interface with navigation menu
+* Sample data (if configured)
+* No compilation errors in the console
+
+== Your First Entity: Client Management (15 minutes)
+
+Let's explore how the Client entity demonstrates the platform's core patterns. The Client entity is already implemented in the example project, so you can see a complete working example.
+
+=== Entity Definition
+
+The `Client` entity demonstrates the platform's entity structure:
+
+[source,java]
+----
+@Entity
+@Table
+@Audited
+@Indexed
+public class Client extends AbstractAuditable<UUID> implements NamedEntity, HasDocuments {
+    
+    @Embedded
+    @Valid
+    private IndividualInfo individualInfo;
+    
+    @Embedded
+    @Valid
+    private ContactInfo contactInfo;
+    
+    // getters and setters...
+}
+----
+
+Key features:
+* **Extends `AbstractAuditable`**: Automatic creation/modification tracking
+* **Implements `NamedEntity`**: Provides display name functionality
+* **Composite structure**: Contains `IndividualInfo` and `ContactInfo` components
+* **Search integration**: `@Indexed` enables full-text search
+* **Audit support**: `@Audited` tracks all changes
+
+=== Form Structure
+
+The `ClientForm` handles user input with validation:
+
+[source,java]
+----
+public class ClientForm {
+    
+    @Valid
+    @NotNull
+    private IndividualInfoForm individualInfo;
+    
+    @Valid
+    @NotNull
+    private ContactInfoForm contactInfo;
+    
+    // getters and setters...
+}
+----
+
+Benefits:
+* **Nested validation**: `@Valid` cascades validation to nested objects
+* **Clean separation**: Form objects separate from entities
+* **Type safety**: Strongly typed form fields
+
+=== Controller Implementation
+
+The main controller handles entity management:
+
+[source,java]
+----
+@Controller
+public class ClientController extends EntityController<UUID, Client, ClientForm> {
+    // Inherits all CRUD functionality automatically
+}
+----
+
+Actions provide specific operations (buttons in the UI):
+
+[source,java]
+----
+@Controller
+public class CreateClientAction extends EntityCreateController<UUID, Client, ClientForm> {
+    @Override
+    protected boolean isOwnPage() {
+        return false;
+    }
+}
+
+@Controller
+public class EditClientAction extends EditEntityActionController<UUID, Client, ClientForm> {
+    // Handles the edit button functionality
+}
+----
+
+What you get automatically:
+* ✅ Create, Read, Update, Delete operations
+* ✅ Form validation and error handling
+* ✅ List view with search and filtering
+* ✅ Responsive web interface
+* ✅ Audit logging of all changes
+
+=== Form Service Layer
+
+The service layer handles business logic and data mapping:
+
+[source,java]
+----
+@Service
+public class ClientFormService extends EntityFormService<Client, ClientForm, UUID> {
+    // Inherits entity-form mapping and persistence operations
+}
+----
+
+The service requires a corresponding MapStruct mapper for entity-form conversion:
+
+[source,java]
+----
+@Mapper
+public interface ClientFormMapper extends EntityToFormMapper<Client, ClientForm> {
+    // MapStruct automatically generates implementation for bidirectional mapping
+}
+----
+
+=== Template Integration
+
+The HTML template demonstrates the form component system:
+
+[source,html]
+----
+<th:block th:insert="~{/form/components :: text(
+    #{client.individualInfo.fullName},
+    'individualInfo.fullName', 
+    'v-required v-name')}" />
+
+<th:block th:insert="~{/form/components :: text(
+    #{client.contactInfo.email},
+    'contactInfo.email', 
+    'v-required v-email')}" />
+----
+
+== Essential Concepts (10 minutes)
+
+=== Entity-Form-Controller Pattern
+
+The platform follows a consistent architectural pattern:
+
+.Platform Architecture Pattern
+[cols="1,2,3"]
+|===
+|Component |Purpose |Example
+
+|**Entity**
+|JPA entity with business logic and relationships
+|`Client` - stores customer data with audit trail
+
+|**Form**
+|DTO for user input with validation rules
+|`ClientForm` - handles form submission and validation
+
+|**Controller**
+|Main entity controller providing CRUD operations
+|`ClientController` - handles entity management
+
+|**Actions**
+|Specific operation buttons in the UI
+|`CreateClientAction`, `EditClientAction` - handle specific operations
+
+|**Service**
+|Business logic and entity-form mapping
+|`ClientFormService` - converts between entities and forms
+
+|**Mapper**
+|Automatic bidirectional object mapping
+|`ClientFormMapper` - MapStruct-generated conversions
+|===
+
+=== Automatic Features
+
+Once you create the basic structure following this pattern, the platform automatically provides:
+
+* **CRUD Operations**: Complete create, read, update, delete functionality
+* **Form Validation**: Client-side and server-side validation
+* **Database Migrations**: Automatic schema generation and versioning
+* **Search and Filtering**: Full-text search and advanced filtering
+* **Audit Logging**: Complete change history tracking
+* **Responsive UI**: Mobile-friendly web interface
+* **Security Integration**: Authentication and authorization
+* **API Endpoints**: RESTful API for external integration
+
+=== Data Flow
+
+Understanding the data flow helps you work effectively with the platform:
+
+[source]
+----
+User Input → Form Validation → Controller → Service → Mapper → Entity → Database
+                     ↓
+             Template Rendering ← Form Object ← Mapper ← Entity ← Database Query
+----
+
+== Common Scenarios (20 minutes)
+
+=== Adding Custom Validation
+
+Enhance the Client form with custom business rules:
+
+[source,java]
+----
+public class ClientForm {
+    @NotBlank
+    @Size(min = 2, max = 100, message = "Name must be between 2 and 100 characters")
+    private String fullName;
+    
+    @NotBlank
+    @Email(message = "Please provide a valid email address")
+    private String email;
+    
+    @NotBlank
+    @Phone(message = "Please provide a valid phone number")
+    private String phone;
+    
+    @PastOrPresent(message = "Birth date cannot be in the future")
+    private LocalDate dateOfBirth;
+}
+----
+
+=== Implementing Business Logic with Entity Checkers
+
+Create automated workflows that respond to client changes:
+
+[source,java]
+----
+@Component
+public class ClientWelcomeChecker extends EntityChecker<Client> {
+    
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<Client> registry) {
+        // Trigger when a new client is created
+        registry.entityChange().inserted();
+    }
+    
+    @Override
+    protected boolean isAvailable(Client client) {
+        // Only for clients with complete contact information
+        return client.getContactInfo() != null 
+            && client.getContactInfo().getEmail() != null;
+    }
+    
+    @Override
+    protected void perform(Client client) {
+        // Send welcome email to new clients
+        emailService.sendWelcomeEmail(client);
+        log.info("Welcome email sent to client: {}", client.getIndividualInfo().getFullName());
+    }
+}
+----
+
+=== Adding Document Management
+
+Enable clients to upload required documents:
+
+[source,java]
+----
+// 1. Make Client support documents
+@Entity
+public class Client extends AbstractAuditable<UUID> implements HasDocuments {
+    // Existing client implementation
+}
+
+// 2. Configure document types
+@Configuration
+public class ClientDocumentConfiguration {
+    
+    public static final EntityDocumentType ID_DOCUMENT = new EntityDocumentType("ID_DOCUMENT");
+    public static final EntityDocumentType PROOF_OF_ADDRESS = new EntityDocumentType("PROOF_OF_ADDRESS");
+    
+    @Bean
+    DocumentTypeAssociation<Client> clientRequiredDocuments() {
+        return DocumentTypeAssociation.forEntityClass(Client.class)
+            .required(ID_DOCUMENT)
+            .required(PROOF_OF_ADDRESS)
+            .build();
+    }
+}
+
+// 3. Add document management tab
+@Controller
+@Order(1000)
+public class ClientDocumentsTab extends EntityDocumentTabController<Client> {
+    
+    @Override
+    public boolean isVisible(Client client) {
+        return true; // Always show documents tab for clients
+    }
+}
+----
+
+=== Integrating External Data Sources
+
+Fetch additional data from external APIs:
+
+[source,java]
+----
+// 1. Create a data source subject interface
+public interface CreditCheckSubject {
+    String getNationalId();
+    String getFullName();
+}
+
+// 2. Implement the interface in your entity
+@Entity
+public class Client implements CreditCheckSubject {
+    
+    @Override
+    public String getNationalId() {
+        return getIndividualInfo().getNationalId();
+    }
+    
+    @Override
+    public String getFullName() {
+        return getIndividualInfo().getFullName();
+    }
+}
+
+// 3. Create the data source implementation
+@Service("creditCheck")
+public class CreditCheckDataSource implements MappedDataSource<CreditCheckSubject, CreditReport> {
+    
+    @Override
+    public Class<CreditReport> getType() {
+        return CreditReport.class;
+    }
+    
+    @Override
+    public Content getData(CreditCheckSubject subject) throws Exception {
+        // Call external credit check API
+        String response = creditCheckApi.checkCredit(
+            subject.getNationalId(), 
+            subject.getFullName()
+        );
+        return new Content(response.getBytes(), MediaType.APPLICATION_JSON_VALUE);
+    }
+    
+    @Override
+    public CreditReport parseRecord(Content data) throws Exception {
+        return objectMapper.readValue(data.getData(), CreditReport.class);
+    }
+}
+----
+
+== What's Next?
+
+=== Explore Advanced Features
+
+Now that you understand the basics, dive deeper into specific areas:
+
+* **Form Classes** - Complex validation, nested forms, and custom components
+* **Entity Checkers** - Business rule automation and workflow triggers  
+* **Document Management** - File uploads, document requirements, and digital signatures
+* **DataSource Integration** - External API integration and data enrichment
+* **Template System** - Custom UI components and advanced templating
+
+=== Real-World Implementation Patterns
+
+Study these complete examples in the project:
+
+* **Client Onboarding**: Complete customer registration with validation and document collection
+* **Application Processing**: Multi-step loan application workflow with automated decision making
+* **Participant Management**: Complex participant relationships with role-based permissions
+* **Document Workflows**: Digital signature processes with DocuSign integration
+* **Risk Assessment**: External data integration for credit scoring and fraud detection
+
+=== Development Best Practices
+
+* **Start Simple**: Begin with basic CRUD operations, add complexity gradually
+* **Follow Patterns**: Use the established Entity-Form-Controller pattern consistently
+* **Leverage Automation**: Use Entity Checkers for business rules instead of manual processes
+* **Test Thoroughly**: The platform provides excellent testing support for all components
+* **Monitor Performance**: Built-in metrics and logging help optimize your application
+
+=== Getting Help
+
+* **Documentation**: This guide covers all platform features in detail
+* **Example Project**: Every feature demonstrated with working code
+* **Professional Support**: Enterprise support available for production deployments
+
+=== Next Steps Checklist
+
+- [ ] Create your first custom entity following the Client pattern
+- [ ] Add custom validation rules to your forms
+- [ ] Implement an Entity Checker for business logic automation
+- [ ] Set up document management for your entities
+- [ ] Integrate with an external data source
+- [ ] Customize the UI templates for your specific needs
+- [ ] Deploy to a staging environment for testing
+
+You're now ready to build powerful financial applications with the Timvero platform!

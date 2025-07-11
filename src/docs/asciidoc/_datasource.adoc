@@ -1,6 +1,6 @@
 = DataSource Integration
 
-:sourcedir: ../../main/java
+:sourcedir: ../../main/java/com/timvero/example/admin
 
 This section describes how to implement and use DataSource interfaces for integrating external data sources into the Feature Store system.
 
@@ -21,21 +21,21 @@ The GitHub DataSource demonstrates a complete implementation that fetches user d
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSource.java[lines=15..22]
+include::{sourcedir}/risk/github/GithubDataSource.java[lines=15..22]
 ----
 
 === Data Retrieval Implementation
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSource.java[lines=34..48]
+include::{sourcedir}/risk/github/GithubDataSource.java[lines=34..48]
 ----
 
 === Data Parsing Implementation
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSource.java[lines=50..53]
+include::{sourcedir}/risk/github/GithubDataSource.java[lines=50..53]
 ----
 
 === Subject and Target Objects
@@ -44,14 +44,14 @@ The subject object defines what data to fetch. In this example, it's a simple wr
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/risk/github/GithubDataSourceSubject.java[lines=1..10]
+include::{sourcedir}/risk/github/GithubDataSourceSubject.java[lines=1..10]
 ----
 
 The target object represents the parsed data structure:
 
 [source,java]
 ----
-include::{sourcedir}/com/timvero/example/admin/risk/github/GithubUser.java[lines=1..15]
+include::{sourcedir}/risk/github/GithubUser.java[lines=1..15]
 ----
 
 NOTE: In the platform, `Participant` entity implements the DataSource Subject pattern and can be used directly as a subject for various data sources.
