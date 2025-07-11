@@ -3,40 +3,43 @@ package com.timvero.example.admin.offer.entity;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_PRECISION;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_SCALE;
 
+import com.timvero.application.procuring.ProcuringType;
+import com.timvero.application.procuring.entity.SecuredOffer;
 import com.timvero.example.admin.application.entity.Application;
-import com.timvero.example.admin.participant.entity.Participant;
-import com.timvero.example.admin.product.entity.ExampleCreditProduct;
-import com.timvero.example.admin.product.entity.ExampleCreditProductAdditive;
 import com.timvero.ground.entity.NamedEntity;
-import com.timvero.ground.util.EntityUtils;
-import com.timvero.loan.offer.entity.ProductOffer;
 import jakarta.persistence.Column;
+import jakarta.persistence.DiscriminatorColumn;
+import jakarta.persistence.DiscriminatorType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
+import jakarta.persistence.Inheritance;
+import jakarta.persistence.InheritanceType;
+import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
 import java.math.BigDecimal;
-import java.util.UUID;
 import javax.money.CurrencyUnit;
 import org.hibernate.envers.AuditOverride;
 import org.hibernate.envers.Audited;
-import org.hibernate.envers.NotAudited;
 import org.hibernate.envers.RelationTargetAuditMode;
 
 @Entity
-@Table(name = "product_offer")
+@Table(name = "secured_offer")
+@Inheritance(strategy = InheritanceType.JOINED)
+@DiscriminatorColumn(name = "procuring_type", discriminatorType = DiscriminatorType.STRING)
 @Audited
-@AuditOverride(forClass = ProductOffer.class)
-public class ExampleProductOffer extends ProductOffer implements NamedEntity {
+@AuditOverride(forClass = SecuredOffer.class)
+public class ExampleSecuredOffer extends SecuredOffer implements NamedEntity {
 
-    @NotAudited
-    @Column(name = "uuid", nullable = false, updatable = false, columnDefinition = "uuid default gen_random_uuid()")
-    private UUID uuid;
+    @ManyToOne(fetch = FetchType.EAGER, optional = false)
+    @JoinColumn(name = "original_offer_id", nullable = false)
+    @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
+    private ExampleProductOffer originalOffer;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
-    private Participant participant;
+    private Application application;
 
     @Column(name = "min_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
     private BigDecimal minAmount;
@@ -50,19 +53,21 @@ public class ExampleProductOffer extends ProductOffer implements NamedEntity {
     @Column(name = "max_term", nullable = false)
     private Integer maxTerm;
 
-    public ExampleProductOffer() {
+    @Column(name = "procuring_type", insertable = false, updatable = false)
+    private String procuringType;
+
+    public ExampleSecuredOffer() {
     }
 
-    public UUID getUuid() {
-        return uuid;
+    public ExampleSecuredOffer(ExampleProductOffer originalOffer, ProcuringType procuringType) {
+        this.originalOffer = originalOffer;
+        this.application = originalOffer.getApplication();
+        this.procuringType = procuringType.name();
     }
 
-    public Participant getParticipant() {
-        return participant;
-    }
-
-    public void setParticipant(Participant participant) {
-        this.participant = participant;
+    @Transient
+    public CurrencyUnit getCurrency() {
+        return getOriginalOffer().getCreditProduct().getCurrency();
     }
 
     public BigDecimal getMinAmount() {
@@ -97,35 +102,31 @@ public class ExampleProductOffer extends ProductOffer implements NamedEntity {
         this.maxTerm = maxTerm;
     }
 
-    @Transient
+    @Override
+    public ExampleProductOffer getOriginalOffer() {
+        return originalOffer;
+    }
+
     public Application getApplication() {
-        return participant != null ? participant.getApplication() : null;
+        return application;
+    }
+
+    public void setApplication(Application application) {
+        this.application = application;
     }
 
     @Override
-    @Transient
-    public ExampleCreditProduct getCreditProduct() {
-        return (ExampleCreditProduct) getProductAdditive().getProduct();
+    public String getOfferKey() {
+        return getOriginalOffer().getUuid() + ":NO_PROCURING";
     }
 
-    @Override
-    public ExampleCreditProductAdditive getProductAdditive() {
-        return (ExampleCreditProductAdditive) EntityUtils.initializeAndUnproxy(super.getProductAdditive());
-    }
-
-    @Transient
-    public CurrencyUnit getCurrency() {
-        return getCreditProduct().getCurrency();
-    }
-
-    @Transient
     @Override
     public String getDisplayedName() {
-        return getCreditProduct().getDisplayedName();
+        return null;
     }
 
-    @Override
-    public String toString() {
-        return "ProductOffer";
+    @Transient
+    public ProcuringType getProcuringType() {
+        return ProcuringType.valueOf(ProcuringType.class, procuringType);
     }
 }

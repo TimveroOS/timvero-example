@@ -2,10 +2,13 @@ package com.timvero.example.admin.participant.entity;
 
 import static jakarta.persistence.EnumType.STRING;
 import static jakarta.persistence.FetchType.EAGER;
+import static org.hibernate.envers.RelationTargetAuditMode.NOT_AUDITED;
 
 import com.timvero.base.entity.AbstractAuditable;
 import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.client.entity.Client;
+import com.timvero.example.admin.offer.entity.ExampleProductOffer;
+import com.timvero.example.admin.offer.entity.ExampleProductOffer_;
 import com.timvero.example.admin.risk.github.GithubDataSourceSubject;
 import com.timvero.flowable.internal.execution.ProcessEntity;
 import com.timvero.ground.document.HasDocuments;
@@ -23,6 +26,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.OneToMany;
 import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
@@ -75,7 +79,11 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @Embedded
     private MonetaryAmount monthlyOutgoings;
 
- // end::entity[]
+    @OneToMany(fetch = FetchType.EAGER, mappedBy = ExampleProductOffer_.PARTICIPANT)
+    @Audited(targetAuditMode = NOT_AUDITED)
+    private Set<ExampleProductOffer> offers;
+
+    // end::entity[]
 
     @OneToOne(cascade = CascadeType.ALL)
     @JoinColumn(nullable = false, updatable = false)
@@ -179,5 +187,13 @@ public class Participant extends AbstractAuditable<UUID> implements NamedEntity,
     @Override
     public PendingDecisionHolder getPendingDecisionHolder() {
         return pendingDecisionHolder;
+    }
+
+    public Set<ExampleProductOffer> getOffers() {
+        return offers;
+    }
+
+    public void setOffers(Set<ExampleProductOffer> offers) {
+        this.offers = offers;
     }
 }

@@ -1,0 +1,34 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<th:block th:fragment="productOffer(productOffer)" th:with="additive = ${productOffer.productAdditive}">
+    <div class="d-flex align-items-center condition__info">
+        <span
+            class="condition__name"
+            th:text="${product.title}"
+        ></span>
+        <span
+            class="condition__price"
+            th:text="${productOffer.minAmount + ' - ' + productOffer.maxAmount + ' ' + productOffer.currency}"
+        ></span>
+        <span
+            class="condition__period"
+            th:text="${productOffer.minTerm + ' - ' + productOffer.maxTerm + ' mo'}"
+        ></span>
+    </div>
+    <div class="condition__action d-flex align-items-center justify-content-between flex-fill">
+        <span
+            class="condition__status"
+            th:if="${#enums.equals(additive.procuringType, 'COLLATERAL')}"
+            th:text="${#enums.name(additive.procuringType) + ' (' + #enums.name(additive.collateralType) + ')'}"
+        ></span>
+        <span
+            class="condition__status"
+            th:unless="${#enums.equals(additive.procuringType, 'COLLATERAL')}"
+            th:text="${#enums.name(additive.procuringType)}"
+        ></span>
+    </div>
+</th:block>
+
+<th:block th:fragment="securedOffer(securedOffer)">
+</th:block>
+</html>

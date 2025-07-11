@@ -1,6 +1,9 @@
 package com.timvero.example.admin.participant.checker;
 
 
+import static com.timvero.example.admin.participant.entity.ParticipantStatus.APPROVED;
+
+import com.timvero.example.admin.offer.ProductOfferService;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.Participant_;
 import com.timvero.ground.checker.CheckerListenerRegistry;
@@ -11,8 +14,11 @@ import org.springframework.stereotype.Component;
 @Component
 public class GenerateOffersChecker extends EntityChecker<Participant, UUID> {
 
-  /*  @Autowired
-    private ProductOfferService productOfferService;*/
+    private final ProductOfferService productOfferService;
+
+    public GenerateOffersChecker(ProductOfferService productOfferService) {
+        this.productOfferService = productOfferService;
+    }
 
     @Override
     protected void registerListeners(CheckerListenerRegistry<Participant> registry) {
@@ -21,18 +27,11 @@ public class GenerateOffersChecker extends EntityChecker<Participant, UUID> {
 
     @Override
     protected boolean isAvailable(Participant participant) {
-        return true;
-     /*   return participant.getStatus().in(APPROVED)
-            && participant.getApplication().getApplicationType().in(PRE_APPROVED, VENDOR);*/
+        return participant.getStatus().in(APPROVED);
     }
 
     @Override
     protected void perform(Participant participant) {
-        return;
-        /*if(participant.getApplication().getApplicationType() == PRE_APPROVED) {
-            productOfferService.generatePreApprovedOffers(participant);
-        }else if (participant.getApplication().getApplicationType() == VENDOR) {
-            productOfferService.generateVendorOffers(participant);
-        }*/
+        productOfferService.generateOffers(participant);
     }
 }

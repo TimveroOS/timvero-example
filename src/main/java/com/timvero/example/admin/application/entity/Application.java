@@ -34,6 +34,11 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
     @OneToMany(mappedBy = Participant_.APPLICATION, cascade = ALL, fetch = EAGER)
     private Set<Participant> participants;
 
+/*    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn(name = "condition")
+    @Fetch(FetchMode.JOIN)
+    private ExampleCreditCondition condition;*/
+
     public ApplicationStatus getStatus() {
         return status;
     }
@@ -62,4 +67,12 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
     public String getDisplayedName() {
         return getBorrowerParticipant().getDisplayedName();
     }
+
+  /*  public ExampleCreditCondition getCondition() {
+        return condition;
+    }
+
+    public void setCondition(ExampleCreditCondition condition) {
+        this.condition = condition;
+    }*/
 }

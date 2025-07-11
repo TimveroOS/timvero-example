@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<div
+    th:each="additive, iterStat : ${additives}"
+    th:object="${additive}"
+    class="card-info-wrapper d-flex align-items-start"
+    th:classappend="${iterStat.index > 0 ? 'mt-20 top-border pt-20' : ''}"
+>
+    <ul class="card-info__body d-flex">
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{additive.name}"
+            ></span>
+            <span class="card-info__value" th:text="*{name}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{additive.active}"
+            ></span>
+            <span
+                class="card-info__value"
+                th:text="*{active}"
+            ></span>
+        </li>
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{additive.minAmount}"
+            ></span>
+            <span class="card-info__value" th:text="*{minAmount}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{additive.maxAmount}"
+            ></span>
+            <span class="card-info__value" th:text="*{maxAmount}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{additive.minTerm}"
+            ></span>
+            <span class="card-info__value" th:text="*{minTerm}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{additive.maxTerm}"
+            ></span>
+            <span class="card-info__value" th:text="*{maxTerm}"></span>
+        </li>
+    </ul>
+    <ul class="card-info__body d-flex">
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
+                th:text="#{credit.product.procuring}"
+            ></span>
+            <span
+                class="card-info__value"
+                th:text="*{#enums.name(procuringType)}"
+            ></span>
+        </li>
+        <th:block th:unless="*{active}">
+            <li class="card-info__item d-flex">
+                <span
+                    class="card-info__property"
+                    th:text="#{additive.deactivatedAt}"
+                ></span>
+                <span
+                    class="card-info__value"
+                    th:text="*{#ldates.format(product.updatedAt)}"
+                ></span>
+            </li>
+            <li class="card-info__item d-flex">
+                <span
+                    class="card-info__property"
+                    th:text="#{additive.deactivatedBy}"
+                ></span>
+                <span
+                    class="card-info__value"
+                    th:text="*{product.updatedBy.name}"
+                ></span>
+            </li>
+        </th:block>
+    </ul>
+
+</div>
+</html>

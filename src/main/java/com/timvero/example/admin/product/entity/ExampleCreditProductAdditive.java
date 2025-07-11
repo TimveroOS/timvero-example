@@ -6,6 +6,7 @@ import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_SCALE;
 import com.timvero.example.admin.offer.entity.ExampleProductOffer;
 import com.timvero.loan.product.entity.CreditProduct;
 import com.timvero.loan.product.entity.CreditProductAdditive;
+import com.timvero.servicing.AmountConstants;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Transient;
@@ -28,6 +29,9 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
 
     @Column(name = "max_term", nullable = false)
     private Integer maxTerm;
+
+    @Column(name = "interest_rate", precision = 19, scale = AmountConstants.PERCENT_SCALE, nullable = false)
+    private BigDecimal interestRate;
 
     protected ExampleCreditProductAdditive() {
         super();
@@ -77,21 +81,29 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
         this.maxTerm = maxTerm;
     }
 
+    public BigDecimal getInterestRate() {
+        return interestRate;
+    }
+
+    public void setInterestRate(BigDecimal interestRate) {
+        this.interestRate = interestRate;
+    }
+
     @Transient
     @Override
     public ExampleProductOffer createOffer() {
         return new ExampleProductOffer();
     }
 
-    @Override
+/*    @Override
     public String toString() {
         return "Product Proposal #" + getId() + " ["
-            + "minAmount=" + minAmount + ", "
-            + "maxAmount=" + maxAmount + ", "
-            + "minTerm=" + minTerm + ", "
-            + "maxTerm=" + maxTerm + ", "
+            + "minAmount=" + getMinAmount() + ", "
+            + "maxAmount=" + getMaxAmount() + ", "
+            + "minTerm=" + getMinTerm() + ", "
+            + "maxTerm=" + getMaxTerm() + ", "
             + "procuring=" + getProcuringType() + "]";
-    }
+    }*/
 
     @Override
     public String getDisplayedName() {
