@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    /* CSS Custom Properties for theming - matching credit-data.html */
+    :root {
+      --table-bg: #ffffff;
+      --table-border: #e5e7eb;
+      --table-header-bg: #f8f9fa;
+      --table-hover-bg: #f9fafb;
+      --text-primary: #374151;
+      --text-secondary: #6b7280;
+      --text-muted: #9ca3af;
+      --positive-color: #059669;
+      --negative-color: #dc2626;
+    }
+
+    /* Section styling preserving layout */
+    .accrual-section {
+      background: var(--table-bg);
+      border-radius: 12px;
+      margin-bottom: 2rem;
+      overflow: hidden;
+      border: 1px solid var(--table-border);
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.02);
+    }
+
+    /* Section header */
+    .accrual-header {
+      background: var(--table-header-bg);
+      padding: 1rem 1.25rem;
+      margin: 0;
+      border-radius: 12px 12px 0 0;
+      border-bottom: 1px solid var(--table-border);
+    }
+
+    .accrual-header h5 {
+      margin: 0;
+      font-weight: 600;
+      font-size: 1.125rem;
+      letter-spacing: 0.025em;
+      color: var(--text-primary);
+    }
+
+    /* Table wrapper */
+    .table-wrapper {
+      overflow-x: auto;
+      margin: 0;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* Table styling matching credit-data.html */
+    .accrual-table {
+      width: 100%;
+      margin: 0;
+      font-size: 1rem;
+      border-collapse: separate;
+      border-spacing: 0;
+      table-layout: auto;
+      background: var(--table-bg);
+      min-width: 1000px;
+    }
+
+    /* Table header matching credit-data.html */
+    .accrual-table thead th {
+      background: var(--table-header-bg);
+      border: none;
+      padding: 1rem 0.75rem;
+      font-weight: 600;
+      font-size: 0.875rem;
+      letter-spacing: 0.025em;
+      color: var(--text-primary);
+      border-bottom: 1px solid var(--table-border);
+      white-space: nowrap;
+      vertical-align: middle;
+      line-height: 1.4;
+      text-align: left;
+    }
+
+    /* Table cells matching credit-data.html */
+    .accrual-table tbody td {
+      padding: 0.875rem 0.75rem;
+      border: none;
+      border-bottom: 1px solid #f9fafb;
+      vertical-align: middle;
+      color: var(--text-primary);
+      font-size: 1rem;
+      line-height: 1.5;
+      transition: background-color 0.15s ease-in-out;
+      white-space: nowrap;
+      text-align: left;
+    }
+
+    .accrual-table tbody tr:hover {
+      background-color: var(--table-hover-bg);
+      transition: background-color 0.15s ease-in-out;
+    }
+
+    .accrual-table tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    /* Footer styling */
+    .accrual-table tfoot td {
+      background: var(--table-header-bg);
+      border-top: 2px solid var(--table-border);
+      padding: 1rem 0.75rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .accrual-table tfoot tr:hover td {
+      background-color: var(--table-header-bg) !important;
+    }
+
+    /* Cell type styling */
+    .amount-cell {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    .date-col {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    .number-col {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    .percentage-cell {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    .increment-cell {
+      font-weight: 600;
+      color: var(--positive-color);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    /* Empty states */
+    .empty-state {
+      text-align: center;
+      padding: 3rem 2rem;
+      color: var(--text-muted);
+    }
+
+    .empty-state-icon {
+      font-size: 3rem;
+      margin-bottom: 1rem;
+      opacity: 0.3;
+      color: var(--text-muted);
+    }
+
+    .global-empty-state {
+      background: var(--table-bg);
+      border-radius: 12px;
+      padding: 4rem 2rem;
+      text-align: center;
+      border: 1px solid var(--table-border);
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.02);
+    }
+
+    .global-empty-state h5 {
+      color: var(--text-primary);
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+
+    .global-empty-state p {
+      color: var(--text-secondary);
+      margin: 0;
+    }
+
+    .text-muted {
+      color: var(--text-secondary) !important;
+    }
+
+    .text-primary .empty-state-icon {
+      color: var(--text-muted) !important;
+    }
+
+    /* Scrollbar styling */
+    .table-wrapper::-webkit-scrollbar {
+      height: 8px;
+    }
+
+    .table-wrapper::-webkit-scrollbar-track {
+      background: #f3f4f6;
+      border-radius: 4px;
+    }
+
+    .table-wrapper::-webkit-scrollbar-thumb {
+      background: #d1d5db;
+      border-radius: 4px;
+    }
+
+    .table-wrapper::-webkit-scrollbar-thumb:hover {
+      background: #9ca3af;
+    }
+
+    .header-row {
+      font-weight: 600;
+    }
+
+    /* Large screens - matching credit-data.html */
+    @media screen and (min-width: 1600px) {
+      .accrual-table {
+        font-size: 1.0625rem;
+      }
+
+      .accrual-table thead th {
+        padding: 1.125rem 1rem;
+        font-size: 0.9375rem;
+      }
+
+      .accrual-table tbody td,
+      .accrual-table tfoot td {
+        padding: 1rem 1rem;
+      }
+
+      .accrual-header h5 {
+        font-size: 1.25rem;
+      }
+    }
+
+    @media screen and (min-width: 1920px) {
+      .accrual-table {
+        font-size: 1.125rem;
+      }
+
+      .accrual-table thead th {
+        padding: 1.25rem 1.125rem;
+        font-size: 1rem;
+      }
+
+      .accrual-table tbody td,
+      .accrual-table tfoot td {
+        padding: 1.125rem 1.125rem;
+      }
+
+      .accrual-header h5 {
+        font-size: 1.375rem;
+      }
+    }
+
+    /* Small screens - matching credit-data.html */
+    @media (max-width: 1200px) {
+      .accrual-header {
+        padding: 0.875rem 1rem;
+      }
+
+      .accrual-header h5 {
+        font-size: 1rem;
+      }
+
+      .accrual-table {
+        font-size: 0.9375rem;
+      }
+
+      .accrual-table thead th,
+      .accrual-table tbody td,
+      .accrual-table tfoot td {
+        padding: 0.75rem 0.625rem;
+      }
+    }
+
+    /* Utility classes */
+    .text-center {
+      text-align: center;
+    }
+
+    .text-end {
+      text-align: right;
+    }
+
+    .text-start {
+      text-align: left;
+    }
+
+    .summary-label {
+      font-weight: 700;
+      color: #1f2937;
+      font-size: 1.05em;
+    }
+
+  </style>
+</head>
+<body>
+<th:block>
+
+  <!-- Main container for accruals display -->
+
+  <!-- Iterate over each accrual account in the map -->
+  <div th:each="accrualEntry : ${accruals}" class="accrual-section">
+
+    <!-- Enhanced section header for each accrual account -->
+    <div class="accrual-header">
+      <h5 th:text="${#enums.name('debt.account', accrualEntry.key)}">
+        Account Name
+      </h5>
+    </div>
+
+    <!-- Responsive table wrapper for accrual records -->
+    <div class="table-wrapper">
+      <table class="table accrual-table">
+
+        <!-- Enhanced table header with proper alignment -->
+        <thead>
+        <tr>
+          <th class="text-center header-row" style="width: 60px;" th:text="#{symbol.id}">#</th>
+          <th class="text-start header-row" style="width: 120px;" th:text="#{accrual.period.start}">Period Start</th>
+          <th class="text-start header-row" style="width: 120px;" th:text="#{accrual.period.end}">Period End</th>
+          <th class="text-start header-row" style="width: 80px;" th:text="#{accrual.days.count}">Days</th>
+          <th class="text-start header-row" style="width: 130px;" th:text="#{accrual.basis.amount}">Basis Amount</th>
+          <th class="text-start header-row" style="width: 110px;" th:text="#{accrual.rate.monthly.percent}">Monthly Rate</th>
+          <th class="text-start header-row" style="width: 110px;" th:text="#{accrual.rate.yearly.percent}">Yearly Rate</th>
+          <th class="text-start header-row" style="width: 100px;" th:text="#{accrual.fraction.value}">Day Fraction</th>
+          <th class="text-start header-row" style="width: 140px;" th:text="#{accrual.increment.amount}">Accrual Amount</th>
+        </tr>
+        </thead>
+
+        <tbody>
+        <!-- Iterate over accrual records for current account with enhanced styling -->
+        <tr th:each="accrual, iterStat : ${accrualEntry.value}" th:object="${accrual}">
+
+          <!-- Row number with enhanced styling -->
+          <td class="text-center">
+            <span class="row-number" th:text="${iterStat.count}">1</span>
+          </td>
+
+          <!-- Period start date with consistent formatting -->
+          <td class="text-start date-col"
+              th:text="${#ldates.format(accrual.start)}"
+              style="white-space: nowrap;">2024-01-01
+          </td>
+
+          <!-- Period end date with consistent formatting -->
+          <td class="text-start date-col"
+              th:text="${#ldates.format(accrual.end)}"
+              style="white-space: nowrap;">2024-01-31
+          </td>
+
+          <!-- Days count in period with left alignment -->
+          <td class="text-start number-col" th:text="*{daysCount}">30</td>
+
+          <!-- Basis amount with left alignment -->
+          <td class="text-start amount-cell"
+              th:text="*{basis != null} ? *{#monetary.format(basis)} : '—'">$1,000.00
+          </td>
+
+          <!-- Monthly rate as percentage with left alignment -->
+          <td class="text-start percentage-cell"
+              th:text="*{monthlyRate != null} ? *{#numbers.formatDecimal(monthlyRate, 1, 2) + '%'} : '—'">2.50%
+          </td>
+
+          <!-- Yearly rate as percentage with left alignment -->
+          <td class="text-start percentage-cell"
+              th:text="*{monthlyRate != null} ? *{#numbers.formatDecimal(monthlyRate.multiply(12), 1, 2) + '%'} : '—'">
+            30.00%
+          </td>
+
+          <!-- Day count fraction with left alignment -->
+          <td class="text-start percentage-cell"
+              th:text="*{fraction != null} ? *{fraction.toString()} : '—'">0.8333
+          </td>
+
+          <!-- Calculated accrual increment with right alignment (as requested) -->
+          <td class="text-start increment-cell"
+              th:text="*{increment != null} ? *{#monetary.format(increment)} : '—'">$20.83
+          </td>
+
+        </tr>
+
+        <!-- Enhanced empty state message when no records exist for account -->
+        <tr th:if="${#lists.isEmpty(accrualEntry.value)}">
+          <td colspan="9" class="empty-state">
+            <div class="empty-state-icon">
+              <i class="fas fa-file-invoice-dollar"></i>
+            </div>
+            <em th:text="#{accrual.records.empty}">No accrual records found for this account</em>
+          </td>
+        </tr>
+        </tbody>
+
+        <!-- Enhanced summary footer for account totals -->
+        <tfoot th:if="${!#lists.isEmpty(accrualEntry.value)}">
+        <tr>
+          <td colspan="8" class="text-end"
+              style="font-weight: 600; border-right: none;">
+            <span class="summary-label" th:text="#{accrual.total.label}">Total:</span>
+          </td>
+          <td class="text-start increment-cell" style="font-weight: 700; font-size: 1.05em;">
+            <!-- Calculate total increment for current account -->
+            <span th:with="total=${totals.get(accrualEntry.key)}"
+                  th:text="${#monetary.format(total)}">$125.00</span>
+          </td>
+        </tr>
+        </tfoot>
+
+      </table>
+    </div>
+  </div>
+
+  <!-- Enhanced global empty state when no accruals exist at all -->
+  <div th:if="${#maps.isEmpty(accruals)}" class="global-empty-state">
+    <div class="empty-state-icon text-primary">
+      <i class="fas fa-calculator"></i>
+    </div>
+    <h5 class="mb-3" th:text="#{accruals.empty.title}">No Accruals Calculated</h5>
+    <p class="text-muted mb-0" th:text="#{accruals.empty.message}">
+      Accrual calculations will appear here once they are processed for this credit.
+    </p>
+  </div>
+
+</th:block>
+</body>
+</html>

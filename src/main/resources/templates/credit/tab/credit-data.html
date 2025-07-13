@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    /* CSS Custom Properties for theming */
+    :root {
+      --table-bg: #ffffff;
+      --table-border: #e5e7eb;
+      --table-header-bg: #f8f9fa;
+      --table-hover-bg: #f9fafb;
+      --text-primary: #374151;
+      --text-secondary: #6b7280;
+      --text-muted: #9ca3af;
+      --status-paid: #059669;
+      --status-paid-bg: #d1fae5;
+      --status-pending: #d97706;
+      --status-pending-bg: #fed7aa;
+      --status-delay: #dc2626;
+      --status-delay-bg: #fee2e2;
+      --status-overdue: #991b1b;
+      --status-overdue-bg: #fecaca;
+      --status-early: #7c3aed;
+      --status-early-bg: #ede9fe;
+      --positive-color: #059669;
+      --negative-color: #dc2626;
+      /* Updated tooltip colors to match the light theme */
+      --tooltip-bg: #ffffff;
+      --tooltip-text: #374151;
+      --tooltip-border: #e5e7eb;
+      --tooltip-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      --tooltip-hover-color: #6b7280;
+    }
+
+    /* Responsive table container with minimalistic styling */
+    .responsive-table-container {
+      width: 100%;
+      margin: 0 auto 1rem;
+      overflow-x: auto;
+      overflow-y: visible;
+      border-radius: 12px;
+      background: var(--table-bg);
+      border: 1px solid var(--table-border);
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.02);
+      position: relative;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* Modern table styling with enhanced header patterns */
+    .table-custom-style {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      table-layout: auto;
+      background: var(--table-bg);
+      font-size: 1rem;
+      min-width: 1600px;
+    }
+
+    /* Enhanced modern table header with minimalistic approach */
+    .table-custom-style thead th {
+      background: var(--table-header-bg);
+      position: sticky;
+      top: 0;
+      padding: 1rem 0.75rem;
+      border: none;
+      white-space: nowrap;
+      font-weight: 600;
+      font-size: 0.875rem;
+      letter-spacing: 0.025em;
+      color: var(--text-primary);
+      vertical-align: middle;
+      line-height: 1.4;
+      z-index: 10;
+    }
+
+    /* Sticky first column header */
+    .table-custom-style thead th:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 11;
+      background: var(--table-header-bg);
+      border-top-left-radius: 12px;
+    }
+
+    /* Last header cell rounded corner */
+    .table-custom-style thead th:last-child {
+      border-top-right-radius: 12px;
+    }
+
+    /* Modern table cells with enhanced styling */
+    .table-custom-style td {
+      padding: 0.875rem 0.75rem;
+      border: none;
+      vertical-align: top;
+      transition: background-color 0.15s ease-in-out;
+      color: var(--text-primary);
+      font-size: 1rem;
+      line-height: 1.5;
+      background: var(--table-bg);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      position: relative; /* Create stacking context for tooltips */
+    }
+
+    /* Sticky first column cells */
+    .table-custom-style tbody td:first-child {
+      position: sticky;
+      left: 0;
+      background: var(--table-bg);
+      z-index: 9;
+    }
+
+    /* Ensure sticky column maintains background on hover */
+    .table-custom-style tbody tr:hover td:first-child {
+      background: var(--table-hover-bg);
+    }
+
+    /* Column sizing - using percentages for proportional scaling */
+    .row-number-col {
+      width: 3%;
+      min-width: 20px;
+      text-align: center;
+    }
+    .date-col {
+      width: 7%;
+      min-width: 110px;
+      font-weight: 600;
+    }
+    .number-col {
+      width: 7%;
+      min-width: 120px;
+    }
+    .number-col-large {
+      width: 8%;
+      min-width: 140px;
+    }
+    .status-col {
+      width: 8%;
+      min-width: 140px;
+    }
+    .payment-amount-col {
+      width: 8%;
+      min-width: 140px;
+    }
+    .payment-date-col {
+      width: 9%;
+      min-width: 150px;
+      font-weight: 600;
+    }
+    .payment-id-col {
+      width: 10%;
+      min-width: 160px;
+      font-weight: 600;
+    }
+
+    /* For large screens - increase font sizes and padding */
+    @media screen and (min-width: 1600px) {
+      .table-custom-style {
+        font-size: 1.0625rem;
+      }
+
+      .table-custom-style thead th {
+        padding: 1.125rem 1rem;
+        font-size: 0.9375rem;
+      }
+
+      .table-custom-style td {
+        padding: 1rem 1rem;
+      }
+    }
+
+    @media screen and (min-width: 1920px) {
+      .table-custom-style {
+        font-size: 1.125rem;
+      }
+
+      .table-custom-style thead th {
+        padding: 1.25rem 1.125rem;
+        font-size: 1rem;
+      }
+
+      .table-custom-style td {
+        padding: 1.125rem 1.125rem;
+      }
+    }
+
+    /* For smaller screens - ensure proper spacing and no overlaps */
+    @media screen and (max-width: 1200px) {
+      .responsive-table-container {
+        overflow-x: scroll;
+      }
+
+      .table-custom-style {
+        font-size: 0.9375rem;
+      }
+
+      .table-custom-style thead th,
+      .table-custom-style td {
+        padding: 0.75rem 0.625rem;
+      }
+    }
+
+    /* Status cell styling */
+    .status-cell {
+      font-weight: 600;
+      font-size: 0.875rem;
+      letter-spacing: 0.05em;
+      padding: 0.375rem 1rem;
+      border-radius: 9999px;
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-paid {
+      color: var(--status-paid);
+      background-color: var(--status-paid-bg);
+    }
+
+    .status-pending {
+      color: var(--status-pending);
+      background-color: var(--status-pending-bg);
+    }
+
+    .status-delay {
+      color: var(--status-delay);
+      background-color: var(--status-delay-bg);
+    }
+
+    .status-overdue {
+      color: var(--status-overdue);
+      background-color: var(--status-overdue-bg);
+    }
+
+    /* Early payment label styling */
+    .early-label {
+      font-weight: 600;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+      padding: 0.125rem 0.5rem;
+      border-radius: 9999px;
+      display: inline-block;
+      margin-left: 0.375rem;
+      vertical-align: middle;
+      color: var(--status-early);
+      background-color: var(--status-early-bg);
+      /*text-transform: uppercase;*/
+    }
+
+    /* Enhanced row hover effects */
+    .table-custom-style tbody tr:hover td {
+      background-color: var(--table-hover-bg);
+      transition: background-color 0.15s ease-in-out;
+    }
+
+    /* Amount cell styling */
+    .amount-cell {
+      font-weight: 600;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Account details styling */
+    .account-label {
+      opacity: 0.8;
+      font-weight: 500;
+      font-size: 0.875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      color: var(--text-secondary);
+    }
+
+    /* Account details stacking */
+    .account-item {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 1rem;
+    }
+
+    .account-item:last-child {
+      margin-bottom: 0;
+    }
+
+    /* Credit view row styling */
+    .credit-main-row {
+      background-color: var(--table-bg);
+    }
+
+    /* ============================ */
+    /* Modern Tooltip Implementation - Pure CSS with minimal JS */
+    /* ============================ */
+
+    /* Special handling for tooltip cells to prevent clipping */
+    .tooltip-cell {
+      overflow: visible !important;
+      position: relative;
+      z-index: 10;
+    }
+
+    /* Ensure row with active tooltip has higher z-index */
+    .table-custom-style tr:hover {
+      position: relative;
+      z-index: 50;
+    }
+
+    .table-custom-style tr.has-active-tooltip {
+      position: relative;
+      z-index: 100 !important;
+    }
+
+    /* Tooltip wrapper - handles positioning context */
+    .tooltip-wrapper {
+      position: relative;
+      display: inline-block;
+      cursor: help;
+    }
+
+    /* Tooltip trigger styling - updated colors */
+    .tooltip-trigger {
+      display: inline-flex;
+      align-items: center;
+      border-bottom: 1px dotted var(--text-secondary);
+      transition: color 0.2s ease, border-color 0.2s ease;
+      color: var(--text-primary);
+    }
+
+    .tooltip-trigger:hover {
+      color: var(--tooltip-hover-color);
+      border-bottom-color: var(--tooltip-hover-color);
+      border-bottom-style: solid;
+    }
+
+    /* Modern tooltip - Updated to match light theme */
+    .modern-tooltip {
+      position: absolute;
+      z-index: 9999;
+      background-color: var(--tooltip-bg);
+      color: var(--tooltip-text);
+      border: 1px solid var(--tooltip-border);
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 0.875rem;
+      font-weight: 400;
+      line-height: 1.5;
+      white-space: nowrap;
+      pointer-events: none;
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(4px);
+      transition: opacity 0.3s ease, transform 0.3s ease, visibility 0.3s ease;
+      box-shadow: var(--tooltip-shadow);
+      max-width: 400px;
+      min-width: 280px;
+
+      /* Default bottom positioning */
+      top: 100%;
+      left: 50%;
+      transform: translateX(-50%) translateY(4px);
+      margin-top: 8px;
+    }
+
+    /* Tooltip arrow - updated to match light theme */
+    .modern-tooltip::before,
+    .modern-tooltip::after {
+      content: '';
+      position: absolute;
+      width: 0;
+      height: 0;
+      border-style: solid;
+      top: -6px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+
+    /* Arrow border */
+    .modern-tooltip::before {
+      border-width: 0 7px 7px 7px;
+      border-color: transparent transparent var(--tooltip-border) transparent;
+      top: -7px;
+    }
+
+    /* Arrow fill */
+    .modern-tooltip::after {
+      border-width: 0 6px 6px 6px;
+      border-color: transparent transparent var(--tooltip-bg) transparent;
+      top: -6px;
+    }
+
+    /* Show tooltip on hover - CSS only fallback */
+    .tooltip-wrapper:hover .modern-tooltip,
+    .tooltip-trigger:focus + .modern-tooltip,
+    .modern-tooltip.active {
+      opacity: 1;
+      visibility: visible;
+      transform: translateX(-50%) translateY(0);
+      pointer-events: auto;
+    }
+
+    /* Touch device active state */
+    .tooltip-wrapper.touch-active .modern-tooltip {
+      opacity: 1;
+      visibility: visible;
+      transform: translateX(-50%) translateY(0);
+      pointer-events: auto;
+    }
+
+    /* Positioning variants */
+    .modern-tooltip.position-top {
+      top: auto;
+      bottom: 100%;
+      margin-top: 0;
+      margin-bottom: 8px;
+      transform: translateX(-50%) translateY(-4px);
+    }
+
+    .modern-tooltip.position-top.active,
+    .tooltip-wrapper:hover .modern-tooltip.position-top {
+      transform: translateX(-50%) translateY(0);
+    }
+
+    .modern-tooltip.position-top::before {
+      top: auto;
+      bottom: -7px;
+      border-width: 7px 7px 0 7px;
+      border-color: var(--tooltip-border) transparent transparent transparent;
+    }
+
+    .modern-tooltip.position-top::after {
+      top: auto;
+      bottom: -6px;
+      border-width: 6px 6px 0 6px;
+      border-color: var(--tooltip-bg) transparent transparent transparent;
+    }
+
+    .modern-tooltip.position-left {
+      left: 0;
+      transform: translateX(0) translateY(4px);
+    }
+
+    .modern-tooltip.position-left.active,
+    .tooltip-wrapper:hover .modern-tooltip.position-left {
+      transform: translateX(0) translateY(0);
+    }
+
+    .modern-tooltip.position-left::before,
+    .modern-tooltip.position-left::after {
+      left: 20px;
+      transform: translateX(0);
+    }
+
+    .modern-tooltip.position-right {
+      left: auto;
+      right: 0;
+      transform: translateX(0) translateY(4px);
+    }
+
+    .modern-tooltip.position-right.active,
+    .tooltip-wrapper:hover .modern-tooltip.position-right {
+      transform: translateX(0) translateY(0);
+    }
+
+    .modern-tooltip.position-right::before,
+    .modern-tooltip.position-right::after {
+      left: auto;
+      right: 20px;
+      transform: translateX(0);
+    }
+
+    /* Tooltip content styling - updated for light theme */
+    .tooltip-content {
+      white-space: normal;
+    }
+
+    .tooltip-content .account-detail {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--table-border);
+      white-space: nowrap;
+    }
+
+    .tooltip-content .account-detail:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+
+    .tooltip-content .account-name {
+      font-weight: 500;
+      margin-right: 8px;
+      color: var(--text-secondary);
+      font-size: 0.8125rem;
+      text-transform: uppercase;
+      letter-spacing: 0.025em;
+    }
+
+    .tooltip-content .account-value {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+      font-size: 0.875rem;
+    }
+
+    /* Enhanced scrollbar with minimalistic styling */
+    .responsive-table-container::-webkit-scrollbar {
+      height: 8px;
+    }
+
+    .responsive-table-container::-webkit-scrollbar-track {
+      background: #f3f4f6;
+      border-radius: 4px;
+    }
+
+    .responsive-table-container::-webkit-scrollbar-thumb {
+      background: #d1d5db;
+      border-radius: 4px;
+    }
+
+    .responsive-table-container::-webkit-scrollbar-thumb:hover {
+      background: #9ca3af;
+    }
+
+    /* Last row rounded corners */
+    .table-custom-style tbody tr:last-child td:first-child {
+      border-bottom-left-radius: 12px;
+    }
+
+    .table-custom-style tbody tr:last-child td:last-child {
+      border-bottom-right-radius: 12px;
+    }
+
+    /* Row number styling */
+    .row-number {
+      font-weight: 600;
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+    }
+
+    /* Difference cell styling */
+    .difference-positive {
+      color: var(--positive-color);
+      font-weight: 700;
+    }
+
+    .difference-negative {
+      color: var(--negative-color);
+      font-weight: 700;
+    }
+
+    /* Empty cell styling */
+    .empty-cell {
+      color: var(--text-muted);
+      text-align: center;
+      font-size: 1rem;
+    }
+
+    /* Multiple payments styling */
+    .payment-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .payment-item {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .payment-item-wrapper {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+    }
+
+    .payment-item-wrapper .payment-item {
+      display: inline;
+    }
+
+    /* Ensure font weight for all content in payment date and ID columns */
+    td.payment-date-col,
+    td.payment-id-col {
+      font-weight: 600;
+    }
+
+    /* Summary row styling */
+    .summary-row {
+      background-color: var(--table-header-bg) !important;
+      border-top: 2px solid var(--table-border);
+      font-weight: 600;
+    }
+
+    .summary-row td {
+      background-color: var(--table-header-bg) !important;
+      padding: 1rem 0.75rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    /* Override hover effects for summary row */
+    .table-custom-style tbody .summary-row:hover td {
+      background-color: var(--table-header-bg) !important;
+    }
+
+    .summary-label {
+      font-weight: 700;
+      color: #1f2937;
+      font-size: 1.05em;
+    }
+
+    /* Text alignment utilities */
+    .text-start {
+      text-align: left;
+    }
+
+    .text-center {
+      text-align: center;
+    }
+
+    .text-end {
+      text-align: right;
+    }
+
+  </style>
+  <script>
+    /**
+     * Modern Tooltip System - Robust initialization without DOMContentLoaded
+     * Uses multiple strategies to ensure tooltips work in all environments
+     */
+
+    // Immediate initialization function
+    (function initTooltips() {
+      'use strict';
+
+      /**
+       * Initialize tooltip functionality
+       * This function can be called multiple times safely
+       */
+      function setupTooltips() {
+        // Find all tooltip wrappers that haven't been initialized
+        const tooltipWrappers = document.querySelectorAll('.tooltip-wrapper:not([data-tooltip-initialized])');
+
+        if (tooltipWrappers.length === 0) {
+          return; // No tooltips to initialize
+        }
+
+        tooltipWrappers.forEach(wrapper => {
+          // Mark as initialized to prevent duplicate setup
+          wrapper.setAttribute('data-tooltip-initialized', 'true');
+
+          const trigger = wrapper.querySelector('.tooltip-trigger');
+          const tooltip = wrapper.querySelector('.modern-tooltip');
+
+          if (!trigger || !tooltip) {
+            console.warn('Tooltip structure incomplete', wrapper);
+            return;
+          }
+
+          // Set ARIA attributes for accessibility
+          const tooltipId = 'tooltip-' + Math.random().toString(36).substr(2, 9);
+          tooltip.id = tooltipId;
+          trigger.setAttribute('aria-describedby', tooltipId);
+          trigger.setAttribute('tabindex', '0');
+
+          // Position tooltip on initialization
+          positionTooltip(wrapper, tooltip);
+
+          // Touch support
+          let touchTimeout;
+          wrapper.addEventListener('touchstart', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            // Clear any existing timeout
+            clearTimeout(touchTimeout);
+
+            // Get the parent row
+            const parentRow = wrapper.closest('tr');
+
+            // Toggle active state
+            if (wrapper.classList.contains('touch-active')) {
+              wrapper.classList.remove('touch-active');
+              tooltip.classList.remove('active');
+              if (parentRow) parentRow.classList.remove('has-active-tooltip');
+            } else {
+              // Hide other active tooltips
+              document.querySelectorAll('.tooltip-wrapper.touch-active').forEach(w => {
+                w.classList.remove('touch-active');
+                w.querySelector('.modern-tooltip').classList.remove('active');
+                const row = w.closest('tr');
+                if (row) row.classList.remove('has-active-tooltip');
+              });
+
+              wrapper.classList.add('touch-active');
+              tooltip.classList.add('active');
+              if (parentRow) parentRow.classList.add('has-active-tooltip');
+
+              // Auto-hide after 5 seconds
+              touchTimeout = setTimeout(() => {
+                wrapper.classList.remove('touch-active');
+                tooltip.classList.remove('active');
+                if (parentRow) parentRow.classList.remove('has-active-tooltip');
+              }, 5000);
+            }
+          }, { passive: false });
+
+          // Keyboard support
+          trigger.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              const parentRow = wrapper.closest('tr');
+              const isActive = tooltip.classList.contains('active');
+
+              if (isActive) {
+                tooltip.classList.remove('active');
+                if (parentRow) parentRow.classList.remove('has-active-tooltip');
+              } else {
+                tooltip.classList.add('active');
+                if (parentRow) parentRow.classList.add('has-active-tooltip');
+              }
+            } else if (e.key === 'Escape') {
+              tooltip.classList.remove('active');
+              const parentRow = wrapper.closest('tr');
+              if (parentRow) parentRow.classList.remove('has-active-tooltip');
+            }
+          });
+
+          // Click support for non-touch devices
+          trigger.addEventListener('click', function(e) {
+            if (!('ontouchstart' in window)) {
+              e.preventDefault();
+              e.stopPropagation();
+              const parentRow = wrapper.closest('tr');
+              const isActive = tooltip.classList.contains('active');
+
+              if (isActive) {
+                tooltip.classList.remove('active');
+                if (parentRow) parentRow.classList.remove('has-active-tooltip');
+              } else {
+                tooltip.classList.add('active');
+                if (parentRow) parentRow.classList.add('has-active-tooltip');
+              }
+            }
+          });
+
+          // Add class on hover for proper z-index
+          wrapper.addEventListener('mouseenter', function() {
+            const parentRow = wrapper.closest('tr');
+            if (parentRow) parentRow.classList.add('has-active-tooltip');
+            positionTooltip(wrapper, tooltip);
+          });
+
+          wrapper.addEventListener('mouseleave', function() {
+            const parentRow = wrapper.closest('tr');
+            if (parentRow && !tooltip.classList.contains('active')) {
+              parentRow.classList.remove('has-active-tooltip');
+            }
+          });
+        });
+
+        // Global click handler to close tooltips
+        if (!document.body.hasAttribute('data-tooltip-global-handler')) {
+          document.body.setAttribute('data-tooltip-global-handler', 'true');
+
+          document.addEventListener('click', function(e) {
+            if (!e.target.closest('.tooltip-wrapper')) {
+              // Close all active tooltips
+              document.querySelectorAll('.modern-tooltip.active').forEach(t => {
+                t.classList.remove('active');
+              });
+              document.querySelectorAll('.tooltip-wrapper.touch-active').forEach(w => {
+                w.classList.remove('touch-active');
+              });
+              // Remove has-active-tooltip class from all rows
+              document.querySelectorAll('.has-active-tooltip').forEach(row => {
+                row.classList.remove('has-active-tooltip');
+              });
+            }
+          });
+
+          // Handle window resize
+          let resizeTimeout;
+          window.addEventListener('resize', function() {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(() => {
+              document.querySelectorAll('.tooltip-wrapper').forEach(wrapper => {
+                const tooltip = wrapper.querySelector('.modern-tooltip');
+                if (tooltip) {
+                  positionTooltip(wrapper, tooltip);
+                }
+              });
+            }, 100);
+          });
+        }
+      }
+
+      /**
+       * Position tooltip intelligently based on viewport
+       */
+      function positionTooltip(wrapper, tooltip) {
+        // Remove all position classes
+        tooltip.classList.remove('position-top', 'position-left', 'position-right');
+
+        // Get dimensions
+        const wrapperRect = wrapper.getBoundingClientRect();
+        const tooltipRect = tooltip.getBoundingClientRect();
+        const viewportHeight = window.innerHeight;
+        const viewportWidth = window.innerWidth;
+
+        // Check vertical space
+        const spaceBelow = viewportHeight - wrapperRect.bottom;
+        const spaceAbove = wrapperRect.top;
+
+        // Position vertically
+        if (spaceBelow < 150 && spaceAbove > spaceBelow) {
+          tooltip.classList.add('position-top');
+        }
+
+        // Check horizontal space
+        const spaceRight = viewportWidth - wrapperRect.left;
+        const spaceLeft = wrapperRect.right;
+
+        // Position horizontally
+        if (spaceRight < 200 && spaceLeft > spaceRight) {
+          tooltip.classList.add('position-right');
+        } else if (wrapperRect.left + tooltipRect.width > viewportWidth - 20) {
+          tooltip.classList.add('position-right');
+        }
+      }
+
+      // Strategy 1: Immediate execution
+      setupTooltips();
+
+      // Strategy 2: After a short delay (for dynamic content)
+      setTimeout(setupTooltips, 100);
+      setTimeout(setupTooltips, 500);
+
+      // Strategy 3: Mutation observer for dynamic content
+      if (typeof MutationObserver !== 'undefined') {
+        const observer = new MutationObserver(function(mutations) {
+          // Check if new tooltip elements were added
+          const hasNewTooltips = mutations.some(mutation => {
+            return Array.from(mutation.addedNodes).some(node => {
+              return node.nodeType === 1 && (
+                  node.classList?.contains('tooltip-wrapper') ||
+                  node.querySelector?.('.tooltip-wrapper')
+              );
+            });
+          });
+
+          if (hasNewTooltips) {
+            setupTooltips();
+          }
+        });
+
+        // Start observing when body is available
+        const startObserving = function() {
+          if (document.body) {
+            observer.observe(document.body, {
+              childList: true,
+              subtree: true
+            });
+          } else {
+            setTimeout(startObserving, 10);
+          }
+        };
+        startObserving();
+      }
+
+      // Strategy 4: Make setup function globally available
+      window.initCreditDataTooltips = setupTooltips;
+
+      // Strategy 5: Check periodically for the first few seconds
+      let checkCount = 0;
+      const checkInterval = setInterval(function() {
+        setupTooltips();
+        checkCount++;
+        if (checkCount > 20) { // Stop after 2 seconds
+          clearInterval(checkInterval);
+        }
+      }, 100);
+
+    })();
+  </script>
+</head>
+<body>
+<th:block>
+  <div class="card-body">
+    <div class="responsive-table-container">
+      <table class="table table-custom-style">
+        <thead>
+        <tr role="row">
+          <!-- Table headers with proper column classes -->
+          <th class="row-number-col text-center" th:text="#{symbol.id}">#</th>
+          <th class="date-col text-start" th:text="#{credit.data.date}">Date</th>
+          <th class="number-col text-start" th:text="#{credit.data.amount}">Amount</th>
+          <th class="number-col text-start" th:text="#{credit.data.principal}">Principal</th>
+          <th class="number-col text-start" th:text="#{credit.data.interest}">Interest</th>
+          <th class="number-col-large text-start" th:text="#{credit.data.balance}">Balance</th>
+          <th class="number-col text-start" th:text="#{credit.data.bank.amount}">Bank Amount</th>
+          <th class="number-col text-start" th:text="#{credit.data.difference}">Difference</th>
+          <th class="number-col text-start" th:text="#{credit.data.to.be.paid}">To be paid</th>
+          <th class="payment-amount-col text-start" th:text="#{credit.data.payment.amount.actual}">Payment Amount</th>
+          <th class="payment-date-col text-start" th:text="#{credit.data.actual.payment.date}">Actual Payment Date</th>
+        </tr>
+        </thead>
+        <tbody>
+        <!-- Iterate through each CreditView -->
+        <th:block th:each="view, iterStat : ${views}" th:object="${view}">
+
+          <tr class="credit-main-row" role="row">
+            <!-- Row number -->
+            <td class="row-number-col row-number text-center">
+              <span th:text="${iterStat.count}"></span>
+            </td>
+
+            <!-- Date -->
+            <td class="date-col text-start">
+              <span th:text="*{#ldates.format(date)}"></span>
+            </td>
+
+            <!-- Payment Amount (from CreditView) -->
+            <td class="number-col amount-cell text-start">
+              <th:block th:if="*{amount != null && !amount.zero}">
+                <span th:text="*{#monetary.format(amount)}"></span>
+              </th:block>
+            </td>
+
+            <!-- Principal -->
+            <td class="number-col amount-cell text-start">
+              <th:block th:if="*{principal != null && !principal.zero}">
+                <span th:text="*{#monetary.format(principal)}"></span>
+              </th:block>
+              <th:block th:unless="*{principal != null && !principal.zero}">
+                <span class="empty-cell">-</span>
+              </th:block>
+            </td>
+
+            <!-- Interest -->
+            <td class="number-col amount-cell text-start">
+              <th:block th:if="*{interest != null && !interest.zero}">
+                <span th:text="*{#monetary.format(interest)}"></span>
+              </th:block>
+              <th:block th:unless="*{interest != null && !interest.zero}">
+                <span class="empty-cell">-</span>
+              </th:block>
+            </td>
+
+            <!-- Balance -->
+            <td class="number-col-large amount-cell text-start">
+              <th:block th:if="*{balance != null}">
+                <span th:text="*{#monetary.format(balance)}"></span>
+              </th:block>
+            </td>
+
+            <!-- Bank Amount -->
+            <td class="number-col amount-cell text-start">
+              <th:block th:if="*{bankAmount != null}">
+                <span th:text="*{#monetary.format(bankAmount)}"></span>
+              </th:block>
+            </td>
+
+            <!-- Difference -->
+            <td class="number-col amount-cell text-start">
+              <th:block th:if="*{difference != null}">
+                <span th:classappend="*{!difference.isNegative() ? 'difference-positive' : 'difference-negative'}"
+                      th:text="*{#monetary.format(difference)}"></span>
+              </th:block>
+            </td>
+
+            <!-- To Be Paid with modern tooltip -->
+            <td class="number-col amount-cell text-start tooltip-cell">
+              <th:block th:if="*{toBePaid != null}">
+                <th:block th:with="totalToBePaid=*{@creditDataTab.total(toBePaid)}">
+                  <th:block th:if="${totalToBePaid != null && totalToBePaid.isPositive}">
+                    <div class="tooltip-wrapper">
+                      <span class="tooltip-trigger">
+                        <span th:text="${#monetary.format(totalToBePaid)}"></span>
+                      </span>
+
+                      <!-- Modern tooltip -->
+                      <div class="modern-tooltip">
+                        <div class="tooltip-content">
+                          <th:block th:with="debtAccounts = *{toBePaid.accounts}">
+                            <th:block th:if="${debtAccounts != null}">
+                              <th:block th:each="account : ${debtAccounts.keySet()}">
+                                <th:block th:with="accountAmount = ${debtAccounts.get(account)}">
+                                  <th:block th:if="${accountAmount != null && !accountAmount.zero}">
+                                    <div class="account-detail">
+                                      <span class="account-name" th:text="${#enums.name('debt.account', account)}">Account</span>
+                                      <span class="account-value" th:text="${#monetary.format(accountAmount)}">Amount</span>
+                                    </div>
+                                  </th:block>
+                                </th:block>
+                              </th:block>
+                            </th:block>
+                          </th:block>
+                        </div>
+                      </div>
+                    </div>
+                  </th:block>
+                </th:block>
+              </th:block>
+            </td>
+
+            <!-- Payment Amount column -->
+            <td class="payment-amount-col amount-cell text-start">
+              <th:block th:if="${view.payments != null && !view.payments.isEmpty()}">
+                <div class="payment-group">
+                  <th:block th:each="payment : ${view.payments}">
+                    <div class="payment-item-wrapper">
+                      <span class="payment-item" th:if="${payment.amount != null && !payment.amount.zero}"
+                            th:text="${#monetary.format(payment.amount)}"></span>
+                      <span class="early-label" th:if="${payment.early}" th:text="#{credit.data.early}">Early</span>
+                    </div>
+                  </th:block>
+                </div>
+              </th:block>
+              <th:block th:unless="${view.payments != null && !view.payments.isEmpty()}">
+                <span class="empty-cell"></span>
+              </th:block>
+            </td>
+
+            <!-- Actual Payment Date column -->
+            <td class="payment-date-col text-start">
+              <th:block th:if="${view.payments != null && !view.payments.isEmpty()}">
+                <div class="payment-group">
+                  <th:block th:each="payment : ${view.payments}">
+                    <span class="payment-item" th:if="${payment.actualDate != null}"
+                          th:text="${#ldates.format(payment.actualDate)}"></span>
+                  </th:block>
+                </div>
+              </th:block>
+              <th:block th:unless="${view.payments != null && !view.payments.isEmpty()}">
+                <span class="empty-cell"></span>
+              </th:block>
+            </td>
+
+          </tr>
+
+        </th:block>
+
+        <!-- Summary row -->
+        <tr class="summary-row" th:if="${summary != null}" th:object="${summary}">
+          <!-- Row number -->
+          <td class="row-number-col text-center">
+            <span class="summary-label" th:text="#{credit.data.summary}">Total</span>
+          </td>
+
+          <!-- Date -->
+          <td class="date-col text-start">
+            <span class="empty-cell"></span>
+          </td>
+
+          <!-- Amount -->
+          <td class="number-col amount-cell text-start">
+            <th:block th:if="*{amount != null && !amount.zero}">
+              <span th:text="*{#monetary.format(amount)}"></span>
+            </th:block>
+            <th:block th:unless="*{amount != null && !amount.zero}">
+              <span class="empty-cell"></span>
+            </th:block>
+          </td>
+
+          <!-- Principal -->
+          <td class="number-col amount-cell text-start">
+            <th:block th:if="*{principal != null && !principal.zero}">
+              <span th:text="*{#monetary.format(principal)}"></span>
+            </th:block>
+            <th:block th:unless="*{principal != null && !principal.zero}">
+              <span class="empty-cell"></span>
+            </th:block>
+          </td>
+
+          <!-- Interest -->
+          <td class="number-col amount-cell text-start">
+            <th:block th:if="*{interest != null && !interest.zero}">
+              <span th:text="*{#monetary.format(interest)}"></span>
+            </th:block>
+            <th:block th:unless="*{interest != null && !interest.zero}">
+              <span class="empty-cell"></span>
+            </th:block>
+          </td>
+
+          <!-- Monitoring Fee -->
+          <td class="number-col amount-cell text-start">
+            <th:block th:if="*{monitoringFee != null && !monitoringFee.zero}">
+              <span th:text="*{#monetary.format(monitoringFee)}"></span>
+            </th:block>
+            <th:block th:unless="*{monitoringFee != null && !monitoringFee.zero}">
+              <span class="empty-cell"></span>
+            </th:block>
+          </td>
+
+          <!-- Balance -->
+          <td class="number-col-large text-start">
+            <span class="empty-cell"></span>
+          </td>
+
+          <!-- Status -->
+          <td class="status-col text-start">
+            <span class="empty-cell"></span>
+          </td>
+
+          <!-- Bank Amount -->
+          <td class="number-col amount-cell text-start">
+            <th:block th:if="*{bankAmount != null}">
+              <span th:text="*{#monetary.format(bankAmount)}"></span>
+            </th:block>
+            <th:block th:unless="*{bankAmount != null}">
+              <span class="empty-cell"></span>
+            </th:block>
+          </td>
+
+          <!-- Difference -->
+          <td class="number-col amount-cell text-start">
+            <th:block th:if="*{difference != null}">
+              <span th:classappend="*{!difference.isNegative() ? 'difference-positive' : 'difference-negative'}"
+                    th:text="*{#monetary.format(difference)}"></span>
+            </th:block>
+            <th:block th:unless="*{difference != null}">
+              <span class="empty-cell"></span>
+            </th:block>
+          </td>
+
+          <!-- To Be Paid -->
+          <td class="number-col text-start">
+            <span class="empty-cell"></span>
+          </td>
+
+          <!-- Payment Amount -->
+          <td class="payment-amount-col text-start">
+            <span class="empty-cell"></span>
+          </td>
+
+          <!-- Actual Payment Date -->
+          <td class="payment-date-col text-start">
+            <span class="empty-cell"></span>
+          </td>
+
+          <!-- Payment ID -->
+          <td class="payment-id-col text-start">
+            <span class="empty-cell"></span>
+          </td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</th:block>
+
+<!-- Additional initialization fallback -->
+<script>
+  // Extra fallback for frameworks that might delay rendering
+  if (typeof window.initCreditDataTooltips === 'function') {
+    // Try multiple times to ensure initialization
+    window.initCreditDataTooltips();
+    setTimeout(window.initCreditDataTooltips, 250);
+    setTimeout(window.initCreditDataTooltips, 1000);
+    setTimeout(window.initCreditDataTooltips, 2000);
+  }
+</script>
+</body>
+</html>

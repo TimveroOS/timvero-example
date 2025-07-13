@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<form
+    th:action="@{${actionPath}}"
+    method="post"
+    class="modal-form"
+    th:data-title="#{creditPayment.dialog.refund}"
+    id="refund"
+    th:object="${form}"
+>
+
+  <div class="form-body">
+    <input type="hidden" th:value="${entity.amount.number}" name="paymentFullAmount">
+    <div>
+      <div class="offerFormRow">
+        <span th:text="#{creditPayment.amount}">Min Amount</span>
+        <b><span th:text="${#monetary.format(entity.amount)}">123</span></b>
+      </div>
+      <div class="offerFormRow">
+        <span th:text="#{creditPayment.date}">Min Amount</span>
+        <b><span th:text="${#ldates.format(entity.date)}">123</span></b>
+      </div>
+      <div class="offerFormRow">
+        <span th:text="#{creditPayment.addedBy}">Min Amount</span>
+        <b><span><a th:text="${entity.createdBy.name}" th:href="@{'/user/'+ ${entity.createdBy.id}}"></a></span></b>
+      </div>
+    </div>
+
+    <hr>
+
+    <th:block
+        th:with="emptyOption=true, selectClassName='v-required'"
+        th:insert="~{/form/components :: select(#{refund.type}, 'type', ${refundTypes})}"></th:block>
+
+    <div
+        class="app_toggled"
+        data-toggle-id="type"
+        data-show-if="PARTIAL"
+    >
+      <th:block
+          th:with="currencies = ${currencies}"
+          th:insert="~{/form/components :: amount(#{common.amount}, 'amount', 'v-required')}"></th:block>
+    </div>
+
+    <th:block
+        th:insert="~{/form/components :: textarea(#{common.description}, 'description', 'v-required')}"></th:block>
+  </div>
+
+  <div class="modal-footer">
+    <button
+        type="button"
+        class="btn btn-secondary"
+        data-dismiss="modal"
+        th:text="#{button.close}"
+    >
+      Close
+    </button>
+    <button
+        type="submit"
+        class="btn btn-success"
+        th:text="#{button.save}"
+    >
+    </button>
+  </div>
+</form>
+
+
+</html>

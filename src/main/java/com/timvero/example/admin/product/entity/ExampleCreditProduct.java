@@ -1,5 +1,6 @@
 package com.timvero.example.admin.product.entity;
 
+import static com.timvero.ground.hibernate.type.ColumnDefenition.NUMERIC;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_PRECISION;
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_SCALE;
 
@@ -12,20 +13,23 @@ import javax.money.CurrencyUnit;
 @Entity
 public class ExampleCreditProduct extends CreditProduct {
 
-    @Column(name = "currency", updatable = false)
+    @Column(updatable = false)
     private CurrencyUnit currency;
 
-    @Column(name = "min_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
+    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
     private BigDecimal minAmount;
 
-    @Column(name = "max_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
+    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
     private BigDecimal maxAmount;
 
-    @Column(name = "min_term", nullable = false)
+    @Column(nullable = false)
     private Integer minTerm;
 
-    @Column(name = "max_term", nullable = false)
+    @Column(nullable = false)
     private Integer maxTerm;
+
+    @Column(nullable = false, columnDefinition = NUMERIC)
+    private BigDecimal lateFeeRate;
 
     public ExampleCreditProduct() {
         super();
@@ -71,4 +75,11 @@ public class ExampleCreditProduct extends CreditProduct {
         this.currency = currency;
     }
 
+    public BigDecimal getLateFeeRate() {
+        return lateFeeRate;
+    }
+
+    public void setLateFeeRate(BigDecimal lateFeeRate) {
+        this.lateFeeRate = lateFeeRate;
+    }
 }

@@ -119,6 +119,22 @@
             <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
+        
+            <!-- Test -->
+
+        <dependency>
+          <groupId>io.zonky.test</groupId>
+          <artifactId>embedded-database-spring-test</artifactId>
+          <version>2.6.0</version>
+          <scope>test</scope>
+        </dependency>
+    
+        <dependency>
+          <groupId>io.zonky.test</groupId>
+          <artifactId>embedded-postgres</artifactId>
+          <version>2.1.0</version>
+          <scope>test</scope>
+        </dependency>
 
     </dependencies>
 

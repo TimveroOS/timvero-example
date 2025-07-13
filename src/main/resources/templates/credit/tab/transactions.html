@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    /* CSS Custom Properties for theming */
+    :root {
+      --table-bg: #ffffff;
+      --table-border: #e5e7eb;
+      --table-header-bg: #f8f9fa;
+      --table-hover-bg: #f9fafb;
+      --text-primary: #374151;
+      --text-secondary: #6b7280;
+      --text-muted: #9ca3af;
+      --status-success: #059669;
+      --status-success-bg: #d1fae5;
+      --status-pending: #d97706;
+      --status-pending-bg: #fed7aa;
+      --status-failed: #dc2626;
+      --status-failed-bg: #fee2e2;
+      --status-voided: #6b7280;
+      --status-voided-bg: #f3f4f6;
+      --arrow-green: #059669;
+      --arrow-red: #dc2626;
+      --arrow-gray: #9ca3af;
+      --arrow-semitransparent: rgba(107, 114, 128, 0.4);
+      --btn-primary: #3b82f6;
+      --btn-primary-hover: #2563eb;
+    }
+
+    /* Responsive table container with minimalistic styling */
+    .responsive-table-container {
+      width: 100%;
+      margin: 0 auto 1rem;
+      overflow-x: auto;
+      overflow-y: visible;
+      border-radius: 12px;
+      background: var(--table-bg);
+      border: 1px solid var(--table-border);
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.02);
+      position: relative;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* Modern table styling */
+    .table-custom-style {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      table-layout: auto;
+      background: var(--table-bg);
+      font-size: 1rem;
+      min-width: 1400px;
+    }
+
+    /* Modern table header */
+    .table-custom-style thead th {
+      background: var(--table-header-bg);
+      position: sticky;
+      top: 0;
+      padding: 1rem 0.75rem;
+      border: none;
+      white-space: nowrap;
+      font-weight: 600;
+      font-size: 0.875rem;
+      letter-spacing: 0.025em;
+      color: var(--text-primary);
+      vertical-align: middle;
+      line-height: 1.4;
+      z-index: 10;
+      text-align: left;
+    }
+
+    /* First header rounded corner */
+    .table-custom-style thead th:first-child {
+      border-top-left-radius: 12px;
+    }
+
+    /* Last header rounded corner */
+    .table-custom-style thead th:last-child {
+      border-top-right-radius: 12px;
+    }
+
+    /* Modern table cells */
+    .table-custom-style td {
+      padding: 0.875rem 0.75rem;
+      border: none;
+      vertical-align: middle;
+      transition: background-color 0.15s ease-in-out;
+      color: var(--text-primary);
+      font-size: 1rem;
+      line-height: 1.5;
+      background: var(--table-bg);
+      white-space: nowrap;
+    }
+
+    /* Column sizing */
+    .id-col {
+      width: 3%;
+      min-width: 50px;
+      text-align: center;
+    }
+
+    .type-col {
+      width: 5%;
+      min-width: 70px;
+      text-align: center;
+    }
+
+    .amount-col {
+      width: 10%;
+      min-width: 120px;
+      font-weight: 600;
+    }
+
+    .payer-col {
+      font-weight: 600;
+      width: 12%;
+      min-width: 140px;
+    }
+
+    .status-col {
+      width: 8%;
+      min-width: 100px;
+    }
+
+    .date-col {
+      width: 10%;
+      min-width: 120px;
+      font-weight: 600;
+    }
+
+    .payment-id-col {
+      width: 10%;
+      min-width: 120px;
+      font-weight: 600;
+    }
+
+    .service-col {
+      width: 10%;
+      min-width: 120px;
+      font-weight: 600;
+    }
+
+    .reference-col {
+      width: 12%;
+      min-width: 140px;
+      font-weight: 600;
+    }
+
+    .description-col {
+      width: 15%;
+      min-width: 180px;
+      font-weight: 600;
+    }
+
+    .actions-col {
+      width: 5%;
+      min-width: 100px;
+      text-align: right;
+    }
+
+    /* Row hover effects */
+    .table-custom-style tbody tr:hover td {
+      background-color: var(--table-hover-bg);
+      transition: background-color 0.15s ease-in-out;
+    }
+
+    /* Row number styling */
+    .row-number {
+      font-weight: 600;
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+    }
+
+    /* Amount cell styling */
+    .amount-cell {
+      font-weight: 600;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    /* Status cell styling */
+    .status-cell {
+      font-weight: 600;
+      font-size: 0.875rem;
+      letter-spacing: 0.05em;
+      padding: 0.375rem 1rem;
+      border-radius: 9999px;
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-succeed,
+    .status-void-failed {
+      color: var(--status-success);
+      background-color: var(--status-success-bg);
+    }
+
+    .status-pending {
+      color: var(--status-pending);
+      background-color: var(--status-pending-bg);
+    }
+
+    .status-failed {
+      color: var(--status-failed);
+      background-color: var(--status-failed-bg);
+    }
+
+    .status-chargeback,
+    .status-voided {
+      color: var(--status-voided);
+      background-color: var(--status-voided-bg);
+    }
+
+    /* Arrow styling */
+    .arrow-green {
+      color: var(--arrow-green);
+    }
+
+    .arrow-red {
+      color: var(--arrow-red);
+    }
+
+    .arrow-lightgray {
+      color: var(--arrow-gray);
+    }
+
+    .arrow-semitransparent {
+      opacity: 0.4;
+    }
+
+    .arrow-right svg {
+      transform: rotate(180deg);
+      display: inline-block;
+    }
+
+    .mr-10 {
+      margin-right: 10px;
+    }
+
+    /* Enhanced scrollbar */
+    .responsive-table-container::-webkit-scrollbar {
+      height: 8px;
+    }
+
+    .responsive-table-container::-webkit-scrollbar-track {
+      background: #f3f4f6;
+      border-radius: 4px;
+    }
+
+    .responsive-table-container::-webkit-scrollbar-thumb {
+      background: #d1d5db;
+      border-radius: 4px;
+    }
+
+    .responsive-table-container::-webkit-scrollbar-thumb:hover {
+      background: #9ca3af;
+    }
+
+    /* Last row rounded corners */
+    .table-custom-style tbody tr:last-child td:first-child {
+      border-bottom-left-radius: 12px;
+    }
+
+    .table-custom-style tbody tr:last-child td:last-child {
+      border-bottom-right-radius: 12px;
+    }
+
+    /* For large screens */
+    @media screen and (min-width: 1600px) {
+      .table-custom-style {
+        font-size: 1.0625rem;
+      }
+
+      .table-custom-style thead th {
+        padding: 1.125rem 1rem;
+        font-size: 0.9375rem;
+      }
+
+      .table-custom-style td {
+        padding: 1rem 1rem;
+      }
+    }
+
+    @media screen and (min-width: 1920px) {
+      .table-custom-style {
+        font-size: 1.125rem;
+      }
+
+      .table-custom-style thead th {
+        padding: 1.25rem 1.125rem;
+        font-size: 1rem;
+      }
+
+      .table-custom-style td {
+        padding: 1.125rem 1.125rem;
+      }
+    }
+
+    /* For smaller screens */
+    @media screen and (max-width: 1200px) {
+      .responsive-table-container {
+        overflow-x: scroll;
+      }
+
+      .table-custom-style {
+        font-size: 0.9375rem;
+      }
+
+      .table-custom-style thead th,
+      .table-custom-style td {
+        padding: 0.75rem 0.625rem;
+      }
+    }
+
+    /* Text alignment utilities */
+    .text-center {
+      text-align: center;
+    }
+
+    .text-right {
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+<th:block>
+  <div class="card-body">
+    <div class="responsive-table-container">
+      <table class="table table-custom-style">
+        <thead>
+        <tr>
+          <th class="id-col text-center" th:text="#{symbol.id}">#</th>
+          <th class="type-col text-center" th:text="#{transaction.type}">Type</th>
+          <th class="amount-col" th:text="#{transaction.amount}">Amount</th>
+          <th class="payer-col" th:text="#{transaction.payer}">Payer</th>
+          <th class="status-col" th:text="#{transaction.status}">Status</th>
+          <th class="date-col" th:text="#{transaction.date}">Date</th>
+          <th class="payment-id-col" th:text="#{transaction.paymentId}">Payment ID</th>
+          <th class="service-col" th:text="#{transaction.service}">Service</th>
+          <th class="description-col" th:text="#{transaction.description}">Description</th>
+          <th class="actions-col"></th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr th:each="t, iterStat : ${transactions}" th:object="${t}" th:with="tId = ${t.id}">
+          <td class="id-col text-center">
+            <span class="row-number" th:text="${iterStat.count}"></span>
+          </td>
+          <td class="type-col text-center">
+            <span
+                th:classappend="*{(status.complete ? (#enums.in(status, {'SUCCEED', 'VOID_FAILED'})
+                     ? 'arrow-green' : #enums.in(status, {'VOIDED'}) ? 'arrow-lightgray' : 'arrow-red') : 'arrow-semitransparent')
+                     + ' ' + (#enums.equals(type, 'INCOMING') ? '' : 'arrow-right')}">
+                <th:block th:replace="~{/icons/icons :: arrow}"/>
+            </span>
+          </td>
+          <td class="amount-col">
+            <span class="amount-cell" th:text="*{#monetary.format(amount)}"></span>
+          </td>
+          <td class="payer-col">
+            <span th:text="*{#enums.equals(type, 'OUTGOING') ? 'Bank' : (paymentMethod != null && #enums.equals(paymentMethod.type, 'LQC') ? (paymentMethod.ownerName != null ? paymentMethod.ownerName : 'N/A') : 'N/A')}"></span>
+          </td>
+          <td class="status-col">
+            <span class="status-cell"
+                  th:classappend="*{'status-' + #strings.replace(#strings.toLowerCase(status.name()), '_', '-')}"
+                  th:text="*{#enums.name(status)}"></span>
+          </td>
+          <td class="date-col">
+            <th:block th:unless="*{completedAt}">
+              <span th:text="*{#ldates.format(createdAt)}"></span>
+            </th:block>
+            <th:block th:if="*{completedAt}">
+              <span th:text="*{#ldates.format(completedAt)}"></span>
+            </th:block>
+          </td>
+          <td class="payment-id-col">
+            <span th:text="*{operation?.id}"></span>
+          </td>
+          <td class="service-col">
+            <span th:text="*{#enums.name('transaction.service', service)}"></span>
+          </td>
+          <td class="description-col">
+            <span th:text="*{description}"></span>
+          </td>
+          <td class="actions-col text-right">
+            <button
+                type="button"
+                class="btn mr-10 no-ajax"
+                th:each="action : ${@entityActionMapping.getAvailableActions(t).all}"
+                th:data-action="@{${action.path}}"
+                th:classappend="|${action.additionalClass} ${action.postOnly ? 'post-only-action' : 'modal-btn'}|"
+                th:text="#{${action.name}}"
+            >
+            </button>
+          </td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</th:block>
+</body>
+</html>

@@ -15,22 +15,22 @@ import java.math.BigDecimal;
 @Entity
 public class ExampleCreditProductAdditive extends CreditProductAdditive {
 
-    @Column(name = "name", nullable = false)
+    @Column(nullable = false)
     private String name;
 
-    @Column(name = "min_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
+    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
     private BigDecimal minAmount;
 
-    @Column(name = "max_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
+    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
     private BigDecimal maxAmount;
 
-    @Column(name = "min_term", nullable = false)
+    @Column(nullable = false)
     private Integer minTerm;
 
-    @Column(name = "max_term", nullable = false)
+    @Column(nullable = false)
     private Integer maxTerm;
 
-    @Column(name = "interest_rate", columnDefinition = NUMERIC)
+    @Column(nullable = false, columnDefinition = NUMERIC)
     private BigDecimal interestRate;
 
     protected ExampleCreditProductAdditive() {

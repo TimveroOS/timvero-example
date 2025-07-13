@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<th:block xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
+  <div class="card-info-wrapper d-flex" th:object="${entity}" th:with="product = *{condition.securedOffer.originalOffer.productAdditive.product}">
+    <!-- Basic Credit Information -->
+    <div class="card-info d-flex pl-20 pb-15">
+      <ul class="card-info__body d-flex">
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.application}"></span>
+          <span class="card-info__value">
+            <a th:href="@{*{application}}">link</a>
+          </span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.borrower}"></span>
+          <span class="card-info__value">
+            <a th:href="@{*{application.borrowerParticipant.client}}"
+               th:text="*{application.borrowerParticipant.client.displayedName}"></a>
+          </span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.product.creditType}"></span>
+          <span class="card-info__value" th:text="${#enums.name(product.creditType)}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.product.engineName}"></span>
+          <span class="card-info__value" th:text="${#enums.name('schedule.engine.name', product.engineName)}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.loanAmount}"></span>
+          <span class="card-info__value" th:text="*{#monetary.format(condition.principal)}"></span>
+        </li>
+      </ul>
+    </div>
+
+    <!-- Financial Information -->
+    <div class="card-info d-flex pl-20 pb-15">
+      <ul class="card-info__body d-flex">
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.startDate}"></span>
+          <span class="card-info__value" th:text="*{#ldates.format(startDate)}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.loanPeriodMonths}"></span>
+          <span class="card-info__value" th:text="*{condition.period.multipliedBy(condition.term).toTotalMonths()}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.paymentPeriod}"></span>
+          <span class="card-info__value" th:text="*{#enums.name('period', condition.period)}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.dayCountMethod}"></span>
+          <span class="card-info__value" th:text="*{#enums.name('day.count.method', condition.dayCountMethod)}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.regularPayment}"></span>
+          <span class="card-info__value" th:text="*{#monetary.format(condition.regularPayment)}"></span>
+        </li>
+      </ul>
+    </div>
+
+    <!-- Fee Information -->
+    <div class="card-info d-flex pl-20 pb-15">
+      <ul class="card-info__body d-flex">
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.interestRate}"></span>
+          <span class="card-info__value"
+                th:text="*{condition.interestRate + '%'}">
+          </span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.product.lateFeeRate}"></span>
+          <span class="card-info__value" th:text="${product.lateFeeRate + '%'}"></span>
+        </li>
+      </ul>
+    </div>
+    <div class="card-info d-flex pl-20 pb-15">
+      <ul class="card-info__body d-flex">
+        <!-- <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.paidPrincipal}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPaidPrincipal(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.paidInterest}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPaidInterest(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.paidTotal}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPaidTotal(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.outstandingPrincipal}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getOutstandingPrincipal(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.outstandingInterest}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getOutstandingInterest(liquidityCredit))}"></span>
+        </li> -->
+      </ul>
+    </div>
+    <div class="card-info d-flex pl-20 pb-15">
+      <ul class="card-info__body d-flex">
+        <!-- <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.pastDuePrincipal}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPastDuePrincipal(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.pastDueInterest}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPastDueInterest(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.pastDueTotal}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPastDueTotal(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.delayDays}"></span>
+          <span class="card-info__value" th:text="${@creditSummaryService.getDaysPastDue(liquidityCredit)}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.unpaidLateFee}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getUnpaidLateFee(liquidityCredit))}"></span>
+        </li> -->
+      </ul>
+    </div>
+    <div class="card-info d-flex pl-20 pb-15">
+      <ul class="card-info__body d-flex">
+        <!-- <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.unpaidMonitoringFee}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getUnpaidMonitoringFee(liquidityCredit))}"></span>
+        </li>
+        <li class="card-info__item d-flex">
+          <span class="card-info__property" th:text="#{credit.overpayment}"></span>
+          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getOverpayment(liquidityCredit).negate())}"></span>
+        </li> -->
+      </ul>
+    </div>
+  </div>
+</th:block>

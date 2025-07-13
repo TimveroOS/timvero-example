@@ -23,19 +23,14 @@ import org.springframework.stereotype.Component;
 @Component
 public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
 
-    private final DecisionProcessStarter decisionProcessStarter;
-    private final EntityDocumentService documentService;
-    private final ParticipantRepository participantRepository;
-    private final EntityDocumentFinder documentFinder;
-
-    public BorrowerStartTreeChecker(DecisionProcessStarter decisionProcessStarter,
-        EntityDocumentService documentService, ParticipantRepository participantRepository,
-        EntityDocumentFinder documentFinder) {
-        this.decisionProcessStarter = decisionProcessStarter;
-        this.documentService = documentService;
-        this.participantRepository = participantRepository;
-        this.documentFinder = documentFinder;
-    }
+    @Autowired
+    private DecisionProcessStarter decisionProcessStarter;
+    @Autowired
+    private EntityDocumentService documentService;
+    @Autowired
+    private ParticipantRepository participantRepository;
+    @Autowired
+    private EntityDocumentFinder documentFinder;
 
     @Override
     protected void registerListeners(CheckerListenerRegistry<Participant> registry) {
@@ -57,12 +52,19 @@ public class BorrowerStartTreeChecker extends EntityChecker<Participant, UUID> {
     // tag::availability[]
     @Override
     protected boolean isAvailable(Participant participant) {
-        return participant.getRoles().contains(ParticipantRole.BORROWER)
-            && participant.getStatus() == ParticipantStatus.NEW
-            && documentFinder.isLatestSigned(participant, ParticipantDocumentTypesConfiguration.APPLICATION_FORM)
-            && documentService.requiredDocumentsAdded(participant);
+        return needSignature(participant) && hasSignature(participant);
     }
 // end::availability[]
+
+    public boolean needSignature(Participant participant) {
+        return participant.getRoles().contains(ParticipantRole.BORROWER)
+            && participant.getStatus() == ParticipantStatus.NEW;
+    }
+
+    public boolean hasSignature(Participant participant) {
+        return documentFinder.isLatestSigned(participant, ParticipantDocumentTypesConfiguration.APPLICATION_FORM)
+            && documentService.requiredDocumentsAdded(participant);
+    }
 
     // tag::perform[]
     @Override

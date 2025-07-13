@@ -1,6 +1,7 @@
 package com.timvero.example.admin;
 
 import com.timvero.example.admin.offer.entity.ExampleProductOffer;
+import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.ground.document.signable.SignableDocument;
 import com.timvero.web.common.action.EntityActionPath;
 import org.springframework.boot.SpringBootConfiguration;
@@ -22,7 +23,8 @@ public class CustomWebConfiguration {
     EntityActionPath signableDocumentPath() {
         return EntityActionPath.builder()
             .addPath(SignableDocument.class, "/signable-document")
-            .addPath(ExampleProductOffer.class, "/offer")
+            .addPath(ExampleProductOffer.class, "/product-offer")
+            .addPath(ExampleCreditPayment.class, "/credit-payment")
             .build();
     }
 }
