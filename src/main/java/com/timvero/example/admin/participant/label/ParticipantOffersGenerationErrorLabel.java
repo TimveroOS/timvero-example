@@ -5,7 +5,7 @@ import com.timvero.ground.entity_marker.label.EntityLabel;
 import org.springframework.stereotype.Component;
 
 @Component
-public class OffersGenerationErrorParticipantLabel implements EntityLabel<Participant> {
+public class ParticipantOffersGenerationErrorLabel implements EntityLabel<Participant> {
 
     @Override
     public boolean isEntityMarked(Participant participant) {

@@ -7,6 +7,7 @@ import com.timvero.loan.product.form.BaseCreditProductForm;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.PositiveOrZero;
 import java.math.BigDecimal;
 import javax.money.CurrencyUnit;
 
@@ -30,6 +31,10 @@ public class CreditProductForm extends BaseCreditProductForm {
 
     @NotNull
     private Integer maxTerm;
+
+    @NotNull
+    @PositiveOrZero
+    private BigDecimal lateFeeRate;
 
     public BigDecimal getMinAmount() {
         return minAmount;
@@ -69,5 +74,13 @@ public class CreditProductForm extends BaseCreditProductForm {
 
     public void setCurrency(CurrencyUnit currency) {
         this.currency = currency;
+    }
+
+    public BigDecimal getLateFeeRate() {
+        return lateFeeRate;
+    }
+
+    public void setLateFeeRate(BigDecimal lateFeeRate) {
+        this.lateFeeRate = lateFeeRate;
     }
 }

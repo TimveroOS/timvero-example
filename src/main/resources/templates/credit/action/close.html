@@ -1,0 +1,37 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<form
+    th:action="@{${actionPath}}"
+    method="post"
+    class="modal-form"
+    th:data-title="#{credit.action.close}"
+    id="paper-check"
+    th:object="${form}"
+>
+  <div class="form-body">
+  
+    <th:block S
+        th:insert="~{/form/components :: date (#{credit.closeDate}, 'closeDate', 'v-required')}"
+        th:with="minDate = ${minDate}, maxDate = ${maxDate}"
+    />
+
+  </div>
+  <div class="modal-footer">
+    <button
+        type="button"
+        class="btn btn-secondary"
+        data-dismiss="modal"
+        th:text="#{button.close}"
+    >
+      Close
+    </button>
+    <button
+        type="submit"
+        class="btn btn-success"
+        th:text="#{button.save}"
+    >
+      Save
+    </button>
+  </div>
+</form>
+</html>

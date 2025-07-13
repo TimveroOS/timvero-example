@@ -19,6 +19,7 @@
                                 <p class="header__title">
                                     <span th:text="#{application.deal}"></span>
                                 </p>
+                                <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
                             </div>
                             <div
                                 class="header-right d-flex align-items-center">

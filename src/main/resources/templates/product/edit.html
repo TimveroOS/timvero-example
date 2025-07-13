@@ -49,6 +49,8 @@
                 th:insert="~{/form/components :: text(#{credit.product.minTerm}, 'minTerm', 'app_digits v-required positive')}"/>
             <th:block
                 th:insert="~{/form/components :: text(#{credit.product.maxTerm}, 'maxTerm', 'app_digits v-required positive')}"/>
+            <th:block
+                th:insert="~{/form/components :: text(#{credit.product.lateFeeRate}, 'lateFeeRate', 'v-required app_decimal')}"/>
         </div>
     </form>
 </div>

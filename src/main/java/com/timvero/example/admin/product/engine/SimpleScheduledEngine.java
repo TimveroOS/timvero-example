@@ -1,21 +1,23 @@
 package com.timvero.example.admin.product.engine;
 
-import static com.timvero.servicing.engine.CreditCalculatorUtils.append;
-import static com.timvero.servicing.engine.CreditCalculatorUtils.calcInterest;
-import static com.timvero.servicing.engine.CreditCalculatorUtils.periodicInterest;
+import static com.timvero.servicing.engine.CreditCalculatorUtils.calcRangeAccural;
 
 import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.ground.util.Lang;
 import com.timvero.loan.engine.scheduled.ScheduledEngine;
-import com.timvero.loan.engine.util.PaymentCalculator;
+import com.timvero.scheduled.day_count.DayCountMethod;
+import com.timvero.scheduled.day_count.PaymentGrid;
 import com.timvero.scheduled.entity.PaymentSegment;
+import com.timvero.servicing.engine.accural.AbstractAccrualEngine.DayCounter;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.Period;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import javax.money.MonetaryAmount;
+import org.apache.commons.math3.fraction.BigFraction;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 @Service(SimpleScheduledEngine.NAME)
@@ -23,59 +25,47 @@ public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondi
 
     public static final String NAME = "SimpleScheduledEngine";
 
-    @Override
-    public List<PaymentSegment> payments(ExampleCreditCondition condition, LocalDate interestStart,
-        LocalDate paymentStart, MonetaryAmount principal, MonetaryAmount interest) {
-        double overestimate = 0;//14/28D;
-
-        BigDecimal annualInterest;
-        annualInterest = condition.getAnnualInterest();
-
-        MonetaryAmount regularPayment = PaymentCalculator.calcAnnuityPayment(principal, interest,
-            periodicInterest(condition.getPeriod(), annualInterest), condition.getTerm(),
-            overestimate);
-
-        return payments(regularPayment, annualInterest,
-            condition.getPeriod(), paymentStart.getDayOfMonth(), principal, interest, interestStart, paymentStart,
-            condition.getTerm());
-    }
+    @Autowired
+    protected Map<String, DayCountMethod> dayCountMethods;
 
     @Override
     public Class<ExampleCreditCondition> getConditionClass() {
         return ExampleCreditCondition.class;
     }
 
+    @Override
+    public List<PaymentSegment> payments(ExampleCreditCondition condition, LocalDate interestStart,
+        LocalDate paymentStart, MonetaryAmount principal, MonetaryAmount interest) {
+        DayCountMethod dayCountMethod = dayCountMethods.get(condition.getDayCountMethod());
+        return payments(condition.getRegularPayment(), condition.getInterestRate(),
+            condition.getPeriod(), principal, interest, interestStart, paymentStart,
+            condition.getTerm(), dayCountMethod);
+    }
+
     private List<PaymentSegment> payments(MonetaryAmount regularPayment, BigDecimal annualInterest,
-        Period period, int day, MonetaryAmount principal, MonetaryAmount interest,
-        LocalDate startInterest, LocalDate payStarting, int length) {
+        Period period, MonetaryAmount principal, MonetaryAmount interest,
+        LocalDate startInterest, LocalDate payStarting, int length, DayCountMethod dayCountMethod) {
+
+        LocalDate maturityDate = startInterest.plus(period.multipliedBy(length));
+        final PaymentGrid paymentGrid = new PaymentGrid(maturityDate, startInterest.getDayOfMonth(), period);
+        final DayCounter dayCounter = new DayCounter(paymentGrid, dayCountMethod);
 
         List<PaymentSegment> payments = new ArrayList<>();
 
-        int shift = 0;
-        LocalDate firstPaymentAt;
-
-        while (ChronoUnit.DAYS.between(payStarting,
-            firstPaymentAt = append(payStarting, period, shift, day)) < 0) {
-            shift++;
-        }
-
-        int order = 0;
-
         LocalDate from = startInterest, to;
-        while (order < length) {
+        for (int order = 1; order <= length; order++) {
 
             MonetaryAmount principalPayment;
             MonetaryAmount interestPayment;
 
-            to = append(firstPaymentAt, period, order, day);
-
-            BigDecimal currentInterest = annualInterest;
+            to = startInterest.plus(period.multipliedBy(order));
 
             if (from.isBefore(to)) {
-                interest = interest.add(calcInterest(currentInterest, principal, from, from, to, period, day));
+                BigFraction fraction = dayCounter.count(from, to);
+                MonetaryAmount increment = calcRangeAccural(principal, annualInterest, fraction);
+                interest = interest.add(increment);
             }
 
-            order++;
             if (order < length) {
                 interestPayment = Lang.min(regularPayment, interest);
                 principalPayment = Lang.min(principal, regularPayment.subtract(interestPayment));

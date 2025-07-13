@@ -58,6 +58,16 @@
         <li class="card-info__item d-flex">
             <span
                 class="card-info__property"
+                th:text="#{additive.interestRate}"
+            ></span>
+            <span
+                class="card-info__value"
+                th:text="*{interestRate+'%'}"
+            ></span>
+        </li>
+        <li class="card-info__item d-flex">
+            <span
+                class="card-info__property"
                 th:text="#{credit.product.procuring}"
             ></span>
             <span

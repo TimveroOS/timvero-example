@@ -1,7 +1,8 @@
 package com.timvero.example.admin.scheduled;
 
+import static com.timvero.ground.hibernate.type.ColumnDefenition.NUMERIC;
+
 import com.timvero.example.admin.offer.entity.ExampleSecuredOffer;
-import com.timvero.ground.hibernate.type.ColumnDefenition;
 import com.timvero.scheduled.entity.CreditCondition;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
@@ -11,6 +12,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
+import jakarta.validation.constraints.NotNull;
 import java.math.BigDecimal;
 import java.time.Period;
 import java.util.UUID;
@@ -29,14 +31,24 @@ public class ExampleCreditCondition extends AbstractPersistable<UUID> implements
     @Column(nullable = false)
     private String engineName;
 
-    @Column(nullable = false, columnDefinition = ColumnDefenition.NUMERIC)
-    private BigDecimal annualInterest;
+    @Column(nullable = false, columnDefinition = NUMERIC)
+    private BigDecimal interestRate;
+
+    @Column(nullable = false, columnDefinition = NUMERIC)
+    private BigDecimal lateFeeRate;
 
     @Column(nullable = false)
-    private Period period = Period.ofMonths(1);
+    private String dayCountMethod;
+
+    @Column(nullable = false)
+    private Period period;
 
     @Column(nullable = false)
     private Integer term;
+
+    @Embedded
+    @NotNull
+    private MonetaryAmount regularPayment;
 
     @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
     @JoinColumn
@@ -44,13 +56,18 @@ public class ExampleCreditCondition extends AbstractPersistable<UUID> implements
 
     protected ExampleCreditCondition() {}
 
-    public ExampleCreditCondition(MonetaryAmount principal, String engineName, BigDecimal annualInterest,
-        Integer term, ExampleSecuredOffer securedOffer) {
+    public ExampleCreditCondition(MonetaryAmount principal, String engineName, BigDecimal interestRate,
+        BigDecimal lateFeeRate, String dayCountMethod, Period period, Integer term, MonetaryAmount regularPayment,
+        ExampleSecuredOffer securedOffer) {
         super();
         this.principal = principal;
         this.engineName = engineName;
-        this.annualInterest = annualInterest;
+        this.interestRate = interestRate;
+        this.lateFeeRate = lateFeeRate;
+        this.dayCountMethod = dayCountMethod;
+        this.period = period;
         this.term = term;
+        this.regularPayment = regularPayment;
         this.securedOffer = securedOffer;
     }
 
@@ -64,8 +81,16 @@ public class ExampleCreditCondition extends AbstractPersistable<UUID> implements
         return engineName;
     }
 
-    public BigDecimal getAnnualInterest() {
-        return annualInterest;
+    public BigDecimal getInterestRate() {
+        return interestRate;
+    }
+
+    public BigDecimal getLateFeeRate() {
+        return lateFeeRate;
+    }
+
+    public String getDayCountMethod() {
+        return dayCountMethod;
     }
 
     public Period getPeriod() {
@@ -74,6 +99,10 @@ public class ExampleCreditCondition extends AbstractPersistable<UUID> implements
 
     public Integer getTerm() {
         return term;
+    }
+
+    public MonetaryAmount getRegularPayment() {
+        return regularPayment;
     }
 
     public ExampleSecuredOffer getSecuredOffer() {

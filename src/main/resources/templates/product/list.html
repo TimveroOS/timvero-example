@@ -16,7 +16,7 @@
             th:object="${entity}" role="row" class="clickable"
         >
             <td>
-                <span class="d-flex justify-content-start" th:text="*{id}"></span>
+                <span class="d-flex justify-content-start" th:text="*{#strings.substring(id, 0, 6)}"></span>
             </td>
             <td th:text="*{code}"></td>
             <td th:text="*{title}"></td>

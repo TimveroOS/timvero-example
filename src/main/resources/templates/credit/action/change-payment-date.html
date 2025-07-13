@@ -1,0 +1,35 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<form
+    th:action="@{${actionPath}}"
+    method="post"
+    class="modal-form"
+    th:data-title="#{creditPayment.dialog.move-payment-date}"
+    id="move-payment-date"
+    th:object="${form}"
+>
+    <div class="form-body">
+        <th:block
+            th:with="minDate = ${#ldates.format(minDate, 'yyyy/MM/dd')}"
+            th:insert="~{/form/components :: date(#{creditPayment.date}, 'date', 'v-required')}"/>
+    </div>
+
+    <div class="modal-footer">
+        <button
+            type="button"
+            class="btn btn-secondary"
+            data-dismiss="modal"
+            th:text="#{button.close}"
+        >
+            Close
+        </button>
+        <button
+            type="submit"
+            class="btn btn-success"
+            th:text="#{button.save}"
+        >
+        </button>
+    </div>
+
+</form>
+</html>

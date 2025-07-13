@@ -6,6 +6,8 @@ import static jakarta.persistence.FetchType.EAGER;
 import static org.hibernate.envers.RelationTargetAuditMode.NOT_AUDITED;
 
 import com.timvero.base.entity.AbstractAuditable;
+import com.timvero.example.admin.credit.entity.ExampleCredit;
+import com.timvero.example.admin.credit.entity.ExampleCredit_;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.ParticipantRole;
 import com.timvero.example.admin.participant.entity.Participant_;
@@ -51,6 +53,9 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
     @Audited(targetAuditMode = NOT_AUDITED)
     private PaymentSchedule paymentSchedule;
 
+    @OneToOne(fetch = FetchType.LAZY, mappedBy = ExampleCredit_.APPLICATION)
+    private ExampleCredit credit;
+
     public ApplicationStatus getStatus() {
         return status;
     }
@@ -94,5 +99,9 @@ public class Application extends AbstractAuditable<UUID> implements NamedEntity 
 
     public void setPaymentSchedule(PaymentSchedule paymentSchedule) {
         this.paymentSchedule = paymentSchedule;
+    }
+
+    public ExampleCredit getCredit() {
+        return credit;
     }
 }
