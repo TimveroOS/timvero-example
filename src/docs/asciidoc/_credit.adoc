@@ -1,0 +1,564 @@
+= Credit Management System
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This section describes how to implement and manage credit entities using the loan servicing framework. The ExampleCredit implementation demonstrates a complete loan management system, but the underlying loan module provides flexible components for implementing various lending products.
+
+== Credit System Architecture
+
+The credit management system is built on the loan servicing framework, which provides core components for any type of lending product. The ExampleCredit serves as a reference implementation, but you can create different credit types for various lending scenarios.
+
+=== Core Components
+
+The loan module (`com.timvero.servicing`) provides the foundation:
+
+* **`Credit`** - Base entity class for all lending products
+* **`CreditSnapshot`** - Point-in-time credit state management
+* **`CreditOperation`** - Base class for all credit operations (payments, charges, etc.)
+* **`Debt`** - Flexible debt structure with account-based balances
+* **`CreditCalculationService`** - Core calculation engine
+* **`CreditPaymentService`** - Payment processing infrastructure
+
+=== ExampleCredit Implementation
+
+The ExampleCredit demonstrates a complete consumer loan implementation:
+
+[source,java]
+----
+include::{sourcedir}/credit/entity/ExampleCredit.java[lines=19..57]
+----
+
+Key features:
+* **Discriminator Value**: `"1"` identifies this credit type in the database
+* **Application Integration**: Links to loan application and borrower
+* **Condition Management**: Contains loan terms (principal, term, interest rate)
+* **Maturity Calculation**: Automatic calculation based on start date and terms
+
+== Credit Entity Setup
+
+=== Creating Custom Credit Types
+
+To implement different lending products, extend the base `Credit` class:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("2")  // Unique identifier for this credit type
+public class MortgageCredit extends Credit implements NamedEntity {
+    
+    @OneToOne(fetch = FetchType.EAGER)
+    @JoinColumn(nullable = false)
+    private PropertyApplication application;
+    
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn(name = "mortgage_condition")
+    private MortgageCondition condition;
+    
+    @Override
+    public String getDisplayedName() {
+        return "Mortgage for " + getApplication().getPropertyAddress();
+    }
+    
+    @Transient
+    public LocalDate getMaturityDate() {
+        return getStartDate().plus(getCondition().getTerm());
+    }
+}
+----
+
+=== Credit Condition Configuration
+
+Define loan terms and conditions specific to your credit type:
+
+[source,java]
+----
+@Entity
+public class ExampleCreditCondition extends BasePersistable<UUID> {
+    
+    @Embedded
+    @CompositeType(MonetaryAmountType.class)
+    private MonetaryAmount principal;
+    
+    @Column(nullable = false)
+    private Period period;  // Payment frequency (monthly, weekly, etc.)
+    
+    @Column(nullable = false)
+    private Integer term;   // Number of payment periods
+    
+    @Column(nullable = false)
+    private BigDecimal interestRate;
+    
+    // getters and setters...
+}
+----
+
+=== Database Schema Generation
+
+The platform automatically generates SQL migrations for credit entities:
+
+[source,sql]
+----
+-- Generated migration for ExampleCredit
+CREATE TABLE credit (
+    id UUID PRIMARY KEY,
+    credit_type INTEGER NOT NULL,  -- Discriminator column
+    start_date DATE NOT NULL,
+    calculation_date DATE,
+    actual_snapshot BIGINT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    -- ExampleCredit specific columns
+    application UUID NOT NULL,
+    condition UUID
+);
+----
+
+== Credit Operations Framework
+
+=== Built-in Operation Types
+
+The loan module provides standard operation types that work with any credit implementation:
+
+==== Payment Operations
+
+[source,java]
+----
+include::{sourcedir}/operation/payment/ExampleCreditPayment.java[lines=15..35]
+----
+
+Custom payment types can be created by extending `CreditPayment`:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("201")
+public class MortgagePayment extends CreditPayment {
+    
+    public static Integer TYPE = 201;
+    
+    public MortgagePayment(LocalDate date, MonetaryAmount amount) {
+        super(TYPE, date, OperationStatus.APPROVED, amount);
+    }
+    
+    @Override
+    public Integer getType() {
+        return TYPE;
+    }
+}
+----
+
+==== Charge Operations
+
+Implement fees and charges specific to your credit type:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("301")
+public class OriginationFeeCharge extends CreditOperation {
+    
+    public static Integer TYPE = 301;
+    
+    @Embedded
+    @CompositeType(MonetaryAmountType.class)
+    private MonetaryAmount amount;
+    
+    public OriginationFeeCharge(LocalDate date, MonetaryAmount amount) {
+        super(TYPE, date, OperationStatus.APPROVED);
+        this.amount = amount;
+    }
+    
+    @Override
+    public boolean isEndDayOperation() {
+        return false;
+    }
+}
+----
+
+==== Accrual Operations
+
+Interest and fee accruals are handled by the calculation engine:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("401")
+public class InterestAccrual extends CreditOperation {
+    
+    @Embedded
+    @CompositeType(MonetaryAmountType.class)
+    private MonetaryAmount accruedAmount;
+    
+    @Column(nullable = false)
+    private String accountType;  // INTEREST, LATE_FEE, etc.
+    
+    @Override
+    public boolean isEndDayOperation() {
+        return true;  // Accruals typically run at end of day
+    }
+}
+----
+
+=== Credit Action Controllers
+
+Actions provide user interface operations for credit management:
+
+==== Payment Registration
+
+[source,java]
+----
+include::{sourcedir}/credit/action/RegisterPaymentAction.java[lines=25..44]
+----
+
+The action uses a form to collect payment details:
+
+[source,java]
+----
+include::{sourcedir}/credit/action/RegisterPaymentAction.java[lines=64..99]
+----
+
+==== Disbursement Processing
+
+[source,java]
+----
+@Controller
+@RequestMapping("/register-disbursement")
+public class RegisterDisbursementAction extends EntityActionController<UUID, ExampleCredit, DisbursementForm> {
+    
+    @Override
+    protected EntityAction<? super ExampleCredit, DisbursementForm> action() {
+        return when(c -> c.getActualSnapshot().getStatus().equals(APPROVED))
+            .then((c, f, u) -> {
+                // Create disbursement transaction
+                disbursementService.processDisbursement(c, f.getAmount(), f.getMethod());
+            });
+    }
+}
+----
+
+=== Transaction Processing Integration
+
+The credit system integrates with the transaction processing framework:
+
+[source,java]
+----
+include::{sourcedir}/transaction/BorrowerTransactionService.java[lines=44..65]
+----
+
+Transaction processing flow:
+1. **Transaction Creation**: `BorrowerTransaction` created with payment details
+2. **Payment Gateway**: Transaction sent to payment processor
+3. **Success Handling**: On success, creates `CreditPayment` operation
+4. **Calculation Trigger**: Credit calculation engine updates balances
+5. **Snapshot Update**: New credit state snapshot created
+
+== Credit Calculation Engine
+
+=== Debt Structure
+
+The loan module uses a flexible debt structure with named accounts:
+
+[source,java]
+----
+// Account type constants for ExampleCredit
+public static final String PRINCIPAL = "PRINCIPAL";
+public static final String INTEREST = "INTEREST"; 
+public static final String LATE_FEE = "LATE_FEE";
+public static final String PAST_DUE_PRINCIPAL = "PAST_DUE_PRINCIPAL";
+public static final String PAST_DUE_INTEREST = "PAST_DUE_INTEREST";
+----
+
+For different credit types, define appropriate account structures:
+
+[source,java]
+----
+// Mortgage-specific accounts
+public static final String PRINCIPAL = "PRINCIPAL";
+public static final String INTEREST = "INTEREST";
+public static final String ESCROW = "ESCROW";
+public static final String PMI = "PMI";
+public static final String PROPERTY_TAX = "PROPERTY_TAX";
+----
+
+=== Calculation Service Integration
+
+The calculation engine automatically processes credit operations:
+
+[source,java]
+----
+// Triggered after payment registration
+creditCalculationService.calculate(creditId, paymentDate, currentCalculationDate);
+----
+
+This recalculates:
+* **Debt Balances**: Updates account balances based on payment distribution
+* **Interest Accruals**: Calculates daily interest charges
+* **Past Due Amounts**: Moves overdue balances to past due accounts
+* **Credit Status**: Updates credit status based on payment history
+
+=== Snapshot Management
+
+Credit snapshots provide point-in-time state tracking:
+
+[source,java]
+----
+// Credit snapshot contains:
+public class CreditSnapshot {
+    private LocalDate date;           // Snapshot date
+    private CreditStatus status;      // Credit status at this date
+    private Debt debt;               // Account balances at this date
+}
+----
+
+== Credit User Interface
+
+=== Controller Implementation
+
+[source,java]
+----
+include::{sourcedir}/credit/controller/ExampleCreditController.java[lines=12..20]
+----
+
+The controller provides:
+* **List View**: Paginated credit listing with filtering
+* **Detail View**: Comprehensive credit information display
+* **Action Buttons**: Context-sensitive operations based on credit status
+
+=== Credit Filtering
+
+[source,java]
+----
+include::{sourcedir}/credit/filter/ExampleCreditFilter.java[lines=9..18]
+----
+
+Filtering capabilities:
+* **Status Filtering**: Filter by credit status (ACTIVE, CLOSED, etc.)
+* **Date Ranges**: Filter by creation date, maturity date, etc.
+* **Amount Ranges**: Filter by principal amount, current balance
+* **Custom Filters**: Add business-specific filtering criteria
+
+=== Tab-Based Interface
+
+Credit details are organized into tabs for better user experience:
+
+[source,java]
+----
+// Credit data tab showing balances and payment history
+@Controller
+@Order(1000)
+public class CreditDataTab extends EntityTabController<UUID, ExampleCredit> {
+    
+    @Override
+    protected String getTabTemplate(UUID id, Model model) throws Exception {
+        ExampleCredit credit = loadEntity(id);
+        
+        // Add credit summary data
+        model.addAttribute("currentBalance", credit.getActualSnapshot().getDebt());
+        model.addAttribute("paymentHistory", getPaymentHistory(credit));
+        model.addAttribute("nextPaymentDate", calculateNextPaymentDate(credit));
+        
+        return super.getTabTemplate(id, model);
+    }
+}
+----
+
+Available tabs:
+* **Credit Data**: Current balances, payment status, maturity information
+* **Payments**: Payment history and upcoming payment schedule
+* **Transactions**: All financial transactions related to the credit
+* **Calculations**: Detailed calculation history and interest computations
+* **Documents**: Credit-related documents and contracts
+
+=== Form Components for Credit Operations
+
+Credit forms use the platform's form component system:
+
+[source,html]
+----
+<!-- Payment amount input -->
+<th:block th:insert="~{/form/components :: amount(
+    #{credit.payment.amount},
+    'amount', 
+    'v-required v-positive')}" 
+    th:with="currencies = ${currencies}" />
+
+<!-- Payment date picker -->
+<th:block th:insert="~{/form/components :: date(
+    #{credit.payment.date},
+    'processedDate', 
+    'v-required')}"
+    th:with="minDate = ${minDate}" />
+
+<!-- Payment description -->
+<th:block th:insert="~{/form/components :: textarea(
+    #{credit.payment.description},
+    'description', 
+    '')}"
+    th:with="rows = 3" />
+----
+
+== Credit Business Rules with Entity Checkers
+
+=== Automated Credit Monitoring
+
+Entity checkers can implement automated credit monitoring:
+
+[source,java]
+----
+@Component
+public class CreditPaymentChecker extends EntityChecker<ExampleCredit> {
+    
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<ExampleCredit> registry) {
+        // Monitor payment operations
+        registry.entityChange(CreditPayment.class, payment -> 
+            creditRepository.findByOperationsIn(payment))
+            .inserted();
+    }
+    
+    @Override
+    protected boolean isAvailable(ExampleCredit credit) {
+        return credit.getActualSnapshot().getStatus().equals(ACTIVE);
+    }
+    
+    @Override
+    protected void perform(ExampleCredit credit) {
+        // Check if credit is now current after payment
+        if (isPaidCurrent(credit)) {
+            updateCreditStatus(credit, CURRENT);
+            sendPaymentConfirmation(credit);
+        }
+    }
+}
+----
+
+=== Past Due Processing
+
+Automated past due detection and processing:
+
+[source,java]
+----
+@Component
+public class PastDueChecker extends EntityChecker<ExampleCredit> {
+    
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<ExampleCredit> registry) {
+        // Monitor daily calculation updates
+        registry.entityChange().updated("calculationDate");
+    }
+    
+    @Override
+    protected boolean isAvailable(ExampleCredit credit) {
+        return isPastDue(credit) && !isAlreadyMarkedPastDue(credit);
+    }
+    
+    @Override
+    protected void perform(ExampleCredit credit) {
+        // Create past due operation
+        PastDueOperation pastDue = new PastDueOperation(
+            LocalDate.now(), 
+            calculatePastDueAmount(credit)
+        );
+        
+        credit.getOperations().add(pastDue);
+        
+        // Send past due notification
+        notificationService.sendPastDueNotice(credit);
+    }
+}
+----
+
+== Extending the Credit System
+
+=== Creating New Credit Types
+
+To implement different lending products:
+
+1. **Extend Credit Entity**: Create new entity with specific discriminator value
+2. **Define Condition Structure**: Create condition entity with product-specific terms
+3. **Implement Operations**: Create custom payment and charge operation types
+4. **Configure Account Types**: Define debt account structure for the product
+5. **Create Controllers**: Implement UI controllers and actions
+6. **Add Business Rules**: Implement entity checkers for automated processing
+
+=== Integration with External Systems
+
+The credit system supports integration with external services:
+
+* **Payment Gateways**: Transaction processing through payment providers
+* **Credit Bureaus**: Credit reporting and monitoring
+* **Core Banking**: Integration with banking systems
+* **Document Management**: Contract and document storage
+* **Notification Services**: Email and SMS notifications
+
+=== Customization Examples
+
+==== Auto Loan Implementation
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("3")
+public class AutoLoan extends Credit {
+    
+    @OneToOne
+    private VehicleApplication application;
+    
+    @OneToOne
+    private AutoLoanCondition condition;
+    
+    @Column
+    private String vehicleVin;
+    
+    @Column
+    private MonetaryAmount vehicleValue;
+}
+----
+
+==== Credit Card Implementation
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("4")
+public class CreditCard extends Credit {
+    
+    @Column
+    private MonetaryAmount creditLimit;
+    
+    @Column
+    private BigDecimal aprRate;
+    
+    @Column
+    private MonetaryAmount availableCredit;
+    
+    @Column
+    private LocalDate statementDate;
+}
+----
+
+== Best Practices
+
+=== Credit Design Principles
+
+* **Separation of Concerns**: Keep business logic in services, not entities
+* **Event-Driven Architecture**: Use entity checkers for automated processing
+* **Flexible Debt Structure**: Design account types to accommodate future requirements
+* **Audit Trail**: Leverage built-in auditing for compliance requirements
+* **Transaction Safety**: Ensure operations are atomic and consistent
+
+=== Performance Considerations
+
+* **Calculation Optimization**: Batch credit calculations during off-peak hours
+* **Snapshot Management**: Archive old snapshots to maintain performance
+* **Index Strategy**: Create appropriate database indexes for credit queries
+* **Lazy Loading**: Use lazy loading for large collections and related entities
+
+=== Security and Compliance
+
+* **Data Protection**: Implement field-level encryption for sensitive data
+* **Access Control**: Use role-based security for credit operations
+* **Audit Logging**: Maintain comprehensive audit trails for regulatory compliance
+* **Data Retention**: Implement data retention policies for closed credits
+
+The credit management system provides a robust foundation for implementing various lending products while maintaining consistency, auditability, and extensibility across different credit types.
