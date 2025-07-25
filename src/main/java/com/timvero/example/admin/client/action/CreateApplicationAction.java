@@ -4,14 +4,12 @@ import com.timvero.example.admin.application.controller.ApplicationController;
 import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.application.form.ApplicationForm;
 import com.timvero.example.admin.application.form.ApplicationFormMapper;
+import com.timvero.example.admin.application.service.ApplicationService;
 import com.timvero.example.admin.client.entity.Client;
-import com.timvero.example.admin.participant.ParticipantDocumentTypesConfiguration;
 import com.timvero.example.admin.participant.entity.Employment;
 import com.timvero.example.admin.participant.entity.Periodicity;
 import com.timvero.ground.action.EntityAction;
-import com.timvero.ground.document.signable.SignableDocumentService;
 import com.timvero.web.common.action.EntityActionController;
-import jakarta.persistence.EntityManager;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Controller;
@@ -26,10 +24,7 @@ public class CreateApplicationAction extends EntityActionController<UUID, Client
     private ApplicationFormMapper mapper;
 
     @Autowired
-    private EntityManager entityManager;
-
-    @Autowired
-    private SignableDocumentService documentService;
+    private ApplicationService applicationService;
 
     @Override
     protected EntityAction<Client, ApplicationForm> action() {
@@ -37,12 +32,8 @@ public class CreateApplicationAction extends EntityActionController<UUID, Client
             .map(Application::getStatus).noneMatch(s -> s.equals(ApplicationStatus.NEW))*/)
             .then((client, form, user) -> {
                 Application application = mapper.createEntity(form);
-                application.getBorrowerParticipant().setClient(client);
-                entityManager.persist(application);
-
-                documentService.generate(application.getBorrowerParticipant(), ParticipantDocumentTypesConfiguration.APPLICATION_FORM);
-
-                setRedirectToPath(ApplicationController.PATH + "/" + application.getId());
+                UUID applicationId = applicationService.createApplication(client, application);
+                setRedirectToPath(ApplicationController.PATH + "/" + applicationId);
             });
     }
 
