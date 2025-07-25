@@ -26,7 +26,7 @@
             </td>
             <td th:text="*{displayedName}"></td>
             <td th:text="*{individualInfo.nationalId}"></td>
-            <td th:text="*{mainNotificationPhone}"></td>
+            <td th:text="*{#phones.format(mainNotificationPhone)}"></td>
             <td th:text="*{notificationEmail}"></td>
             <td th:text="*{#ldates.format(createdAt)}"></td>
         </tr>
