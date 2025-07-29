@@ -11,6 +11,7 @@ import java.time.LocalDate;
 import org.hibernate.envers.Audited;
 import org.hibernate.envers.RelationTargetAuditMode;
 
+// tag::entity[]
 @Entity
 @DiscriminatorValue("900")
 @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
@@ -52,3 +53,4 @@ public class PastDueOperation extends CreditOperation {
         return 900;
     }
 }
+// end::entity[]
