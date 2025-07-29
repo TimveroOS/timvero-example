@@ -33,3 +33,5 @@ include::_documents.adoc[leveloffset=+1]
 include::_checkers.adoc[leveloffset=+1]
 
 include::_credit.adoc[leveloffset=+1]
+
+include::_operations.adoc[leveloffset=+1]

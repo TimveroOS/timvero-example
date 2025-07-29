@@ -11,6 +11,7 @@ import javax.money.MonetaryAmount;
 import org.hibernate.envers.Audited;
 import org.hibernate.envers.RelationTargetAuditMode;
 
+// tag::entity[]
 @Entity
 @DiscriminatorValue("901")
 @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
@@ -45,3 +46,4 @@ public class ChargeOperation extends CreditOperation {
         return 101;
     }
 }
+// end::entity[]

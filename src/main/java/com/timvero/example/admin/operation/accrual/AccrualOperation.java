@@ -8,6 +8,7 @@ import java.time.LocalDate;
 import org.hibernate.envers.Audited;
 import org.hibernate.envers.RelationTargetAuditMode;
 
+// tag::entity[]
 @Entity
 @DiscriminatorValue("950")
 @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
@@ -34,3 +35,4 @@ public class AccrualOperation extends CreditOperation {
     }
 
 }
+// end::entity[]

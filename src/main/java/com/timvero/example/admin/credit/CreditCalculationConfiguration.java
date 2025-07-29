@@ -25,12 +25,14 @@ public class CreditCalculationConfiguration {
     public static final CreditStatus CLOSED = new CreditStatus("CLOSED", 2000, true);
     public static final CreditStatus VOID = new CreditStatus("VOID", 2100, true);
 
+    // tag::account-types[]
     public static final String PRINCIPAL = "PRINCIPAL";
     public static final String INTEREST = "INTEREST";
     public static final String PAST_DUE_PRINCIPAL = "PD_PRINCIPAL";
     public static final String PAST_DUE_INTEREST = "PD_INTEREST";
     public static final String LATE_FEE = "LATE_FEE";
     public static final String OVERPAYMENT = "OVERPAYMENT";
+    // end::account-types[]
 
     @Bean
     CreditViewOptions creditViewOptions() {
@@ -60,11 +62,13 @@ public class CreditCalculationConfiguration {
         return new PastDueOperationService(map);
     }
 
+    // tag::payment-distribution[]
     @Bean
     CreditPaymentOperationHandler<ExampleCreditPayment> creditPaymentOperationHandler() {
         return new CreditPaymentOperationHandler<>(OVERPAYMENT, List.of(PAST_DUE_PRINCIPAL, PAST_DUE_INTEREST,
             LATE_FEE, INTEREST, PRINCIPAL)) {};
     }
+    // end::payment-distribution[]
 
     @Bean
     InterestAccrualEngine interestAccrualEngine() {
