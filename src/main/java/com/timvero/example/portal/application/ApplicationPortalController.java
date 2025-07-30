@@ -123,8 +123,9 @@ public class ApplicationPortalController {
             content = @Content()
         )
     })
-    public String getApplicationSignatureUrl(@RequestParam UUID applicationId, @RequestParam String returnUrl)
+    public ResponseEntity<String> getApplicationSignatureUrl(@RequestParam UUID applicationId, @RequestParam String returnUrl)
         throws IOException {
-        return applicationService.getSignatureUrl(applicationId, returnUrl);
+        String signatureUrl = applicationService.getSignatureUrl(applicationId, returnUrl);
+        return ResponseEntity.ok(signatureUrl);
     }
 }
