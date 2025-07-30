@@ -22,12 +22,13 @@ public class ApplicationService {
     @Transactional
     public UUID createApplication(Client client, Application application) {
         application.getBorrowerParticipant().setClient(client);
-        
+
         Application savedApplication = applicationRepository.save(application);
-        
-        documentService.generate(savedApplication.getBorrowerParticipant(), 
-                                ParticipantDocumentTypesConfiguration.APPLICATION_FORM);
-        
+
+        documentService.generate(savedApplication.getBorrowerParticipant(),
+            ParticipantDocumentTypesConfiguration.APPLICATION_FORM);
+
         return savedApplication.getId();
     }
+
 }

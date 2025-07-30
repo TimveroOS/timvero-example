@@ -1,12 +1,8 @@
 package com.timvero.example.portal.client;
 
-import com.timvero.example.admin.application.entity.Application;
-import com.timvero.example.admin.application.service.ApplicationService;
 import com.timvero.example.admin.client.entity.Client;
 import com.timvero.example.admin.client.entity.ClientRepository;
 import com.timvero.example.portal.client.form.ClientRequiestMapper;
-import com.timvero.example.portal.client.form.CreateApplicationMapper;
-import com.timvero.example.portal.client.form.CreateApplicationRequest;
 import com.timvero.example.portal.client.form.CreateClientRequest;
 import com.timvero.ground.filter.base.NotFoundException;
 import jakarta.validation.Valid;
@@ -24,12 +20,6 @@ public class ClientService {
     @Autowired
     private ClientRepository clientRepository;
 
-    @Autowired
-    private ApplicationService applicationService;
-
-    @Autowired
-    private CreateApplicationMapper applicationMapper;
-
     @Transactional
     public UUID createClient(@Valid CreateClientRequest form) {
         Client client = mapper.createEntity(form);
@@ -37,12 +27,9 @@ public class ClientService {
         return savedClient.getId();
     }
 
-    @Transactional
-    public UUID createApplication(UUID clientId, @Valid CreateApplicationRequest request) {
-        Client client = clientRepository.findById(clientId)
-            .orElseThrow(() -> new NotFoundException("Client not found with ID: " + clientId));
-
-        Application application = applicationMapper.toApplication(request);
-        return applicationService.createApplication(client, application);
+    @Transactional(readOnly = true)
+    public Client getById(UUID id) {
+        return clientRepository.findById(id)
+            .orElseThrow(() -> new NotFoundException("Client not found with ID: " + id));
     }
 }

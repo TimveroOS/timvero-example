@@ -1,4 +1,4 @@
-package com.timvero.example.portal.client.form;
+package com.timvero.example.portal.application.form;
 
 import java.util.UUID;
 

@@ -1,0 +1,276 @@
+= Docusign Integration
+
+:sourcedir: ../../main/java/com/timvero/example
+
+This section describes how to integrate Docusign electronic signature service into your TimVero application for document signing workflows.
+
+== Docusign Overview
+
+Docusign is a cloud-based electronic signature platform that enables organizations to digitally prepare, sign, act on, and manage agreements. The Timvero platform provides built-in integration capabilities through a framework that handles:
+
+* Document preparation and sending to Docusign
+* Signature URL generation for embedded signing
+* Webhook processing for signature status updates
+
+The framework includes pre-built services and controllers that minimize the integration effort - you only need to configure properties, implement API endpoints, and optionally set up webhooks.
+
+== Framework Components
+
+The Timvero platform includes several ready-to-use Docusign integration components:
+
+* **`DocusignSignatureService`** - Core service for managing signature workflows
+* **`DocusignService`** - Low-level Docusign API integration
+* **`DocusignWebhookController`** - Base webhook controller for processing Docusign events
+
+These components handle the complex Docusign API interactions, leaving you to focus on your business logic.
+
+== Configuration Setup
+
+=== Properties Configuration
+
+Add the following properties to your application configuration file (e.g., `application.properties`, `application.yml`, or environment-specific property files):
+
+[source,properties]
+----
+# DocuSign Configuration
+docusign.api.base.path=https://demo.docusign.net/restapi
+docusign.oauth.base.path=account-d.docusign.com
+docusign.rsa.key.file=classpath:/docusign/private.key
+docusign.client.id=602c4320-5b82-48bf-b0c9-9d47a84de053
+docusign.user.id=c2e5a6c9-fd35-477f-8104-e2e5385d251a
+----
+
+NOTE: The configuration values shown above are examples only. Your actual configuration will differ and should be obtained from your DocuSign account and environment setup.
+
+==== Property Descriptions
+
+
+**`docusign.api.base.path`**::
+Base URL for DocuSign REST API endpoints. The actual URLs may vary depending on your DocuSign environment and region. Refer to the DocuSign platform documentation for current API endpoints.
+
+**`docusign.oauth.base.path`**::
+OAuth base domain for DocuSign JWT authentication. Check the DocuSign platform documentation for the appropriate OAuth endpoints for your environment.
+
+**`docusign.rsa.key.file`**::
+Path to the RSA private key file used for JWT authentication.
+
+**`docusign.client.id`**::
+Integration Key (Client ID) for your DocuSign application. This value can be obtained from your DocuSign account on the platform.
+
+**`docusign.user.id`**::
+DocuSign User ID (GUID) associated with your integration. This value can be obtained from your DocuSign account on the platform.
+
+NOTE: All DocuSign-specific configuration values (API endpoints, Client ID, User ID) should be obtained from your DocuSign account dashboard. Refer to the DocuSign developer documentation for detailed instructions on locating these values.
+
+=== Private Key Setup
+
+The DocuSign integration requires an RSA private key for JWT authentication. Ensure that the private key file is placed in the location specified by the `docusign.rsa.key.file` property in your configuration.
+
+For example, if your configuration specifies:
+[source,properties]
+----
+docusign.rsa.key.file=classpath:/docusign/private.key
+----
+
+Then place your private key file at `src/main/resources/docusign/private.key`.
+
+NOTE: For detailed instructions on generating and configuring DocuSign API credentials and private keys, refer to the https://developers.docusign.com/platform/auth/jwt/jwt-get-token/[DocuSign JWT Authentication Guide].
+
+== Implementation Steps
+
+=== Step 1: Create Signature URL API
+
+Typically, you need to provide a document signing link for your user portal. We recommend creating an API that returns the signing URL for the current document associated with an Application. You can implement APIs for other entities using the same approach.
+
+This API endpoint will generate a DocuSign signing URL that can be embedded in your portal or sent to users via email.
+
+==== Controller Method
+
+The main method for generating signature URLs:
+
+[source,java]
+----
+@GetMapping("/signature-url")
+public ResponseEntity<String> getApplicationSignatureUrl(@RequestParam UUID applicationId, @RequestParam String returnUrl) throws IOException {
+    String signatureUrl = applicationService.getSignatureUrl(applicationId, returnUrl);
+    return ResponseEntity.ok(signatureUrl);
+}
+----
+
+This method:
+- Accepts an `applicationId` parameter to identify which application's document needs to be signed
+- Takes a `returnUrl` parameter to specify where users should be redirected after signing
+- Returns the Docusign signature URL as a string response
+For the complete controller implementation with Swagger annotations and full error handling, see:
+
+[source,java]
+----
+include::{sourcedir}/portal/application/ApplicationPortalController.java[]
+----
+
+
+==== Service Implementation
+
+To generate a DocuSign signature URL, you only need to provide:
+
+* **Document**: The specific document that requires signing
+* **Document Owner**: The entity that owns the document (must implement `DocusignSigner` interface)
+
+The framework's `DocusignSignatureService` automatically handles all other aspects:
+
+* Creating signers in DocuSign if they don't exist
+* Uploading documents to DocuSign
+* Generating embedded signing URLs
+* Managing the signing workflow
+* Extracting signer information from the document owner
+
+The business logic for determining which document should be signed can vary based on your specific requirements. The framework provides flexibility to implement custom logic while handling the DocuSign integration automatically.
+
+==== Implementation Example
+
+Here's an example implementation for an Application portal that determines document types based on application status:
+
+[source,java]
+----
+@Transactional
+public String getSignatureUrl(UUID applicationId, String returnUrl) throws IOException {
+    Application application = applicationRepository.findById(applicationId)
+        .orElseThrow(() -> new NotFoundException("Application not found with ID: " + applicationId));
+
+    PortalApplicationStatus portalStatus = PortalApplicationStatus.fromApplicationStatus(application.getStatus());
+
+    SignableDocumentType documentType;
+    switch (portalStatus) {
+        case IN_PROCESS -> documentType = APPLICATION_FORM;
+        case PENDING_CONTRACT_SIGNATURE -> documentType = APPLICATION_CONTRACT;
+        case null, default -> throw new PreconditionFailedException(
+            "Signature is not available for application status: " + portalStatus);
+    }
+
+    Participant participant = application.getBorrowerParticipant();
+    SignableDocument document = signableDocumentService.getAllDocuments(participant).stream()
+        .filter(doc -> documentType.getDocumentType().equals(doc.getDocumentType().getDocumentType()))
+        .findFirst()
+        .orElseThrow(() -> new NotFoundException(
+            "Not found signable document of type " + documentType.getDocumentType()
+                + " for application with ID: " + applicationId
+        ));
+
+    return docusignSignatureService.getDocusignUrl(participant, document, returnUrl);
+}
+----
+
+In this example:
+
+* **Status-based Selection**: The service determines which document type is relevant based on the application's current status
+* **Document Validation**: If no documents are available for signing, the service throws an exception
+* **Document Retrieval**: `signableDocumentService.getAllDocuments()` returns all documents for the Participant, filtered by the relevant type
+* **URL Generation**: `docusignSignatureService.getDocusignUrl()` handles the DocuSign integration and returns the signing URL
+
+This implementation demonstrates how to:
+
+* Validate the application exists and is in a signable state
+* Determine the appropriate document type based on application status
+* Retrieve the signable document for the participant
+* Generate the DocuSign URL through the framework service
+
+The framework automatically handles signer creation and document upload to DocuSign when needed, using the document owner's information to populate signer details.
+
+=== Step 2: Application Status API (Optional)
+
+Before requesting a signature URL, you may want to check the application's current status to determine if documents are available for signing. This helps provide better user experience by showing appropriate UI states.
+
+==== API Endpoint
+
+[source,http]
+----
+GET /api/portal/applications/{applicationId}/status
+----
+
+==== Response
+
+Returns the current status which determines document availability:
+- `IN_PROCESS` → `APPLICATION_FORM` document available for signing
+- `PENDING_CONTRACT_SIGNATURE` → `APPLICATION_CONTRACT` document available for signing
+- Other statuses → No documents available for signing
+
+==== Implementation
+
+[source,java]
+----
+@GetMapping("/{applicationId}/status")
+public ResponseEntity<PortalApplicationStatus> getApplicationStatus(@PathVariable UUID applicationId) {
+    PortalApplicationStatus status = applicationService.getApplicationStatus(applicationId);
+    return ResponseEntity.ok(status);
+}
+----
+
+[source,java]
+----
+@Transactional(readOnly = true)
+public PortalApplicationStatus getApplicationStatus(UUID id) {
+    return applicationRepository.findStatusById(id)
+        .map(PortalApplicationStatus::fromApplicationStatus)
+        .orElseThrow(() -> new NotFoundException("Application not found with ID: " + id));
+}
+----
+
+This API is optional but recommended for determining when to show signature options to users.
+
+
+=== Step 3: Webhook Implementation (Optional)
+
+DocuSign webhooks notify your application when signature events occur (e.g., when a document is signed). The framework provides a default webhook implementation at `/callback/docusign/webhook`, but you can create a custom webhook if needed.
+
+==== Default Webhook
+
+The framework automatically handles webhook events and processes signed documents. No additional implementation is required unless you need custom logic.
+
+==== Custom Webhook Implementation
+
+If you need custom webhook handling (e.g., additional notifications, logging, or business logic), you can create your own webhook controller:
+
+[source,java]
+----
+@RestController
+@RequestMapping(value = DocusignWebhookController.PATH, produces = MediaType.APPLICATION_JSON_VALUE)
+public class DocusignWebhookController {
+
+    protected static final String PATH = "/callback/docusign";
+
+    @Value("${docusign.user.id}")
+    private String userId;
+
+    @Autowired
+    private DocusignSignatureService docusignSignatureService;
+
+    @RequestMapping(value = "/webhook", method = RequestMethod.POST, produces = "application/json;charset=UTF-8")
+    public void handleWebhook(@RequestBody DocusignWebhookResponse payload) throws IOException {
+        if (payload.getData() != null) {
+            if (payload.getData().getUserId().equals(userId)) {
+                String envelopeId = payload.getData().getEnvelopeId();
+                docusignSignatureService.signDocumentByEnvelopeId(envelopeId);
+
+                // Add your custom logic here
+                // e.g., send notifications, update application status, etc.
+            }
+        }
+    }
+}
+----
+
+**Key points:**
+- **User ID validation**: Only processes webhooks for the configured DocuSign user
+- **Envelope processing**: Calls `signDocumentByEnvelopeId()` to handle the signed document
+- **Custom logic**: Add any additional business logic after the framework processing
+
+==== DocuSign Webhook Configuration
+
+Configure webhooks in your DocuSign account:
+
+1. Go to your DocuSign Admin panel
+2. Navigate to **Integrations > Webhooks**
+3. Create a new webhook with your endpoint URL
+4. Select relevant events (e.g., "Envelope Completed")
+
+For detailed configuration instructions, see the https://developers.docusign.com/platform/webhooks/[DocuSign Webhooks Documentation].

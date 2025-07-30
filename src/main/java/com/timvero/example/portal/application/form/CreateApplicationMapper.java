@@ -1,4 +1,4 @@
-package com.timvero.example.portal.client.form;
+package com.timvero.example.portal.application.form;
 
 import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.participant.entity.Participant;
