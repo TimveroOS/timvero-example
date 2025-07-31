@@ -445,3 +445,12 @@ Study these complete examples in the project:
 - [ ] Deploy to a staging environment for testing
 
 You're now ready to build powerful financial applications with the Timvero platform!
+
+---
+
+**Next Chapter:** <<data-model>> - SQL autogeneration and Flyway migration workflows
+
+**Related Chapters:**
+* <<forms>> - Form classes, validation, MapStruct mappers, and service layers
+* <<templates>> - Thymeleaf components, validation classes, and UI integration  
+* <<checkers>> - Entity Checkers for event-driven business rules
