@@ -172,3 +172,98 @@ Client entity (persisted to database)
 Form classes integrate with HTML templates using Thymeleaf for rendering user interfaces. The templates use nested field access (dot notation) and reusable form components for consistent styling and validation.
 
 For detailed information about HTML template integration, form components, and Thymeleaf usage, see <<_html_template_integration>>.
+
+== Troubleshooting Form Issues
+
+=== Form Validation Problems
+
+==== Server-Side Validation Not Working
+
+**Problem**: Invalid data reaches the service layer despite validation annotations
+
+**Solution**:
+
+1. **Check @Valid annotations are present**:
++
+```java
+// On controller method parameters
+@PostMapping
+public String save(@Valid @ModelAttribute ClientForm form, BindingResult result) {
+    if (result.hasErrors()) {
+        return "client/edit";
+    }
+    // ...
+}
+```
+
+2. **Verify nested object validation**:
++
+```java
+public class ClientForm {
+    @Valid  // This is crucial for nested validation
+    @NotNull
+    private IndividualInfoForm individualInfo;
+    
+    @Valid  // Don't forget this
+    @NotNull
+    private ContactInfoForm contactInfo;
+}
+```
+
+3. **Check validation annotations are correct**:
++
+```java
+public class IndividualInfoForm {
+    @NotBlank(message = "Full name is required")
+    @Size(max = 255, message = "Full name cannot exceed 255 characters")
+    private String fullName;
+    
+    @Email(message = "Please provide a valid email address")
+    private String email;
+}
+```
+
+=== MapStruct Mapping Issues
+
+==== Compilation Errors
+
+**Problem**: `No property named "X" exists in source parameter` or similar MapStruct errors
+
+**Solution**:
+
+1. **Verify property names match exactly**:
++
+```java
+// Entity
+public class Client {
+    private IndividualInfo individualInfo;  // Property name
+    public IndividualInfo getIndividualInfo() { return individualInfo; }
+}
+
+// Form - property name must match
+public class ClientForm {
+    private IndividualInfoForm individualInfo;  // Same name
+    public IndividualInfoForm getIndividualInfo() { return individualInfo; }
+}
+```
+
+2. **Check nested object mapping**:
++
+```java
+@Mapper
+public interface ClientFormMapper extends EntityToFormMapper<Client, ClientForm> {
+    // Explicit mapping may be needed for complex cases
+    @Mapping(source = "individualInfo.fullName", target = "individualInfo.fullName")
+    @Mapping(source = "contactInfo.email", target = "contactInfo.email")
+    ClientForm entityToForm(Client entity);
+}
+```
+
+3. **Rebuild after changes**:
++
+```bash
+# MapStruct generates code at compile time
+mvn clean compile
+
+# Check generated classes in target/generated-sources/annotations/
+```

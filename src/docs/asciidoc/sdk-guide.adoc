@@ -41,15 +41,15 @@ For a complete working example, see the https://github.com/TimveroOS/timvero-exa
 
 This guide is designed to be read sequentially, with each chapter building on the previous:
 
-. **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
-. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
-. **<<data-model>>** - SQL autogeneration and Flyway migration workflows
-. **<<forms>>** - Form classes, validation, MapStruct mappers, and service layers
-. **<<templates>>** - Thymeleaf components, validation classes, and UI integration
-. **<<operations>>** - Credit operations framework: charges, payments, accruals, past due processing
-. **<<payment-transactions>>** - Real-world payment processing with gateway integration
+. **<<_platform_overview>>** - Core concepts: Basic, Origination, and Servicing layers
+. **<<_getting_started>>** - Master the Entity-Form-Controller pattern with Client example  
+. **<<_data_model_setup>>** - SQL autogeneration and Flyway migration workflows
+. **<<_form_classes_setup_and_usage>>** - Form classes, validation, MapStruct mappers, and service layers
+. **<<_html_template_integration>>** - Thymeleaf components, validation classes, and UI integration
+. **<<_credit_operations_framework>>** - Credit operations framework: charges, payments, accruals, past due processing
+. **<<_payment_transactions_framework>>** - Real-world payment processing with gateway integration
 
-**Advanced Topics:** <<datasource>>, <<documents>>, <<checkers>>, <<credit>>
+**Advanced Topics:** <<_datasource_integration>>, <<_document_management>>, <<_entity_checkers_setup_and_usage>>, <<_credit_management_system>>
 
 TIP: New to TimveroOS? Start with Platform Overview and Getting Started. Experienced developers can jump to specific chapters using the navigation above.
 
