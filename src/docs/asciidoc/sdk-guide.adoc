@@ -11,12 +11,47 @@ ifndef::imagesdir[:imagesdir: images]
 :numbered:
 
 
-This SDK empowers developers to leverage the timveroOS platform with
-flexibility, allowing extensive customization through code. By utilizing
-these components, teams can create bespoke financial solutions that
-align perfectly with their business goals.
+== Why TimveroOS?
+
+Building financial applications traditionally means months of development for basic features like payment processing, KYC compliance, and risk management. TimveroOS changes this by providing production-ready financial components that you customize through code, not configuration.
+
+=== The Problem
+* **6-12 months** to build basic lending platform from scratch
+* **Complex integrations** with payment gateways, KYC providers, credit bureaus
+* **Regulatory compliance** requirements that slow development
+* **Scalability challenges** as your business grows
+
+=== The TimveroOS Solution
+* **2-4 weeks** to customize and deploy with pre-built components
+* **Built-in integrations** for payments, documents, notifications
+* **Compliance frameworks** for KYC, AML, reporting built-in
+* **Enterprise-scale architecture** from day one
+
+=== What You'll Build
+This SDK empowers developers to create financial applications through:
+* **Entity-Form-Controller Pattern** - Define business objects with automatic CRUD operations
+* **Comprehensive Form System** - Handle complex forms with validation, nested components, and MapStruct mapping
+* **Credit Operations Framework** - Manage loan lifecycle with automated calculations, accruals, and payments
+* **Payment Transaction System** - Process real-world payments through multiple gateways with complete audit trails
+* **Entity Checkers** - Implement event-driven business rules that respond to data changes automatically
 
 For a complete working example, see the https://github.com/TimveroOS/timvero-example[timvero-example project^].
+
+== Learning Path
+
+This guide is designed to be read sequentially, with each chapter building on the previous:
+
+. **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
+. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
+. **<<data-model>>** - SQL autogeneration and Flyway migration workflows
+. **<<forms>>** - Form classes, validation, MapStruct mappers, and service layers
+. **<<templates>>** - Thymeleaf components, validation classes, and UI integration
+. **<<operations>>** - Credit operations framework: charges, payments, accruals, past due processing
+. **<<payment-transactions>>** - Real-world payment processing with gateway integration
+
+**Advanced Topics:** <<datasource>>, <<documents>>, <<checkers>>, <<credit>>
+
+TIP: New to TimveroOS? Start with Platform Overview and Getting Started. Experienced developers can jump to specific chapters using the navigation above.
 
 include::_platform-overview.adoc[leveloffset=+1]
 
