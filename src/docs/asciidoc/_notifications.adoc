@@ -1,0 +1,512 @@
+= Notifications
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This section covers creating and managing automated notifications for loan applications and credit accounts. The notification system provides multi-channel communication (EMAIL, SMS, VOICE, LETTER) with template-based content.
+
+== Notification System Overview
+
+The notification system consists of:
+
+* **`NotificationEvent`** - Defines when notifications are triggered
+* **`NotificationModel`** - Provides data to notification templates
+* **`NotificationTemplate`** - Database-stored templates with dynamic content
+* **Notification Gateways** - Handle delivery via EMAIL, SMS, VOICE, LETTER
+
+== Creating Notification Events
+
+Notification events define when and how notifications are sent to users.
+
+=== Basic Notification Event
+
+[source,java]
+----
+include::{sourcedir}/notification/LoanApprovedEvent.java[lines=10..27]
+----
+
+Key components:
+* **`NotificationEventType`** - Unique identifier for the event type
+* **`getType()`** - Returns the event type for template matching
+* **`notify()`** - Triggers notification with entity data
+* **`isSuitableTestEntity()`** - Determines when event can be tested
+
+=== Event with Custom Data
+
+[source,java]
+----
+include::{sourcedir}/notification/LoanDeclinedEvent.java[lines=12..29]
+----
+
+Custom template models provide specific data for templates:
+
+[source,java]
+----
+include::{sourcedir}/notification/LoanDeclineTemplateModel.java[lines=7..28]
+----
+
+=== Event with Parameters
+
+Events can use EventParameters for template-configurable logic:
+
+[source,java]
+----
+include::{sourcedir}/notification/PaymentReminderEvent.java[lines=18..31]
+----
+
+EventParameters allow admin users to configure notification behavior:
+* **`daysCount`** - Configurable number of days for payment reminders
+* Used in `entityMatchesTemplate()` to control when notifications are sent
+
+== Creating Notification Templates
+
+Templates are created and managed through the admin interface, similar to document templates.
+
+=== Accessing Template Management
+
+Navigate to **System → Notification Templates** in the admin interface.
+
+=== Creating New Template
+
+1. **Template Details**:
+   - **Name**: Descriptive name (e.g., "Loan Approval - Email")
+   - **Event Type**: Select from dropdown (e.g., "LOAN_APPROVED")
+   - **Gateway Type**: EMAIL, SMS, VOICE, or LETTER
+   - **Recipient Type**: BORROWER, AGENT, etc.
+   - **Active**: Check to enable template
+
+2. **Template Content**: Use WYSIWYG editor with Pebble template syntax
+
+=== Template Content Examples
+
+==== Email Template (Loan Approval) - Minimal
+
+**Subject**: `Loan Approved - {{ application.id | slice(0, 8) | upper }}`
+
+**Body**:
+```html
+<h2>Congratulations {{ application.client.individualInfo.firstName }}!</h2>
+<p>Your {{ application.requestedAmount | currency }} loan has been approved at {{ application.condition.interestRate | numberformat('#,##0.00%') }}.</p>
+<p>Documents will be ready within 2 business days.</p>
+```
+
+==== SMS Template (Payment Reminder)
+
+```
+{% if reminderType == 'UPCOMING' %}
+Payment due {{ expectedPaymentDate | date('MM/dd') }}. 
+{% else %}
+Payment overdue by {{ daysCount | abs }} days. 
+{% endif %}
+Account: {{ credit.id | slice(0, 8) | upper }}
+Pay online or call (555) 123-4567
+```
+
+==== Email Template (Loan Decline)
+
+**Subject**: `Loan Application Update`
+
+**Body**:
+```html
+<h2>Dear {{ application.client.individualInfo.firstName }},</h2>
+
+{% if declineReason %}
+<p><strong>Status:</strong> {{ declineReason.description }}</p>
+{% else %}
+<p>Your application did not meet our current lending criteria.</p>
+{% endif %}
+
+<p>You may reapply after {{ reapplicationWaitDays }} days.</p>
+<p>Questions? Call (555) 123-4567.</p>
+```
+
+== Template Variables and Functions
+
+=== Available Variables
+
+Templates have access to:
+* **Entity data** - All properties from the associated entity (Application, ExampleCredit, etc.)
+* **Model data** - Custom data from NotificationModel subclasses
+* **Built-in filters** - Date formatting, number formatting, string manipulation
+
+=== Common Pebble Filters
+
+**Date Formatting**:
+```
+{{ application.createdAt | date('MMMM dd, yyyy') }}     // March 15, 2024
+{{ expectedPaymentDate | date('yyyy-MM-dd') }}          // 2024-03-15
+```
+
+**Number Formatting**:
+```
+{{ application.requestedAmount | currency }}                    // $50,000.00
+{{ application.condition.interestRate | numberformat('#,##0.00%') }}  // 5.50%
+```
+
+**String Operations**:
+```
+{{ application.id | slice(0, 8) | upper }}              // A1B2C3D4
+{{ application.client.individualInfo.firstName | title }}  // John
+```
+
+**Conditional Content**:
+```
+{% if application.status == 'SERVICING' %}
+    Your loan is now active.
+{% else %}
+    Your application is being processed.
+{% endif %}
+```
+
+**Loops** (for collections):
+```
+{% for document in application.documents %}
+    Document: {{ document.name }}
+{% endfor %}
+```
+
+== Event Parameters vs Custom Models
+
+**Use EventParameters when**: Admin users need to configure *when* notifications send (timing, thresholds, conditions)
+
+**Use Custom Models when**: Templates need additional *data* not available on the base entity
+
+=== EventParameter Example
+
+Payment reminders need admin-configurable timing:
+
+[source,java]
+----
+public static final EventParameter DAYS_COUNT = EventParameter.integerField("daysCount");
+
+public PaymentReminderEvent() {
+    super(DAYS_COUNT);
+}
+
+@Override
+protected boolean entityMatchesTemplate(ExampleCredit credit, PaymentReminderTemplateModel model,
+                                      Map<String, Object> templateParams) {
+    Integer daysCount = (Integer) templateParams.get("daysCount");
+    model.setDaysCount(daysCount);
+    
+    if (daysCount < 0) {
+        // Overdue reminder: check if credit is exactly |daysCount| days past due
+        return pastDueService.daysPastDue(credit) == -daysCount;
+    } else {
+        // Upcoming reminder: check if payment is exactly daysCount days away
+        return getNextPaymentDate(credit).equals(today.plusDays(daysCount));
+    }
+}
+----
+
+=== Parameter Types
+
+* **`integerField("name")`** - Days, counts, thresholds
+* **`decimalField("name")`** - Amounts, percentages
+* **`stringField("name")`** - Categories, codes
+* **`enumField("name", values)`** - Predefined choices
+
+== Automatic Notifications
+
+=== Entity Event Listeners
+
+Events can implement `EntityEventListener` to automatically trigger on system events:
+
+[source,java]
+----
+@Component  
+public class PaymentReminderEvent extends NotificationEvent<ExampleCredit, PaymentReminderTemplateModel>
+    implements EntityEventListener<CreditCalculationDateChangeEvent> {
+
+    public PaymentReminderEvent() {
+        super(EventParameter.integerField("daysCount"));
+    }
+
+    @Override
+    public void handle(CreditCalculationDateChangeEvent event) {
+        notify(event.getCreditId(), new PaymentReminderTemplateModel());
+    }
+
+    @Override
+    protected boolean entityMatchesTemplate(ExampleCredit credit, PaymentReminderTemplateModel model,
+                                          Map<String, Object> templateParams) {
+        Integer daysCount = (Integer) templateParams.get("daysCount");
+        model.setDaysCount(daysCount);
+        
+        if (daysCount < 0) {
+            // Overdue: check if exactly |daysCount| days past due
+            return pastDueService.daysPastDue(credit) == -daysCount;
+        } else {
+            // Upcoming: check if payment is exactly daysCount days away
+            return ChronoUnit.DAYS.between(today, nextPaymentDate) == daysCount;
+        }
+    }
+}
+----
+
+This automatically triggers payment reminders when credit calculation dates change, with templates configured for specific day thresholds.
+
+=== EntityChecker Integration
+
+Notifications can be triggered automatically using EntityCheckers:
+
+[source,java]
+----
+@Component
+public class ApplicationStatusNotificationChecker extends EntityChecker<UUID, Application> {
+    
+    @Autowired
+    private LoanApprovedEvent loanApprovedEvent;
+    
+    @Autowired 
+    private LoanDeclinedEvent loanDeclinedEvent;
+    
+    @Override
+    protected void registerListeners() {
+        register(Application.class, EntityChangeEvent.Operation.UPDATE);
+    }
+    
+    @Override
+    protected boolean isAvailable(Application application) {
+        return application.getStatus().in(ApplicationStatus.SERVICING, ApplicationStatus.DECLINE);
+    }
+    
+    @Override
+    protected void perform(Application application) {
+        switch (application.getStatus()) {
+            case SERVICING -> loanApprovedEvent.notify(application.getId());
+            case DECLINE -> loanDeclinedEvent.notify(application.getId(), 
+                application.getDeclineReason(), true);
+        }
+    }
+}
+----
+
+== Notification Gateways
+
+Gateways handle actual delivery of notifications via EMAIL, SMS, VOICE, or LETTER channels.
+
+=== Gateway Interface
+
+[source,java]
+----
+public interface NotificationGateway {
+    NotificationGatewayType getType();
+    String send(Notification notification) throws Exception;
+    Map<String, NotificationStatus> check(Collection<String> messageIds) throws Exception;
+}
+----
+
+=== Custom Implementation
+
+Extend abstract gateways for specific providers:
+
+[source,java]
+----
+@Component
+public class TwilioSmsGateway extends AbstractSmsGateway {
+    
+    @Override
+    protected String sendSms(String phone, String message) throws Exception {
+        // Integrate with Twilio API
+        Message twilioMessage = Message.creator(
+            new PhoneNumber(phone),
+            new PhoneNumber(fromPhoneNumber),
+            message
+        ).create();
+        return twilioMessage.getSid();
+    }
+    
+    @Override
+    public Map<String, NotificationStatus> check(Collection<String> messageIds) throws Exception {
+        // Check delivery status from Twilio
+        return messageIds.stream().collect(Collectors.toMap(
+            id -> id,
+            id -> getDeliveryStatus(id)
+        ));
+    }
+}
+----
+
+=== Development Gateway
+
+For testing, use built-in development gateways that log instead of sending:
+
+[source,java]
+----
+@Bean
+@Profile("dev")
+public NotificationGateway devEmailGateway(DocumentStorage documentStorage) {
+    return new DevEmailGateway(documentStorage);
+}
+----
+
+== Internationalization (i18n)
+
+The notification system integrates with Spring's message system for localized labels and descriptions.
+
+=== Event Type Labels
+
+Event types are displayed in the admin interface using message keys:
+
+```properties
+# messages.properties
+notification.event.type.APP_STATUS_CHANGE=Application Status Change
+notification.event.type.PAYMENT_REMINDER=Payment Reminder
+notification.event.type.LOAN_APPROVED=Loan Approved
+notification.event.type.LOAN_DECLINED=Loan Declined
+```
+
+The pattern is: `notification.event.type.{EVENT_TYPE_NAME}=Display Name`
+
+=== EventParameter Labels
+
+EventParameter fields are labeled using their parameter names:
+
+```properties
+# messages.properties  
+notification.event.APP_STATUS_CHANGE.status=Status
+notification.event.PAYMENT_REMINDER.daysCount=Days Count
+notification.event.LOAN_DECLINED.declineReason=Decline Reason
+```
+
+The pattern is: `notification.event.{EVENT_TYPE_NAME}.{PARAMETER_NAME}=Field Label`
+
+=== Usage in Admin Interface
+
+These labels appear in:
+- **Notification Templates list** - Event type dropdown and display
+- **Template configuration** - EventParameter field labels
+- **Template testing** - Event selection and parameter forms
+
+== Testing Notifications
+
+=== Template Testing
+
+Use the admin interface to test templates:
+
+1. **Go to Notification Templates**
+2. **Select a template**
+3. **Click "Test Template"**
+4. **Choose a suitable entity** from the dropdown (filtered by `isSuitableTestEntity()`)
+5. **Preview the rendered template**
+
+=== Programmatic Testing
+
+[source,java]
+----
+@Test
+public void testLoanApprovalNotification() {
+    // Create test application
+    Application application = createTestApplication();
+    application.setStatus(ApplicationStatus.SERVICING);
+    
+    // Test notification
+    boolean sent = loanApprovedEvent.notify(application.getId());
+    assertTrue(sent);
+}
+----
+
+== Integration Examples
+
+=== Scheduled Payment Reminders
+
+[source,java]
+----
+@Component
+public class PaymentReminderScheduler {
+    
+    @Autowired
+    private PaymentReminderEvent paymentReminderEvent;
+    
+    @Scheduled(cron = "0 0 9 * * ?") // Daily at 9 AM
+    public void sendPaymentReminders() {
+        // PaymentReminderEvent handles the business logic
+        // Templates configured with different daysCount values will
+        // automatically send appropriate reminders
+        List<ExampleCredit> activeCredits = creditRepository.findActiveCredits();
+        
+        for (ExampleCredit credit : activeCredits) {
+            paymentReminderEvent.notify(credit.getId());
+        }
+    }
+}
+----
+
+=== Workflow Integration
+
+[source,java]
+----
+@Component
+public class WorkflowCompletionListener implements EntityEventListener<ProcessExecutionFinishedEvent> {
+    
+    @Autowired
+    private LoanApprovedEvent loanApprovedEvent;
+    
+    @Override
+    public void handle(ProcessExecutionFinishedEvent event) {
+        if ("LOAN_APPROVAL_PROCESS".equals(event.getProcessDefinitionKey())) {
+            if ("APPROVED".equals(event.getResult())) {
+                loanApprovedEvent.notify(event.getEntityId());
+            }
+        }
+    }
+}
+----
+
+== Common Patterns
+
+=== Event Design Decisions
+
+```java
+// ✅ Good: Simple event, no custom data needed
+public class LoanApprovedEvent extends NotificationEvent<Application, NotificationModel> {
+    public boolean notify(UUID applicationId) {
+        return super.notify(applicationId, new NotificationModel());
+    }
+}
+
+// ✅ Good: Custom data for template logic
+public class LoanDeclinedEvent extends NotificationEvent<Application, LoanDeclineTemplateModel> {
+    public boolean notify(UUID applicationId, DeclineReason reason, boolean eligible) {
+        LoanDeclineTemplateModel model = new LoanDeclineTemplateModel();
+        model.setDeclineReason(reason);
+        model.setReapplicationEligible(eligible);
+        return super.notify(applicationId, model);
+    }
+}
+
+// ❌ Avoid: EventParameter for static data
+public class BadEvent extends NotificationEvent<Application, NotificationModel> {
+    private static final EventParameter COMPANY_NAME = EventParameter.stringField("companyName");
+    // Use application properties or constants instead
+}
+```
+
+=== Template Patterns
+
+```html
+<!-- ✅ Good: Fallback for missing data -->
+{{ application.client.individualInfo.firstName | default("Valued Customer") }}
+
+<!-- ✅ Good: Safe navigation with conditionals -->
+{% if application.condition %}
+Rate: {{ application.condition.interestRate | numberformat('#,##0.00%') }}
+{% endif %}
+
+<!-- ❌ Avoid: Complex calculations in templates -->
+<!-- Move business logic to NotificationModel methods -->
+```
+
+=== Integration Patterns
+
+**Automatic notifications**: Use EntityChecker for state-driven events
+**Scheduled reminders**: Use EventParameters for admin-configurable timing  
+**Workflow notifications**: Listen to process completion events
+
+=== Performance Notes
+
+* **Batch scheduled notifications** - don't send individually in loops
+* **Use isSuitableTestEntity()** to filter test data accurately
+* **Monitor gateway delivery rates** - EMAIL typically higher success than SMS
+
+This notification system provides flexible, template-based communication that integrates seamlessly with your loan management workflow.
