@@ -3,7 +3,7 @@ package com.timvero.example.admin.risk.github;
 import static com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.timvero.loan.risk.datasource.DataUnavailableException;
+import com.timvero.loan.risk.datasource.DataUnavaliableException;
 import com.timvero.loan.risk.datasource.MappedDataSource;
 import java.io.IOException;
 import org.springframework.http.HttpEntity;
@@ -50,7 +50,7 @@ public class GithubDataSource implements MappedDataSource<GithubDataSourceSubjec
             );
             return new Content(response.getBody(), MediaType.APPLICATION_JSON_VALUE) ;
         } catch (HttpClientErrorException.NotFound e) {
-            throw new DataUnavailableException("User not found: " + subject.getGithubUsername());
+            throw new DataUnavaliableException("User not found: " + subject.getGithubUsername());
         }
     }
 
