@@ -1,0 +1,699 @@
+= Document Templates
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This section covers creating and customizing document templates for contracts, reports, and other generated documents in the platform.
+
+== Template System Overview
+
+The document template system enables automatic generation of formatted documents using entity data. The system consists of:
+
+* **`DocumentCategory`** - Defines document types and data models
+* **`DocumentTemplate`** - Stores template content (HTML/TXT)
+* **`DocumentModel`** - Provides data structure for templates
+* **Template Engine** - Processes templates with entity data
+
+== Creating Document Categories
+
+Document categories define what data is available to templates and when documents can be generated.
+
+=== Basic Document Category
+
+[source,java]
+----
+include::{sourcedir}/participant/document/ApplicationContractDocumentCategory.java[lines=12..30]
+----
+
+Key components:
+* **`DocumentType`** - Unique identifier for the document type
+* **`getModel()`** - Provides data structure for template processing
+* **`isSuitableTestEntity()`** - Determines when document generation is available
+
+=== Document Model Creation
+
+The document model exposes entity data to templates:
+
+[source,java]
+----
+include::{sourcedir}/participant/document/ApplicationContractDocumentCategory.java[lines=32..58]
+----
+
+Model features:
+* **Public getters** - Expose data to template engine
+* **Computed properties** - Derive values from entity data (e.g., `getFirstPayment()`)
+* **Nested objects** - Include related entities for complex templates
+
+== Template Content Creation
+
+Templates are created using the WYSIWYG editor in the admin interface, which provides rich text formatting and HTML support.
+
+=== Using the WYSIWYG Editor
+
+The admin interface provides a visual editor for creating document templates:
+
+1. **Rich Text Formatting** - Bold, italic, fonts, colors, alignment
+2. **HTML Support** - Full HTML markup for advanced formatting
+3. **Variable Insertion** - Insert dynamic variables using Pebble syntax
+4. **Preview Mode** - See how templates render with sample data
+
+=== Pebble Template Processing
+
+Templates use Pebble template engine for dynamic content processing. Pebble provides:
+
+* **Variable substitution** - `{{ variable.property }}`
+* **Conditional logic** - `{% if condition %}...{% endif %}`
+* **Loops** - `{% for item in items %}...{% endfor %}`
+* **Filters** - `{{ amount | currency }}`, `{{ date | date('yyyy-MM-dd') }}`
+
+=== Basic Template Example
+
+```html
+<h1>Loan Agreement</h1>
+
+<p>Borrower: {{ application.client.individualInfo.firstName }} {{ application.client.individualInfo.lastName }}</p>
+<p>Loan Amount: <strong>{{ application.requestedAmount }}</strong></p>
+
+<h3>Payment Schedule</h3>
+<table border="1">
+    <tr><th>Payment Date</th><th>Amount</th></tr>
+    {% for payment in paymentSchedule.payments.values %}
+    <tr>
+        <td>{{ payment.dueDate | date('yyyy-MM-dd') }}</td>
+        <td>{{ payment.amount }}</td>
+    </tr>
+    {% endfor %}
+</table>
+```
+
+== Template Variables and Functions
+
+=== Available Variables
+
+Templates have access to:
+* **Model properties** - All public getters from your DocumentModel
+* **Built-in filters** - Date formatting, number formatting, string manipulation
+* **Global variables** - Current date/time, system settings
+
+=== Common Pebble Filters
+
+**Date Formatting:**
+```
+{{ payment.dueDate | date('MMMM dd, yyyy') }}     // March 15, 2024
+{{ payment.dueDate | date('yyyy-MM-dd') }}        // 2024-03-15
+```
+
+**Number Formatting:**
+```
+{{ amount | currency }}                           // $1,234.56
+{{ interestRate | numberformat('#,##0.00%') }}    // 5.50%
+{{ amount | numberformat('#,##0.00') }}           // 1,234.56
+```
+
+**String Formatting:**
+```
+{{ client.name | upper }}                         // JOHN DOE
+{{ client.name | lower }}                         // john doe
+{{ client.name | title }}                         // John Doe
+```
+
+**Conditional Content:**
+```
+{% if application.status == 'APPROVED' %}
+    This loan has been approved.
+{% else %}
+    This loan is pending review.
+{% endif %}
+```
+
+**Loops:**
+```
+{% for participant in participants %}
+    {{ participant.role }}: {{ participant.client.displayName }}
+{% endfor %}
+```
+
+== Template Management
+
+=== Creating Templates via UI
+
+1. **Navigate to Document Templates** in admin interface
+2. **Create New Template** with:
+   - Name and description
+   - Document type (from your DocumentCategory)
+   - Template type (HTML or TXT)
+   - Template content
+
+3. **Test Template** with sample entity data
+
+=== Template Storage
+
+Templates are stored in the `document_template` table:
+* **Content** - Template markup
+* **Type** - HTML or TXT
+* **Document Type** - Links to DocumentCategory
+
+== Advanced Features
+
+=== Document Queries with EntityDocumentFinder
+
+The `EntityDocumentFinder` service provides powerful document querying capabilities for conditional template logic and document management.
+
+==== Document Type Distinction
+
+The system has two types of documents:
+
+* **`EntityDocumentType`** - Regular uploaded documents (PDFs, images, etc.)
+* **`SignableDocumentType`** - Generated documents that require signatures
+
+Methods work with different types:
+* Document existence: `EntityDocumentType`
+* Signature operations: `SignableDocumentType` only
+
+==== Checking Document Existence
+
+Use `EntityDocumentFinder` to check if documents exist before generation:
+
+[source,java]
+----
+@Service
+public class ContractGenerationService {
+    
+    @Autowired
+    private EntityDocumentFinder documentFinder;
+    
+    // Document type constants
+    private static final EntityDocumentType ID_SCAN = new EntityDocumentType("ID_SCAN");
+    private static final EntityDocumentType INCOME_PROOF = new EntityDocumentType("INCOME_PROOF");
+    private static final SignableDocumentType CONTRACT_TYPE = new SignableDocumentType("CONTRACT");
+    
+    public boolean canGenerateContract(Participant participant) {
+        // Check if required documents are present (EntityDocumentType)
+        boolean hasIdScan = documentFinder.isPresent(participant, ID_SCAN);
+        boolean hasIncomeProof = documentFinder.isPresent(participant, INCOME_PROOF);
+        
+        // Check if contract already exists and is signed (SignableDocumentType)
+        boolean contractSigned = documentFinder.isLatestSigned(participant, CONTRACT_TYPE);
+        
+        return hasIdScan && hasIncomeProof && !contractSigned;
+    }
+}
+----
+
+==== Document Status in Templates
+
+Access document information in your DocumentModel:
+
+[source,java]
+----
+public class ContractDocumentModel extends DocumentModel {
+    private Participant participant;
+    private EntityDocumentFinder documentFinder;
+    
+    // Document type constants
+    private static final SignableDocumentType CONTRACT_TYPE = new SignableDocumentType("CONTRACT");
+    private static final SignableDocumentType PREVIOUS_CONTRACT_TYPE = new SignableDocumentType("PREVIOUS_CONTRACT");
+    
+    public ContractDocumentModel(Participant participant, EntityDocumentFinder finder) {
+        this.participant = participant;
+        this.documentFinder = finder;
+    }
+    
+    public boolean hasSignedPreviousContract() {
+        return documentFinder.isLatestSigned(participant, PREVIOUS_CONTRACT_TYPE);
+    }
+    
+    public String getLastContractDate() {
+        return documentFinder.latest(participant, CONTRACT_TYPE)
+            .map(doc -> doc.getCreatedAt().format(DateTimeFormatter.ofPattern("yyyy-MM-dd")))
+            .orElse("No previous contract");
+    }
+}
+----
+
+Use in templates:
+```html
+{% if hasSignedPreviousContract %}
+    <p>This replaces your previous contract dated {{ lastContractDate }}.</p>
+{% else %}
+    <p>This is your first contract with us.</p>
+{% endif %}
+```
+
+==== Available Query Methods
+
+**Document Existence (EntityDocumentType):**
+* `isPresent(owner, EntityDocumentType)` - Check if document exists
+* `isMissing(owner, EntityDocumentType)` - Check if document is missing
+
+**Document Retrieval:**
+* `getDocuments(owner)` - Get all active documents
+* `latest(owner, EntityDocumentType)` - Get most recent document of type
+* `latest(owner, SignableDocumentType)` - Get most recent signable document
+
+**Signature Status (SignableDocumentType only):**
+* `isLatestSigned(owner, SignableDocumentType)` - Check if latest document is signed
+* `signatureOfLatest(owner, SignableDocumentType)` - Get signature details
+
+=== Multiple Document Templates
+
+A single DocumentCategory can have multiple templates created in the admin interface. Generate documents using specific template IDs:
+
+==== Single Document Category
+
+[source,java]
+----
+@Component
+public class ContractDocumentCategory extends DocumentCategory<UUID, Application, ContractDocumentModel> {
+    
+    public static final DocumentType CONTRACT = new DocumentType("CONTRACT");
+    
+    @Override
+    public DocumentType getType() {
+        return CONTRACT;
+    }
+    
+    @Override
+    protected ContractDocumentModel getModel(Application application) {
+        return new ContractDocumentModel(application, application.getPaymentSchedule());
+    }
+    
+    @Override
+    protected boolean isSuitableTestEntity(Application application) {
+        return application.getStatus() == ApplicationStatus.APPROVED;
+    }
+}
+----
+
+==== Document Model with Conditional Logic
+
+The DocumentModel can expose properties for template conditional logic:
+
+[source,java]
+----
+public class ContractDocumentModel extends DocumentModel {
+    private Application application;
+    private PaymentSchedule schedule;
+    private LocalDate generationDate;
+    
+    public ContractDocumentModel(Application application, PaymentSchedule schedule) {
+        this.application = application;
+        this.schedule = schedule;
+        this.generationDate = LocalDate.now();
+    }
+    
+    public Application getApplication() {
+        return application;
+    }
+    
+    public PaymentSchedule getSchedule() {
+        return schedule;
+    }
+    
+    // Template conditional properties
+    public boolean isSecuredLoan() {
+        return application.isSecuredLoan();
+    }
+    
+    public boolean isHighValueLoan() {
+        return application.getRequestedAmount().isGreaterThan(MonetaryAmount.of(100000, "USD"));
+    }
+    
+    public String getContractType() {
+        if (isSecuredLoan()) {
+            return "Secured Loan Agreement";
+        }
+        return "Standard Loan Agreement";
+    }
+    
+    // Secured loan specific data (null if not secured)
+    public String getCollateralDescription() {
+        return application.getCollateral() != null ? 
+            application.getCollateral().getDescription() : null;
+    }
+}
+----
+
+==== Multiple Templates in Admin Interface
+
+Create different templates for the same DocumentCategory:
+
+1. **Standard Contract Template**:
+   - Name: "Standard Loan Contract"
+   - Document Type: CONTRACT
+   - Content: Basic loan terms without collateral sections
+
+2. **Secured Contract Template**:
+   - Name: "Secured Loan Contract" 
+   - Document Type: CONTRACT
+   - Content: Includes collateral information using conditional logic
+
+3. **High-Value Contract Template**:
+   - Name: "High-Value Loan Contract"
+   - Document Type: CONTRACT
+   - Content: Additional compliance sections for large loans
+
+==== Template Conditional Content
+
+Templates use the same DocumentModel but show different content:
+
+**Standard Contract Template:**
+```html
+<h1>{{ contractType }}</h1>
+
+<p>Loan Amount: {{ application.requestedAmount }}</p>
+<p>Interest Rate: {{ application.condition.interestRate }}%</p>
+
+{% if not isSecuredLoan %}
+    <h3>Unsecured Loan Terms</h3>
+    <p>This loan is not secured by collateral...</p>
+{% endif %}
+```
+
+**Secured Contract Template:**
+```html
+<h1>{{ contractType }}</h1>
+
+<p>Loan Amount: {{ application.requestedAmount }}</p>
+<p>Interest Rate: {{ application.condition.interestRate }}%</p>
+
+{% if isSecuredLoan %}
+    <h3>Collateral Information</h3>
+    <p><strong>Description:</strong> {{ collateralDescription }}</p>
+    <p><strong>Value:</strong> {{ application.collateral.estimatedValue }}</p>
+{% endif %}
+```
+
+==== Generating with Specific Templates
+
+Generate documents using template IDs:
+
+[source,java]
+----
+// Generate using specific template
+SignableDocument document = documentService.generate(
+    application, 
+    CONTRACT,
+    standardContractTemplateId  // Specify which template to use
+);
+
+// Or for secured loans
+SignableDocument securedDocument = documentService.generate(
+    application,
+    CONTRACT, 
+    securedContractTemplateId   // Different template, same DocumentCategory
+);
+----
+
+This approach allows:
+* **Single DocumentCategory** - One category handles all contract variations
+* **Multiple templates** - Different layouts and content for same data
+* **Template selection** - Choose appropriate template based on business logic
+* **Shared data model** - Same DocumentModel serves all template variations
+
+=== Custom Template Functions
+
+Extend template capabilities with custom functions in your DocumentModel:
+
+[source,java]
+----
+public class ContractDocumentModel extends DocumentModel {
+    
+    // Format complex data for display
+    public String getFormattedLoanTerm() {
+        int months = application.getCondition().getTermInMonths();
+        return months == 12 ? "1 year" : months + " months";
+    }
+    
+    // Business logic for conditional content
+    public boolean isHighRiskLoan() {
+        return application.getCondition().getInterestRate() > 15.0;
+    }
+    
+    // Computed properties
+    public MonetaryAmount getMonthlyPayment() {
+        return schedule.getPayments().values().stream()
+            .findFirst()
+            .map(PaymentSegment::getAmount)
+            .orElse(MonetaryAmount.ZERO);
+    }
+    
+    // Formatting helpers
+    public String getClientFullName() {
+        IndividualInfo info = application.getClient().getIndividualInfo();
+        return info.getFirstName() + " " + info.getLastName();
+    }
+    
+    // Status checks
+    public boolean requiresAdditionalDocumentation() {
+        return isHighValueLoan() || isHighRiskLoan();
+    }
+}
+----
+
+Use in templates:
+```html
+<h1>{{ contractType }} - {{ formattedLoanTerm }}</h1>
+<p>Borrower: {{ clientFullName }}</p>
+<p>Monthly Payment: {{ monthlyPayment | currency }}</p>
+
+{% if highRiskLoan %}
+    <div class="warning">
+        <strong>High Risk Loan</strong> - Additional terms apply
+    </div>
+{% endif %}
+
+{% if requiresAdditionalDocumentation %}
+    <p><em>Additional documentation may be required.</em></p>
+{% endif %}
+```
+
+== Integration with Signature Workflow
+
+=== Signable Documents
+
+For documents requiring signatures:
+
+[source,java]
+----
+// Document generation creates SignableDocument
+SignableDocument document = documentService.generate(
+    participant, 
+    APPLICATION_CONTRACT,
+    templateId
+);
+
+// Document flows through signature process
+// PENDING_SIGNATURE -> SIGNED -> contract complete
+----
+
+=== Signature Status Lifecycle
+
+Documents progress through signature states:
+
+* **`GENERATION_FAILED`** - Document generation failed
+* **`PENDING_SIGNATURE`** - Waiting for signature
+* **`SIGNED`** - Successfully signed
+* **`REFUSE`** - Signature refused
+* **`REVOKE`** - Signature revoked
+
+=== DocumentSignature Extensions
+
+The system supports different signature types through inheritance. Create custom signature implementations for specific workflows:
+
+==== Physical Document Signature
+
+For in-person or printed document signing:
+
+[source,java]
+----
+include::{sourcedir}/document/signature/PhysicalDocumentSignature.java[lines=7..]
+----
+
+==== Custom Signature Types
+
+Create specialized signature classes for different signing methods:
+
+[source,java]
+----
+@Entity
+@Table(name = "electronic_document_signature")
+@DiscriminatorValue("ELECTRONIC")
+public class ElectronicDocumentSignature extends DocumentSignature {
+    
+    @Column(name = "ip_address")
+    private String ipAddress;
+    
+    @Column(name = "user_agent")
+    private String userAgent;
+    
+    @Column(name = "signature_timestamp")
+    private Instant signatureTimestamp;
+    
+    @Column(name = "verification_code")
+    private String verificationCode;
+    
+    // Getters and setters
+    public String getIpAddress() { return ipAddress; }
+    public void setIpAddress(String ipAddress) { this.ipAddress = ipAddress; }
+    
+    public String getUserAgent() { return userAgent; }
+    public void setUserAgent(String userAgent) { this.userAgent = userAgent; }
+    
+    public Instant getSignatureTimestamp() { return signatureTimestamp; }
+    public void setSignatureTimestamp(Instant timestamp) { this.signatureTimestamp = timestamp; }
+    
+    public String getVerificationCode() { return verificationCode; }
+    public void setVerificationCode(String code) { this.verificationCode = code; }
+}
+----
+
+=== Signature Actions
+
+Create action controllers to handle signature workflows:
+
+[source,java]
+----
+@RequestMapping("/sign")
+@Controller
+@Order(1000)
+public class SignDocumentAction extends SimpleActionController<UUID, SignableDocument> {
+    
+    @Autowired
+    private ParticipantRepository participantRepository;
+    @Autowired
+    private EntityDocumentService entityDocumentService;
+    
+    @Override
+    protected EntityAction<SignableDocument, Object> action() {
+        return when(d -> isRequiredDocAdded(d)
+            && d.getStatus().in(SignatureStatus.PENDING_SIGNATURE) 
+            && d.getDocument() != null)
+            
+            .then((document, f, u) -> {
+                Participant participant = participantRepository.getReferenceById(document.getOwnerId());
+                
+                // Create appropriate signature type
+                PhysicalDocumentSignature signature = new PhysicalDocumentSignature();
+                signature.setSigner(participant.getDisplayedName());
+                signature.setEmail(participant.getClient().getContactInfo().getEmail());
+                signature.setPhone(participant.getClient().getContactInfo().getPhone());
+                
+                document.setSignature(signature);
+                document.setStatus(SignatureStatus.SIGNED);
+            });
+    }
+    
+    private boolean isRequiredDocAdded(SignableDocument d) {
+        Participant participant = participantRepository.getReferenceById(d.getOwnerId());
+        return entityDocumentService.requiredDocumentsAdded(participant);
+    }
+}
+----
+
+=== Signature Integration
+
+Templates can include signature placeholders and access signature information:
+
+```html
+<div class="signature-section">
+    <p>Borrower Signature:</p>
+    <div class="signature-line">_________________________</div>
+    <p>Date: {{ generationDate }}</p>
+    
+    {% if capturedSignature %}
+        <p><strong>Signed by:</strong> {{ signerName }}</p>
+        <p><strong>Signature Type:</strong> {{ capturedSignature.class.simpleName }}</p>
+    {% endif %}
+</div>
+```
+
+**Static Date Handling**: Capture the generation date in the DocumentModel constructor, not in a getter:
+
+```java
+public class ContractDocumentModel extends DocumentModel {
+    private LocalDate generationDate;
+    
+    public ContractDocumentModel(Application application) {
+        this.generationDate = LocalDate.now(); // Captured at generation time
+    }
+    
+    public String getGenerationDate() {
+        return generationDate.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+    }
+}
+```
+
+== Complete Implementation Example
+
+To implement a new document template:
+
+1. **Create DocumentCategory**:
+[source,java]
+----
+@Component
+public class LoanSummaryDocumentCategory extends DocumentCategory<UUID, Application, LoanSummaryModel> {
+    
+    public static final DocumentType LOAN_SUMMARY = new DocumentType("LOAN_SUMMARY");
+    
+    @Autowired
+    private EntityDocumentFinder documentFinder;
+    
+    @Override
+    public DocumentType getType() {
+        return LOAN_SUMMARY;
+    }
+    
+    @Override
+    protected LoanSummaryModel getModel(Application application) {
+        // Capture dynamic data at generation time
+        int docCount = documentFinder.getDocuments(application).size();
+        return new LoanSummaryModel(application, application.getPaymentSchedule(), docCount);
+    }
+    
+    @Override
+    protected boolean isSuitableTestEntity(Application application) {
+        // Note: Using EntityDocumentType for document existence check
+        EntityDocumentType contractEntityType = new EntityDocumentType("CONTRACT");
+        return application.getStatus() == ApplicationStatus.SERVICING
+            && documentFinder.isPresent(application, contractEntityType);
+    }
+}
+----
+
+2. **Create Document Model** (static data only):
+[source,java]
+----
+public class LoanSummaryModel extends DocumentModel {
+    private Application application;
+    private PaymentSchedule schedule;
+    private LocalDate generationDate;
+    private int documentCount; // Captured at generation time
+    
+    public LoanSummaryModel(Application application, PaymentSchedule schedule, int docCount) {
+        this.application = application;
+        this.schedule = schedule;
+        this.generationDate = LocalDate.now(); // Fixed at generation
+        this.documentCount = docCount; // Static snapshot
+    }
+    
+    public MonetaryAmount getTotalInterest() {
+        return schedule.getPayments().values().stream()
+            .map(PaymentSegment::getInterestAmount)
+            .reduce(MonetaryAmount.ZERO, MonetaryAmount::add);
+    }
+    
+    public String getGenerationDate() {
+        return generationDate.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+    }
+    
+    public int getDocumentCount() {
+        return documentCount; // Static value
+    }
+}
+----
+
+3. **Create HTML Template** in admin interface using model properties
+
+4. **Generate Documents** using `DocumentService.generate()`
+
+This provides a complete document template system with rich formatting, dynamic content, and signature integration.

@@ -1,0 +1,510 @@
+= Workflow Integration
+
+Connect your entities to automated decision-making workflows for credit scoring, risk assessment, and approval processes.
+
+== What You'll Learn
+
+After reading this chapter, you'll know how to:
+
+* Make any entity workflow-enabled with two simple interfaces
+* Automatically trigger workflows when business events occur
+* Handle workflow results and update entity status
+* Provide manual workflow controls for users
+* Test your workflow integration
+
+== The Big Picture
+
+TimveroOS separates **what** decisions to make from **how** to make them:
+
+* **Workflow Engine** (admin configures): Decision logic, scoring rules, approval criteria
+* **Your Code** (this chapter): When to start workflows, how to handle results
+
+Think of it like this: You tell the system "start credit check for this customer," the workflow engine figures out approve/decline/review, then you handle the result.
+
+== Step 1: Make Your Subject Workflow-Enabled
+
+`ProcessEntity` represents the **subject being evaluated** - typically a person, property, or asset. Not the business process itself.
+
+[source,java]
+----
+@Entity
+public class Borrower extends AbstractAuditable<UUID> 
+    implements ProcessEntity, HasPendingDecisions {
+    
+    // Person/subject information
+    private String fullName;
+    private String socialSecurityNumber;
+    private String email;
+    private LocalDate dateOfBirth;
+    
+    // Workflow integration - just add these two things:
+    
+    @OneToOne(cascade = CascadeType.ALL)
+    private PendingDecisionHolder pendingDecisionHolder = 
+        new PendingDecisionHolder("BORROWER");
+    
+    @Override
+    public String getPrimaryId() {
+        return socialSecurityNumber; // Unique identifier for data sources
+    }
+    
+    @Override
+    public PendingDecisionHolder getPendingDecisionHolder() {
+        return pendingDecisionHolder;
+    }
+}
+----
+
+**Common ProcessEntity types:**
+* **Person**: Borrower, Guarantor, Co-signer (credit checks, income verification)
+* **Property**: House, Vehicle, Asset (appraisals, valuations)  
+* **Business**: Company, Partnership (business credit, financial analysis)
+
+=== What Each Interface Does
+
+**ProcessEntity**: "This subject can be evaluated by workflows"
+* Requires `getPrimaryId()` - how external data sources identify this subject (SSN, VIN, Tax ID, etc.)
+
+**HasPendingDecisions**: "This subject can receive workflow evaluation results"  
+* Stores decisions from workflows (approve/decline/manual review)
+* Tracks decision progress
+
+== Step 2: Automatically Start Workflows
+
+Use `EntityChecker` to start workflows when business events happen. The pattern is to listen for business process changes and start subject evaluation:
+
+[source,java]
+----
+@Component
+public class BorrowerCreditCheckTrigger extends EntityChecker<LoanApplication, UUID> {
+
+    @Autowired
+    private DecisionProcessStarter workflowStarter;
+
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<LoanApplication> registry) {
+        // Listen for application status changes
+        registry.entityChange().updated(LoanApplication_.STATUS);
+    }
+
+    @Override
+    protected boolean isAvailable(LoanApplication application) {
+        return application.getStatus() == ApplicationStatus.SUBMITTED
+            && application.getBorrower() != null;
+    }
+
+    @Override
+    protected void perform(LoanApplication application) {
+        // Start credit check workflow for the BORROWER (the subject)
+        Borrower borrower = application.getBorrower();
+        workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrower.getId());
+    }
+}
+----
+
+**Key pattern:**
+1. **Listen** for business process events (application submitted, document signed, etc.)
+2. **Check** if subject evaluation should start (`isAvailable`)
+3. **Start** workflow for the **subject** (borrower, property, etc.), not the process
+
+=== Common Trigger Patterns
+
+**Status changes:**
+```java
+registry.entityChange().updated(MyEntity_.STATUS);
+```
+
+**New records:**
+```java
+registry.entityChange().inserted();
+```
+
+**Specific field updates:**
+```java
+registry.entityChange().updated(MyEntity_.CREDIT_SCORE);
+```
+
+**Complex conditions:**
+```java
+registry.entityChange().updated(MyEntity_.STATUS)
+    .and(entity -> entity.getAmount().isGreaterThan(THRESHOLD));
+```
+
+=== Manual Workflow Calls
+
+Sometimes you need to start workflows directly from your service code:
+
+[source,java]
+----
+@Service
+public class BorrowerEvaluationService {
+    
+    @Autowired
+    private DecisionProcessStarter workflowStarter;
+    
+    public void requestCreditCheck(UUID borrowerId) {
+        workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrowerId);
+    }
+    
+    public void requestIncomeVerification(UUID borrowerId) {
+        workflowStarter.start(INCOME_VERIFICATION_WORKFLOW, borrowerId);
+    }
+    
+    public void evaluateAllBorrowersForApplication(UUID applicationId) {
+        LoanApplication app = applicationRepository.findById(applicationId);
+        for (Borrower borrower : app.getBorrowers()) {
+            workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrower.getId());
+        }
+    }
+}
+----
+
+Use this when:
+* User clicks "Run Credit Check" button for a specific borrower
+* External API triggers evaluation of a person/property
+* Scheduled job needs to re-evaluate subjects
+* You need precise control over which subjects to evaluate
+
+== Step 3: Handle Workflow Results
+
+When workflows complete, they send results back to your subject. Handle them with `EntityEventListener`:
+
+[source,java]
+----
+@Component
+public class BorrowerEvaluationResultHandler implements EntityEventListener<FinishedScoringEvent<Borrower>> {
+
+    @Autowired
+    private BorrowerService borrowerService;
+    @Autowired
+    private LoanApplicationService applicationService;
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void handle(FinishedScoringEvent<Borrower> event) {
+        UUID borrowerId = event.getEntityId();
+        Borrower borrower = borrowerService.findById(borrowerId);
+        
+        List<PendingDecision> decisions = borrower.getPendingDecisions();
+        
+        if (hasDeclinedDecisions(decisions)) {
+            borrowerService.markAsDeclined(borrowerId, getDeclineReason(decisions));
+            // Update related applications
+            applicationService.handleBorrowerDeclined(borrowerId);
+        } else if (hasPendingDecisions(decisions)) {
+            borrowerService.markForManualReview(borrowerId);
+        } else {
+            borrowerService.markAsApproved(borrowerId);
+            // Check if all borrowers are approved, then approve application
+            applicationService.checkApplicationReadiness(borrower.getApplicationId());
+        }
+    }
+    
+    private boolean hasDeclinedDecisions(List<PendingDecision> decisions) {
+        return decisions.stream().anyMatch(d -> d.getStatus() == DecisionStatus.DECLINED);
+    }
+    
+    private boolean hasPendingDecisions(List<PendingDecision> decisions) {
+        return decisions.stream().anyMatch(d -> d.getStatus() == DecisionStatus.PENDING);
+    }
+}
+----
+
+**What this does:**
+1. **Listens** for subject evaluation completion events
+2. **Checks** all decisions from the workflow
+3. **Updates** subject status based on results
+4. **Triggers business logic** (e.g., check if application can proceed)
+5. **Uses new transaction** to avoid conflicts with workflow engine
+
+=== Service Layer Pattern
+
+Keep your business logic clean with separate services for subjects and processes:
+
+[source,java]
+----
+@Service
+public class BorrowerService {
+
+    @Transactional
+    public void markAsApproved(UUID borrowerId) {
+        Borrower borrower = repository.findById(borrowerId);
+        borrower.setEvaluationStatus(EvaluationStatus.APPROVED);
+        borrower.setEvaluationDate(Instant.now());
+        // Clear any pending decisions, update credit score, etc.
+    }
+
+    @Transactional  
+    public void markAsDeclined(UUID borrowerId, String reason) {
+        Borrower borrower = repository.findById(borrowerId);
+        borrower.setEvaluationStatus(EvaluationStatus.DECLINED);
+        borrower.setDeclineReason(reason);
+        // Log decline reason, update risk profile, etc.
+    }
+
+    @Transactional
+    public void markForManualReview(UUID borrowerId) {
+        Borrower borrower = repository.findById(borrowerId);
+        borrower.setEvaluationStatus(EvaluationStatus.MANUAL_REVIEW);
+        // Create review tasks, notify underwriters, etc.
+    }
+}
+
+@Service
+public class LoanApplicationService {
+    
+    @Transactional
+    public void checkApplicationReadiness(UUID applicationId) {
+        LoanApplication app = repository.findById(applicationId);
+        
+        // Check if all borrowers are evaluated
+        boolean allBorrowersReady = app.getBorrowers().stream()
+            .allMatch(b -> b.getEvaluationStatus() != EvaluationStatus.PENDING);
+            
+        if (allBorrowersReady) {
+            boolean anyDeclined = app.getBorrowers().stream()
+                .anyMatch(b -> b.getEvaluationStatus() == EvaluationStatus.DECLINED);
+                
+            if (anyDeclined) {
+                app.setStatus(ApplicationStatus.DECLINED);
+            } else {
+                app.setStatus(ApplicationStatus.APPROVED);
+            }
+        }
+    }
+}
+----
+
+== Step 4: Add Manual Controls
+
+Sometimes users need to manually control workflows. Add action controllers:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/retry-credit-check")
+public class RetryCreditCheckAction extends SimpleActionController<UUID, Borrower> {
+
+    @Autowired
+    private DecisionProcessStarter workflowStarter;
+    
+    @Override
+    protected EntityAction<? super Borrower, Object> action() {
+        return when(borrower -> 
+                borrower.getEvaluationStatus() == EvaluationStatus.FAILED
+        ).then((borrower, form, user) -> {
+            workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrower.getId());
+            borrower.setEvaluationStatus(EvaluationStatus.PENDING);
+        });
+    }
+}
+----
+
+**This creates a "Retry Credit Check" button that:**
+* Only shows when borrower evaluation failed
+* Restarts the credit check workflow for that borrower
+* Updates borrower evaluation status
+* Refreshes the page
+
+== Step 5: Configuration
+
+=== Define Your Workflow Types
+
+Create `DecisionProcessType` constants for your workflows:
+
+[source,java]
+----
+@Configuration
+public class WorkflowConfiguration {
+    
+    public static final DecisionProcessType<Borrower> CREDIT_CHECK_WORKFLOW =
+        new DecisionProcessType<>("CREDIT_CHECK_WORKFLOW", Borrower.class);
+        
+    public static final DecisionProcessType<Borrower> INCOME_VERIFICATION_WORKFLOW =
+        new DecisionProcessType<>("INCOME_VERIFICATION_WORKFLOW", Borrower.class);
+        
+    public static final DecisionProcessType<Borrower> FRAUD_CHECK_WORKFLOW =
+        new DecisionProcessType<>("FRAUD_CHECK_WORKFLOW", Borrower.class);
+        
+    public static final DecisionProcessType<Property> PROPERTY_APPRAISAL_WORKFLOW =
+        new DecisionProcessType<>("PROPERTY_APPRAISAL_WORKFLOW", Property.class);
+}
+----
+
+**Each `DecisionProcessType` specifies:**
+* **Name**: Identifier for the workflow process
+* **Entity type**: What type of entity this workflow processes
+
+Use these constants everywhere instead of creating new instances.
+
+=== Application Setup
+
+The workflow engine runs on a separate port. Set this up in your main class:
+
+[source,java]
+----
+public class MyLendingApplication {
+    public static void main(String[] args) {
+        SpringApplicationBuilder parent = new SpringApplicationBuilder(BaseConfiguration.class)
+                .web(WebApplicationType.NONE);
+        parent.run(args);
+        
+        // Main application (port 8081)
+        parent.child(WebMvcConfig.class, MyConfiguration.class)
+            .properties("server.port=8081")
+            .run(args);
+            
+        // Workflow engine (separate port)
+        parent.child(ExternalProcessWebMvcConfig.class)
+            .properties("spring.config.name=workflow")
+            .run(args);
+    }
+}
+----
+
+=== Workflow Properties
+
+Create `src/main/resources/workflow.properties`:
+
+[source,properties]
+----
+server.port=${process.engine.callbackPort}
+server.servlet.context-path=/external-process
+----
+
+=== Application Properties
+
+Add these essential workflow configuration properties to `src/main/resources/application.properties`:
+
+[source,properties]
+----
+# Workflow Callback Configuration
+process.engine.callbackPort=8180
+process.engine.callbackUrl=http://localhost:
+process.engine.type=workflow
+
+# Workflow Modeler UI  
+process.modeler.url=http://localhost:8280/workflow
+# Workflow Engine URL for back-to-back calls 
+process.engine.url=http://localhost:8280/workflow
+----
+
+**What these properties do:**
+
+* **`process.engine.callbackPort`**: Port where your admin application runs (workflow engine calls back to this)
+* **`process.engine.callbackUrl`**: Base URL for workflow engine callbacks to your application
+* **`process.engine.type`**: Identifies this as a workflow-enabled application
+* **`process.modeler.url`**: URL to the workflow designer/modeler interface
+* **`process.engine.url`**: URL to the workflow execution engine
+
+**Important**: The workflow engine runs separately from your application and needs these URLs to communicate back and forth.
+
+== Complete Example: Borrower Credit Check Workflow
+
+Here's everything working together for a borrower evaluation workflow:
+
+**1. The Subject (ProcessEntity)**
+[source,java]
+----
+@Entity
+public class Borrower extends AbstractAuditable<UUID> 
+    implements ProcessEntity, HasPendingDecisions {
+    
+    private String fullName;
+    private String socialSecurityNumber;
+    private EvaluationStatus evaluationStatus = EvaluationStatus.PENDING;
+    
+    @OneToOne(cascade = CascadeType.ALL)
+    private PendingDecisionHolder pendingDecisionHolder = 
+        new PendingDecisionHolder("BORROWER");
+    
+    @Override
+    public String getPrimaryId() { return socialSecurityNumber; }
+    
+    @Override
+    public PendingDecisionHolder getPendingDecisionHolder() { 
+        return pendingDecisionHolder; 
+    }
+    
+    // getters/setters...
+}
+----
+
+**2. Automatic Trigger (listens to business process)**
+[source,java]
+----
+@Component
+public class BorrowerCreditCheckTrigger extends EntityChecker<LoanApplication, UUID> {
+    
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<LoanApplication> registry) {
+        registry.entityChange().updated(LoanApplication_.STATUS);
+    }
+
+    @Override
+    protected boolean isAvailable(LoanApplication app) {
+        return app.getStatus() == ApplicationStatus.SUBMITTED;
+    }
+
+    @Override
+    protected void perform(LoanApplication app) {
+        // Start workflow for each BORROWER (the subject)
+        for (Borrower borrower : app.getBorrowers()) {
+            workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrower.getId());
+        }
+        app.setStatus(ApplicationStatus.UNDER_REVIEW);
+    }
+}
+----
+
+**3. Result Handler (handles subject evaluation results)**
+[source,java]
+----
+@Component
+public class BorrowerEvaluationResultHandler implements EntityEventListener<FinishedScoringEvent<Borrower>> {
+    
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void handle(FinishedScoringEvent<Borrower> event) {
+        Borrower borrower = borrowerService.findById(event.getEntityId());
+        List<PendingDecision> decisions = borrower.getPendingDecisions();
+        
+        if (hasDeclinedDecisions(decisions)) {
+            borrowerService.markAsDeclined(borrower.getId());
+            applicationService.handleBorrowerDeclined(borrower.getApplicationId());
+        } else if (hasPendingDecisions(decisions)) {
+            borrowerService.markForManualReview(borrower.getId());
+        } else {
+            borrowerService.markAsApproved(borrower.getId());
+            applicationService.checkApplicationReadiness(borrower.getApplicationId());
+        }
+    }
+}
+----
+
+**4. Manual Controls**
+[source,java]
+----
+@Controller
+@RequestMapping("/retry-credit-check")
+public class RetryCreditCheckAction extends SimpleActionController<UUID, Borrower> {
+    
+    @Override
+    protected EntityAction<? super Borrower, Object> action() {
+        return when(borrower -> borrower.getEvaluationStatus() == EvaluationStatus.FAILED)
+            .then((borrower, form, user) -> {
+                workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrower.getId());
+                borrower.setEvaluationStatus(EvaluationStatus.PENDING);
+            });
+    }
+}
+----
+
+**The Flow:**
+1. User submits application → Application status changes to SUBMITTED
+2. EntityChecker detects change → Starts credit check workflow for each borrower  
+3. Workflow evaluates borrower → Sends result to your handler
+4. Handler updates borrower status → Checks if application can proceed
+5. If workflow fails → User can retry credit check for specific borrower
+
+**Key Pattern**: Business process (application) triggers subject evaluation (borrower), results flow back to update both subject and process.

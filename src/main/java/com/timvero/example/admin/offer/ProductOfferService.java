@@ -12,28 +12,25 @@ import jakarta.persistence.EntityManager;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+// tag::service[]
 @Service
 public class ProductOfferService {
 
-    private final OfferEngine offerEngine;
-    private final ExceptionEntityService exceptionService;
-    private final ExampleDataProcessor exampleDataProcessor;
-    private final ExampleCreditProductRepository exampleCreditProductRepository;
-    private final EntityManager entityManager;
-
-    public ProductOfferService(ExampleCreditProductRepository exampleCreditProductRepository, OfferEngine offerEngine,
-        ExceptionEntityService exceptionService, ExampleDataProcessor exampleDataProcessor,
-        EntityManager entityManager) {
-        this.exampleCreditProductRepository = exampleCreditProductRepository;
-        this.offerEngine = offerEngine;
-        this.exceptionService = exceptionService;
-        this.exampleDataProcessor = exampleDataProcessor;
-        this.entityManager = entityManager;
-    }
+    @Autowired
+    private OfferEngine offerEngine;
+    @Autowired
+    private ExceptionEntityService exceptionService;
+    @Autowired
+    private ExampleDataProcessor exampleDataProcessor;
+    @Autowired
+    private ExampleCreditProductRepository exampleCreditProductRepository;
+    @Autowired
+    private EntityManager entityManager;
 
     @SuppressWarnings("unchecked")
     @Transactional(propagation = Propagation.MANDATORY)
@@ -56,3 +53,4 @@ public class ProductOfferService {
         }
     }
 }
+// end::service[]

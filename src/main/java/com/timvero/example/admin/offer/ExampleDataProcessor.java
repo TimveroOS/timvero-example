@@ -17,6 +17,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import org.springframework.stereotype.Component;
 
+// tag::processor[]
 @Component
 public class ExampleDataProcessor extends OfferEngineDataProcessor<UUID, Participant> {
 
@@ -47,3 +48,4 @@ public class ExampleDataProcessor extends OfferEngineDataProcessor<UUID, Partici
         return List.of(map);
     }
 }
+// end::processor[]

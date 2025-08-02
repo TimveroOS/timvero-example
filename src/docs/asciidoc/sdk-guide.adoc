@@ -48,8 +48,9 @@ This guide is designed to be read sequentially, with each chapter building on th
 . **<<_html_template_integration>>** - Thymeleaf components, validation classes, and UI integration
 . **<<_credit_operations_framework>>** - Credit operations framework: charges, payments, accruals, past due processing
 . **<<_payment_transactions_framework>>** - Real-world payment processing with gateway integration
+. **<<_offer_engine_credit_products>>** - Generate personalized loan offers from credit products and participant data
 
-**Advanced Topics:** <<_datasource_integration>>, <<_document_management>>, <<_entity_checkers_setup_and_usage>>, <<_credit_management_system>>
+**Advanced Topics:** <<_datasource_integration>>, <<_document_management>>, <<_document_templates>>, <<_entity_checkers_setup_and_usage>>, <<_credit_management_system>>, <<_workflow_process_integration>>
 
 TIP: New to TimveroOS? Start with Platform Overview and Getting Started. Experienced developers can jump to specific chapters using the navigation above.
 
@@ -67,6 +68,8 @@ include::_datasource.adoc[leveloffset=+1]
 
 include::_documents.adoc[leveloffset=+1]
 
+include::_document-templates.adoc[leveloffset=+1]
+
 include::_checkers.adoc[leveloffset=+1]
 
 include::_credit.adoc[leveloffset=+1]
@@ -74,3 +77,7 @@ include::_credit.adoc[leveloffset=+1]
 include::_operations.adoc[leveloffset=+1]
 
 include::_payment-transactions.adoc[leveloffset=+1]
+
+include::_offer-engine.adoc[leveloffset=+1]
+
+include::_workflow-integration.adoc[leveloffset=+1]
