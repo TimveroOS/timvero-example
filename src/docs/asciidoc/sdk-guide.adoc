@@ -39,36 +39,64 @@ For a complete working example, see the https://github.com/TimveroOS/timvero-exa
 
 == Learning Path
 
-This guide is designed to be read sequentially, with each chapter building on the previous:
+This guide is organized into logical parts that build on each other:
 
-. **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
-. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
-. **<<data-model>>** - SQL autogeneration and Flyway migration workflows
-. **<<forms>>** - Form classes, validation, MapStruct mappers, and service layers
-. **<<templates>>** - Thymeleaf components, validation classes, and UI integration
-. **<<operations>>** - Credit operations framework: charges, payments, accruals, past due processing
-. **<<payment-transactions>>** - Real-world payment processing with gateway integration
+=== PART I: FOUNDATION
+. **<<_platform_overview>>** - Core concepts: Basic, Origination, and Servicing layers
+. **<<_getting_started>>** - Master the Entity-Form-Controller pattern with Client example  
+. **<<_data_model_setup>>** - SQL autogeneration and Flyway migration workflows
 
-**Advanced Topics:** <<datasource>>, <<documents>>, <<checkers>>, <<credit>>
+=== PART II: USER INTERFACE  
+[start=4]
+. **<<_form_classes_setup_and_usage>>** - Form classes, validation, MapStruct mappers, and service layers
+. **<<_html_template_integration>>** - Thymeleaf components, validation classes, and UI integration
+. **<<_document_management>>** - Document upload, requirements, and UI integration
+. **<<_document_templates>>** - Generate contracts, reports, and formatted documents
+. **<<_notifications>>** - Multi-channel automated notifications with template-based content
 
-TIP: New to TimveroOS? Start with Platform Overview and Getting Started. Experienced developers can jump to specific chapters using the navigation above.
+=== PART III: BUSINESS LOGIC
+[start=9]
+. **<<_entity_checkers_setup_and_usage>>** - Event-driven business rules and automation
+. **<<_datasource_integration>>** - External API integration and data enrichment
+. **<<_workflow_integration>>** - Integration for decision workflows
+. **<<_offer_engine_credit_products>>** - Generate personalized loan offers from credit products and participant data
 
+=== PART IV: FINANCIAL OPERATIONS
+[start=12]
+. **<<_credit_management_system>>** - Complete credit lifecycle management
+. **<<_credit_operations_framework>>** - Credit operations: charges, payments, accruals, past due processing
+. **<<_payment_transactions_framework>>** - Real-world payment processing with gateway integration
+
+TIP: New to TimveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
+
+// PART I: FOUNDATION
 include::_platform-overview.adoc[leveloffset=+1]
 
 include::_getting-started.adoc[leveloffset=+1]
 
 include::_data-model.adoc[leveloffset=+1]
 
+// PART II: USER INTERFACE
 include::_forms.adoc[leveloffset=+1]
 
 include::_templates.adoc[leveloffset=+1]
 
-include::_datasource.adoc[leveloffset=+1]
-
 include::_documents.adoc[leveloffset=+1]
 
+include::_document-templates.adoc[leveloffset=+1]
+
+include::_notifications.adoc[leveloffset=+1]
+
+// PART III: BUSINESS LOGIC
 include::_checkers.adoc[leveloffset=+1]
 
+include::_datasource.adoc[leveloffset=+1]
+
+include::_workflow-integration.adoc[leveloffset=+1]
+
+include::_offer-engine.adoc[leveloffset=+1]
+
+// PART IV: FINANCIAL OPERATIONS
 include::_credit.adoc[leveloffset=+1]
 
 include::_operations.adoc[leveloffset=+1]

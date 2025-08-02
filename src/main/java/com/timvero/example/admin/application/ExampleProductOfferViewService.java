@@ -12,6 +12,7 @@ import java.util.Locale;
 import org.springframework.stereotype.Service;
 
 
+// tag::view[]
 @Service
 public class ExampleProductOfferViewService extends ProductOfferViewService {
 
@@ -41,3 +42,4 @@ public class ExampleProductOfferViewService extends ProductOfferViewService {
             details);
     }
 }
+// end::view[]

@@ -18,6 +18,7 @@ import org.hibernate.envers.AuditOverride;
 import org.hibernate.envers.Audited;
 import org.hibernate.envers.RelationTargetAuditMode;
 
+// tag::entity[]
 @Entity
 @Table(name = "secured_offer")
 @Inheritance(strategy = InheritanceType.JOINED)
@@ -57,3 +58,4 @@ public abstract class ExampleSecuredOffer extends SecuredOffer {
         return getOriginalOffer().getUuid() + ":NO_PROCURING";
     }
 }
+// end::entity[]

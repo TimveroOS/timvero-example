@@ -7,18 +7,17 @@ import com.timvero.example.admin.participant.entity.ParticipantStatus;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.web.common.action.SimpleActionController;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.RequestMapping;
 
+// tag::action[]
 @RequestMapping("/generate-offers")
 @Controller
 public class GenerateOffersParticipantAction extends SimpleActionController<UUID, Participant> {
 
-    private final ProductOfferService productOfferService;
-
-    public GenerateOffersParticipantAction(ProductOfferService productOfferService) {
-        this.productOfferService = productOfferService;
-    }
+    @Autowired
+    private ProductOfferService productOfferService;
 
     @Override
     protected EntityAction<? super Participant, Object> action() {
@@ -37,3 +36,4 @@ public class GenerateOffersParticipantAction extends SimpleActionController<UUID
         return BTN_PRIMARY;
     }
 }
+// end::action[]
