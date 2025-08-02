@@ -726,9 +726,9 @@ You're now ready to build powerful financial applications with the Timvero platf
 
 ---
 
-**Next Chapter:** <<_data_model_setup>> - SQL autogeneration and Flyway migration workflows
+**Next Chapter:** <<data_model_setup>> - SQL autogeneration and Flyway migration workflows
 
 **Related Chapters:**
-* <<_form_classes_setup_and_usage>> - Form classes, validation, MapStruct mappers, and service layers
-* <<_html_template_integration>> - Thymeleaf components, validation classes, and UI integration  
-* <<_entity_checkers_setup_and_usage>> - Entity Checkers for event-driven business rules
+* <<form_classes_setup_and_usage>> - Form classes, validation, MapStruct mappers, and service layers
+* <<html_template_integration>> - Thymeleaf components, validation classes, and UI integration  
+* <<entity_checkers_setup_and_usage>> - Entity Checkers for event-driven business rules

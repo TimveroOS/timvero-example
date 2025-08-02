@@ -171,7 +171,7 @@ Client entity (persisted to database)
 
 Form classes integrate with HTML templates using Thymeleaf for rendering user interfaces. The templates use nested field access (dot notation) and reusable form components for consistent styling and validation.
 
-For detailed information about HTML template integration, form components, and Thymeleaf usage, see <<_html_template_integration>>.
+For detailed information about HTML template integration, form components, and Thymeleaf usage, see <<html_template_integration>>.
 
 == Troubleshooting Form Issues
 
