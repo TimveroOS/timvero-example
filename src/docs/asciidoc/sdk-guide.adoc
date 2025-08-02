@@ -42,30 +42,30 @@ For a complete working example, see the https://github.com/TimveroOS/timvero-exa
 This guide is organized into logical parts that build on each other:
 
 === PART I: FOUNDATION
-. **<<platform_overview>>** - Core concepts: Basic, Origination, and Servicing layers
-. **<<getting_started>>** - Master the Entity-Form-Controller pattern with Client example  
-. **<<data_model_setup>>** - SQL autogeneration and Flyway migration workflows
+. **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
+. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
+. **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE  
 [start=4]
-. **<<form_classes_setup_and_usage>>** - Form classes, validation, MapStruct mappers, and service layers
-. **<<html_template_integration>>** - Thymeleaf components, validation classes, and UI integration
-. **<<document_management>>** - Document upload, requirements, and UI integration
-. **<<document_templates>>** - Generate contracts, reports, and formatted documents
+. **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
+. **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
+. **<<document-management>>** - Document upload, requirements, and UI integration
+. **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
 
 === PART III: BUSINESS LOGIC
 [start=9]
-. **<<entity_checkers_setup_and_usage>>** - Event-driven business rules and automation
-. **<<datasource_integration>>** - External API integration and data enrichment
-. **<<workflow_integration>>** - Integration for decision workflows
-. **<<offer_engine_credit_products>>** - Generate personalized loan offers from credit products and participant data
+. **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
+. **<<datasource-integration>>** - External API integration and data enrichment
+. **<<workflow-integration>>** - Integration for decision workflows
+. **<<offer-engine-credit-products>>** - Generate personalized loan offers from credit products and participant data
 
 === PART IV: FINANCIAL OPERATIONS
 [start=12]
-. **<<credit_management_system>>** - Complete credit lifecycle management
-. **<<credit_operations_framework>>** - Credit operations: charges, payments, accruals, past due processing
-. **<<payment_transactions_framework>>** - Real-world payment processing with gateway integration
+. **<<credit-management-system>>** - Complete credit lifecycle management
+. **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
+. **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
 TIP: New to TimveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
 

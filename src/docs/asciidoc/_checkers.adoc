@@ -28,7 +28,7 @@ The application uses a structured checker architecture based on framework compon
 
 Each checker consists of three main parts:
 
-* **<<listener_registration,Listener Registration>>** (`registerListeners` method) - defines what entity changes to monitor
+* **<<listener-registration,Listener Registration>>** (`registerListeners` method) - defines what entity changes to monitor
 * **Availability Check** (`isAvailable` method) - determines when the checker should execute
 * **Business Logic** (`perform` method) - implements the actual business rule
 
@@ -49,11 +49,11 @@ The `registerListeners` method is the core mechanism for defining what entity ch
 |`entityChange`
 |`Class<T> entityClass` - Type of entity being monitored +
 `Function<T, E> mapper` - Function to convert changed entity to target entity
-|Creates a listener for entity change events. See <<using_entitychange_method,usage examples>>.
+|Creates a listener for entity change events. See <<using-entitychange-method,usage examples>>.
 
 |`entityChange`
 |_(no parameters)_
-|Monitors the same entity type as the checker (shorthand). See <<using_entitychange_method,usage examples>>.
+|Monitors the same entity type as the checker (shorthand). See <<using-entitychange-method,usage examples>>.
 
 |`updated`
 |`String... fields` - Names of fields to monitor for changes
