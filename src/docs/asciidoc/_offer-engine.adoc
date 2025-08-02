@@ -844,9 +844,9 @@ if (profile.creditScore >= 700) {
 
 == Next Steps
 
-* **<<_credit-management>>**: Convert selected offers into active credits
-* **<<_workflow-integration>>**: Automate offer generation through workflows  
-* **<<_operations>>**: Handle offer-related operations and modifications
-* **<<_payment-transactions>>**: Process payments for accepted offers
+* **<<credit-management>>**: Convert selected offers into active credits
+* **<<workflow-integration>>**: Automate offer generation through workflows  
+* **<<operations>>**: Handle offer-related operations and modifications
+* **<<payment-transactions>>**: Process payments for accepted offers
 
 The Offer Engine provides the foundation for personalized lending by transforming static products into dynamic, risk-adjusted offers tailored to each participant's profile and circumstances.
