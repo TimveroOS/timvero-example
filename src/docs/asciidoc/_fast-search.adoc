@@ -123,12 +123,12 @@ Specify custom result templates:
 @Bean
 FastSearchEntity<Client> clientSearchEntity() {
     FastSearchEntity<Client> entity = new FastSearchEntity<>(Client.class, Client::getDisplayedName);
-    entity.setLayoutTemplateName("client-result");
+    entity.setLayoutTemplateName("/client/search :: client-result");
     return entity;
 }
 ----
 
-This uses `/form/search :: client-result` template for displaying this entity in search results. Default template is "default".
+This uses `/client/search +++::+++ client-result` template for displaying this entity in search results. Default template is `/form/search +++::+++ default`.
 
 === Multiple Entities
 

@@ -3,6 +3,8 @@
 :toc: 
 :toclevels: 3 
 
+:idprefix:
+:idseparator: -
 :example-caption!:
 ifndef::imagesdir[:imagesdir: images]
 
