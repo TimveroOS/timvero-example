@@ -11,7 +11,7 @@
   <div class="form-body">
     <th:block
         th:insert="~{/form/components :: date (#{credit.payment.processedDate}, 'processedDate', 'v-required')}"
-        th:with="minDate = ${#ldates.format(minDate, 'yyyy/MM/dd')}"/>
+        th:with="minDate = ${minDate}"/>
 
     <th:block
         th:with="currencies = ${currencies}"
