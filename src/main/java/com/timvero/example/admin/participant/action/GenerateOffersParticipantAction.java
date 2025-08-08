@@ -21,7 +21,7 @@ public class GenerateOffersParticipantAction extends SimpleActionController<UUID
 
     @Override
     protected EntityAction<? super Participant, Object> action() {
-        return when(this::isAvailable).then((participant, f, u) -> {
+        return when(p -> isAvailable(p)).then((participant, f, u) -> {
             productOfferService.generateOffers(participant);
         });
     }

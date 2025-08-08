@@ -5,6 +5,32 @@
 
 The Offer Engine transforms static credit product templates into personalized offers by evaluating participant risk data, workflow results, and business rules through configurable scripts.
 
+== Process Flow
+
+The offer generation follows this sequence:
+
+[cols="1,1,1,1,1", options="header"]
+|===
+|Product Template |Risk Assessment |Personalized Offer |Select Condition |Active Credit
+
+|• Amount ranges
+• Interest rates  
+• Terms
+• Payment engine
+|• Credit score
+• Income data
+• Workflow results
+• External data
+|• Adjusted amounts
+• Final rates
+• Secured options
+|• Participant chooses offer
+• Payment schedule
+• Signs contract
+|• Credit entity
+• Active servicing
+|===
+
 == What You'll Build
 
 * **Credit Products**: Loan product templates with terms and parameters
@@ -23,25 +49,14 @@ Credit products define the basic parameters for loan types - amounts, terms, cur
 ----
 @Entity
 public class ExampleCreditProduct extends CreditProduct {
-
-    @Column(updatable = false)
-    private CurrencyUnit currency;
-
-    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
-    private BigDecimal minAmount;
-
-    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
-    private BigDecimal maxAmount;
-
-    @Column(nullable = false)
-    private Integer minTerm;
-
-    @Column(nullable = false)
-    private Integer maxTerm;
-
-    @Column(nullable = false, columnDefinition = NUMERIC)
-    private BigDecimal lateFeeRate;
-
+    private CurrencyUnit currency;        // USD, EUR, etc.
+    private BigDecimal minAmount;         // $1,000
+    private BigDecimal maxAmount;         // $50,000
+    private Integer minTerm;              // 6 months
+    private Integer maxTerm;              // 60 months
+    private BigDecimal lateFeeRate;       // 5% late fee
+    private String engineName;            // "SimpleScheduledEngine"
+    
     // Constructor and getters/setters omitted for brevity
 }
 ----
@@ -52,6 +67,38 @@ public class ExampleCreditProduct extends CreditProduct {
 * **Fee Structure**: Late fee rates and other charges
 * **Engine Integration**: Links to offer generation engines
 
+==== Payment Calculation Engines
+
+Credit products integrate with payment calculation engines to generate detailed payment schedules. The `engineName` field references a Spring service that implements the `ScheduledEngine` interface to calculate how loan amounts are split into principal and interest payments over time.
+
+[source,java]
+----
+// Example: SimpleScheduledEngine for standard annuity payments
+@Service("SimpleScheduledEngine")
+public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondition> {
+    
+    @Override
+    public List<PaymentSegment> payments(ExampleCreditCondition condition, 
+                                       LocalDate interestStart, LocalDate paymentStart,
+                                       MonetaryAmount principal, MonetaryAmount interest) {
+        // Calculate payment schedule based on loan terms
+        // Each PaymentSegment contains payment date, principal/interest breakdown,
+        // and remaining balances after payment
+        return payments;
+    }
+}
+----
+
+**Engine Purpose:**
+* **Payment Breakdown**: Calculates how much of each payment goes to principal vs interest
+* **Schedule Generation**: Creates complete payment timeline with remaining balances
+* **Algorithm Flexibility**: Different engines can implement various payment calculation methods (annuity, differentiated, interest-only, etc.)
+
+**Integration:**
+* **Product Configuration**: Credit product's `engineName` field matches Spring service name
+* **Automatic Discovery**: Platform automatically finds and manages all ScheduledEngine beans
+* **Validation**: System ensures payment calculations are mathematically correct (remaining debt = 0)
+
 === Product Additives
 
 Additives are specific configurations within products that define interest rates, procuring types, and offer generation rules.
@@ -60,44 +107,18 @@ Additives are specific configurations within products that define interest rates
 ----
 @Entity
 public class ExampleCreditProductAdditive extends CreditProductAdditive {
+    private String name;                  // "Prime Rate", "Standard Rate"
+    private BigDecimal interestRate;      // 8.5%, 12.9%
+    private BigDecimal minAmount;         // Refined amount ranges
+    private BigDecimal maxAmount;         // within product limits
+    private Integer minTerm;              // Refined term ranges
+    private Integer maxTerm;              // within product limits
 
-    @Column(nullable = false)
-    private String name;
-
-    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
-    private BigDecimal minAmount;
-
-    @Column(precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
-    private BigDecimal maxAmount;
-
-    @Column(nullable = false)
-    private Integer minTerm;
-
-    @Column(nullable = false)
-    private Integer maxTerm;
-
-    @Column(nullable = false, columnDefinition = NUMERIC)
-    private BigDecimal interestRate;
-
-    protected ExampleCreditProductAdditive() {
-        super();
-    }
-
-    public ExampleCreditProductAdditive(CreditProduct product) {
-        super(product);
-    }
-
-    @Transient
     @Override
     public ExampleProductOffer createOffer() {
         return new ExampleProductOffer();
     }
-
-    @Override
-    public String getDisplayedName() {
-        return name;
-    }
-
+    
     // Standard getters/setters omitted for brevity
 }
 ----
@@ -115,50 +136,19 @@ Generated offers are personalized versions of product additives tailored to spec
 [source,java]
 ----
 @Entity
-@Table(name = "product_offer")
-@Audited
 public class ExampleProductOffer extends ProductOffer {
+    private UUID uuid;                    // Unique offer identifier
+    private Participant participant;      // Who gets this offer
+    private BigDecimal minAmount;         // Personalized min amount
+    private BigDecimal maxAmount;         // Personalized max amount  
+    private Integer minTerm;              // Personalized min term
+    private Integer maxTerm;              // Personalized max term
 
-    @NotAudited
-    @Column(name = "uuid", nullable = false, updatable = false)
-    private UUID uuid;
-
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    private Participant participant;
-
-    @Column(name = "min_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
-    private BigDecimal minAmount;
-
-    @Column(name = "max_amount", precision = AMOUNT_PRECISION, scale = AMOUNT_SCALE, nullable = false)
-    private BigDecimal maxAmount;
-
-    @Column(name = "min_term", nullable = false)
-    private Integer minTerm;
-
-    @Column(name = "max_term", nullable = false)
-    private Integer maxTerm;
-
-    @Transient
+    // Links back to product and participant's application
     public Application getApplication() {
-        return participant != null ? participant.getApplication() : null;
+        return participant.getApplication();
     }
-
-    @Override
-    @Transient
-    public ExampleCreditProduct getCreditProduct() {
-        return (ExampleCreditProduct) getProductAdditive().getProduct();
-    }
-
-    @Transient
-    public CurrencyUnit getCurrency() {
-        return getCreditProduct().getCurrency();
-    }
-
-    @PrePersist
-    protected void prePersist() {
-        uuid = UUID.randomUUID();
-    }
-
+    
     // Standard getters/setters omitted for brevity
 }
 ----

@@ -38,13 +38,11 @@ import java.util.UUID;
 import javax.money.MonetaryAmount;
 import org.hibernate.envers.Audited;
 import org.hibernate.envers.NotAudited;
-import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 
 // tag::entity[]
 @Entity
 @Table
 @Audited
-@Indexed
 public class Participant extends AbstractAuditable<UUID> implements NamedEntity, GithubDataSourceSubject, HasDocuments,
     ProcessEntity, DocusignSigner,
     HasPendingDecisions {

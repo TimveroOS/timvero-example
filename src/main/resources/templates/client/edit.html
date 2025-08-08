@@ -20,7 +20,7 @@
         <th:block
             th:insert="~{/form/components :: date (#{client.individualInfo.birthDate},
                 'individualInfo.dateOfBirth', '')}"
-            th:with="maxDate = ${#dates.format(#dates.createNow())}" />
+            th:with="maxDate = ${#dates.createNow()}" />
         <th:block
             th:insert="~{/form/components :: select(#{client.address.stateOfResidence},
                 'individualInfo.residenceCountry', ${countries})}" />

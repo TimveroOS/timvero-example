@@ -28,12 +28,10 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import org.hibernate.envers.Audited;
-import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 
 @Entity
 @Table
 @Audited
-@Indexed
 public class Application extends AbstractAuditable<UUID> implements NamedEntity {
 
     @Column(nullable = false)
