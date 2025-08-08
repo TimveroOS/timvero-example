@@ -1,0 +1,207 @@
+= Fast Search System
+
+Add search functionality to your entities with minimal configuration.
+
+== What You Need to Know
+
+Fast Search lets users search across all your application entities. It's already enabled and integrated into the UI - you just need to configure which entities are searchable.
+
+== Configuration
+
+=== Properties
+
+Configure Fast Search in `application.properties`:
+
+[source,properties]
+----
+## Quick Search (uses Lucene backend by default)
+hibernate.search.enabled=true
+hibernate.search.backend.directory.root=/index
+----
+
+=== Using Elasticsearch
+
+To use Elasticsearch instead of the default Lucene backend:
+
+[source,properties]
+----
+## Quick Search with Elasticsearch
+hibernate.search.enabled=true
+hibernate.search.backend.type=elasticsearch
+hibernate.search.backend.hosts=localhost:9200
+hibernate.search.backend.protocol=http
+----
+
+== Quick Setup
+
+=== 1. Make Entity Searchable
+
+Add `@Indexed` to your entity and mark searchable fields:
+
+[source,java]
+----
+@Entity
+@Indexed
+public class Client extends AbstractAuditable<UUID> {
+    
+    @FullTextField  // Natural language search
+    private String fullName;
+    
+    @KeywordField   // Exact matches only
+    private String nationalId;
+    
+    @IndexedEmbedded  // Include nested fields
+    private ContactInfo contactInfo;
+}
+----
+
+=== 2. Configure Search Entity
+
+Create a configuration class:
+
+[source,java]
+----
+@Configuration
+@ConditionalOnProperty("hibernate.search.enabled")
+public class ClientSearchConfig {
+
+    @Bean
+    FastSearchEntity<Client> clientSearchEntity() {
+        return new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+    }
+}
+----
+
+That's it! Search is now available in the application UI at `/search`.
+
+== Field Types
+
+**`@FullTextField`** - For names, descriptions, natural language text  
+**`@KeywordField`** - For IDs, codes, statuses, exact matches  
+**`@IndexedEmbedded`** - Include fields from nested objects
+
+== FastSearchEntity Configuration
+
+The `FastSearchEntity` bean controls how your entity appears in search results.
+
+=== Basic Configuration
+
+[source,java]
+----
+@Bean
+FastSearchEntity<Client> clientSearchEntity() {
+    return new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+}
+----
+
+**Parameters:**
+- `Client.class` - The entity class to make searchable
+- `Client::getDisplayedName` - Function that returns the display name for search results
+
+=== Custom Display Names
+
+Control how search results are displayed:
+
+[source,java]
+----
+@Bean
+FastSearchEntity<Client> clientSearchEntity() {
+    return new FastSearchEntity<>(Client.class, client -> {
+        String name = client.getIndividualInfo().getFullName();
+        String id = client.getIndividualInfo().getNationalId();
+        return name + " (" + id + ")";
+    });
+}
+----
+
+=== Layout Templates
+
+Specify custom result templates:
+
+[source,java]
+----
+@Bean
+FastSearchEntity<Client> clientSearchEntity() {
+    FastSearchEntity<Client> entity = new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+    entity.setLayoutTemplateName("client-result");
+    return entity;
+}
+----
+
+This uses `/form/search :: client-result` template for displaying this entity in search results. Default template is "default".
+
+=== Multiple Entities
+
+Configure multiple entities in one config class:
+
+[source,java]
+----
+@Configuration
+@ConditionalOnProperty("hibernate.search.enabled")
+public class SearchConfig {
+
+    @Bean
+    FastSearchEntity<Client> clientSearchEntity() {
+        return new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+    }
+    
+    @Bean
+    FastSearchEntity<Application> applicationSearchEntity() {
+        return new FastSearchEntity<>(Application.class, app -> 
+            "Application #" + app.getId());
+    }
+}
+----
+
+== Entity Labels
+
+Add entity type labels to `messages.properties` for proper display:
+
+[source,properties]
+----
+entity.client=Client
+entity.application=Application
+entity.participant=Participant
+----
+
+== Index Management
+
+Search indexes are created automatically when the application starts.
+
+=== Manual Index Refresh
+
+Use the **Update Indexes** button on the `/control` page to manually refresh search indexes.
+
+=== Index Recreation
+
+If indexes are dropped or corrupted, they will be automatically recreated when the application starts.
+
+== Search Examples
+
+Users can search with:
+
+[source]
+----
+john smith             # Find both terms
+"john smith"           # Exact phrase
+fullName:john          # Search specific field
+john*                  # Wildcard search
+john AND smith         # Boolean operators
+----
+
+== Common Issues
+
+**No search results?**
+1. Check `@Indexed` annotation exists
+2. Verify `FastSearchEntity` bean is configured  
+3. Ensure searchable fields have `@FullTextField` or `@KeywordField`
+
+**Slow search?**
+1. Use `@KeywordField` for exact matches
+2. Only index fields users actually search
+
+---
+
+**Related:** <<getting-started>>, <<form-classes-setup-and-usage>>, <<html-template-integration>>
+
+**Advanced:** https://hibernate.org/search/documentation/

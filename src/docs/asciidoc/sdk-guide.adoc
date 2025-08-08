@@ -50,19 +50,20 @@ This guide is organized into logical parts that build on each other:
 [start=4]
 . **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
+. **<<fast-search-system>>** - Unified search across all entities with Hibernate Search and Lucene
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
 
 === PART III: BUSINESS LOGIC
-[start=9]
+[start=10]
 . **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
 . **<<offer-engine-credit-products>>** - Generate personalized loan offers from credit products and participant data
 
 === PART IV: FINANCIAL OPERATIONS
-[start=12]
+[start=14]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
@@ -80,6 +81,8 @@ include::_data-model.adoc[leveloffset=+1]
 include::_forms.adoc[leveloffset=+1]
 
 include::_templates.adoc[leveloffset=+1]
+
+include::_fast-search.adoc[leveloffset=+1]
 
 include::_documents.adoc[leveloffset=+1]
 
