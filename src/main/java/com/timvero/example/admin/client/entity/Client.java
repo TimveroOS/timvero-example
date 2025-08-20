@@ -11,7 +11,6 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.Table;
 import java.util.Set;
-import java.util.UUID;
 import org.hibernate.envers.Audited;
 import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 import org.hibernate.search.mapper.pojo.mapping.definition.annotation.IndexedEmbedded;
@@ -20,7 +19,7 @@ import org.hibernate.search.mapper.pojo.mapping.definition.annotation.IndexedEmb
 @Table
 @Audited
 @Indexed
-public class Client extends AbstractAuditable<UUID> implements NamedEntity, Notifiable {
+public class Client extends AbstractAuditable implements NamedEntity, Notifiable {
 
     @Embedded
     @IndexedEmbedded

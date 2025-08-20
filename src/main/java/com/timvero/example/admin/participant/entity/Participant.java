@@ -34,7 +34,6 @@ import jakarta.persistence.Transient;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.UUID;
 import javax.money.MonetaryAmount;
 import org.hibernate.envers.Audited;
 import org.hibernate.envers.NotAudited;
@@ -43,7 +42,7 @@ import org.hibernate.envers.NotAudited;
 @Entity
 @Table
 @Audited
-public class Participant extends AbstractAuditable<UUID> implements NamedEntity, GithubDataSourceSubject, HasDocuments,
+public class Participant extends AbstractAuditable implements NamedEntity, GithubDataSourceSubject, HasDocuments,
     ProcessEntity, DocusignSigner,
     HasPendingDecisions {
 
