@@ -2,9 +2,9 @@ package com.timvero.example.portal.application;
 
 import static com.timvero.example.portal.InternalApiSecurityConfig.BASIC_AUTH;
 
-import com.timvero.example.admin.application.entity.ApplicationStatus;
 import com.timvero.example.portal.application.form.CreateApplicationRequest;
 import com.timvero.example.portal.application.form.CreateApplicationResponse;
+import com.timvero.ground.document.exception.SignatureException;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -74,7 +74,7 @@ public class ApplicationPortalController {
         @ApiResponse(
             responseCode = "200",
             description = "Application status retrieved successfully",
-            content = @Content(schema = @Schema(implementation = ApplicationStatus.class))
+            content = @Content(schema = @Schema(implementation = PortalApplicationStatus.class))
         ),
         @ApiResponse(
             responseCode = "404",
@@ -105,7 +105,7 @@ public class ApplicationPortalController {
         @ApiResponse(
             responseCode = "200",
             description = "Application status retrieved successfully",
-            content = @Content(schema = @Schema(implementation = ApplicationStatus.class))
+            content = @Content(schema = @Schema(implementation = PortalApplicationStatus.class))
         ),
         @ApiResponse(
             responseCode = "404",
@@ -123,8 +123,14 @@ public class ApplicationPortalController {
             content = @Content()
         )
     })
-    public ResponseEntity<String> getApplicationSignatureUrl(@RequestParam UUID applicationId, @RequestParam String returnUrl)
-        throws IOException {
+    public ResponseEntity<String> getApplicationSignatureUrl(
+        @RequestParam
+        @Parameter(description = "The application id", example = "45b633aa-c59c-4ae0-9623-06a8379df8b2")
+        UUID applicationId,
+        @RequestParam
+        @Parameter(description = "URL where user will be redirected after completing document signature", example = "https://example.com/signature/complete")
+        String returnUrl)
+        throws IOException, SignatureException {
         String signatureUrl = applicationService.getSignatureUrl(applicationId, returnUrl);
         return ResponseEntity.ok(signatureUrl);
     }

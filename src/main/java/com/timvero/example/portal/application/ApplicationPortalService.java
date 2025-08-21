@@ -12,6 +12,7 @@ import com.timvero.example.portal.application.form.CreateApplicationMapper;
 import com.timvero.example.portal.application.form.CreateApplicationRequest;
 import com.timvero.example.portal.client.ClientService;
 import com.timvero.example.portal.exception.PreconditionFailedException;
+import com.timvero.ground.document.exception.SignatureException;
 import com.timvero.ground.document.signable.SignableDocument;
 import com.timvero.ground.document.signable.SignableDocumentService;
 import com.timvero.ground.document.signable.SignableDocumentType;
@@ -55,7 +56,7 @@ public class ApplicationPortalService {
     }
 
     @Transactional
-    public String getSignatureUrl(UUID applicationId, String returnUrl) throws IOException {
+    public String getSignatureUrl(UUID applicationId, String returnUrl) throws IOException, SignatureException {
         Application application = applicationRepository.findById(applicationId)
             .orElseThrow(() -> new NotFoundException("Application not found with ID: " + applicationId));
 
