@@ -32,7 +32,7 @@ public class DocusignWebhookController {
                 try {
                     docusignSignatureService.signDocumentByEnvelopeId(envelopeId);
                 } catch (SignatureException e) {
-                 // ignore
+                    // Ignore - webhook may arrive for signatures not tracked in our system
                 }
             }
         }
