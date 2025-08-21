@@ -1,0 +1,830 @@
+= Payment Transactions Framework
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The Payment Transactions Framework connects real-world payments to credit operations. When someone makes a payment, it creates a transaction record, processes it through a payment gateway, and then creates the corresponding credit operation. This ensures every payment operation can be traced back to an actual payment.
+
+== The Basic Concept
+
+Think of payment transactions as a receipt system:
+
+1. **Customer pays** → Create transaction record (like writing a receipt)
+2. **Process payment** → Send to bank/payment processor 
+3. **Payment succeeds** → Create credit operation (update the loan balance)
+4. **Keep records** → Maintain complete audit trail
+
+This two-step process (transaction → operation) ensures every balance change has a real-world payment behind it.
+
+== Architecture Overview
+
+The system has three main layers that work together:
+
+=== Transaction Layer
+**What it does:** Records and processes real payments
+```
+BorrowerTransaction → PaymentGateway → Bank/Card Processor
+```
+
+=== Bridge Layer  
+**What it does:** Converts successful payments into credit operations
+```
+BorrowerTransactionService.handle() → Creates CreditOperation
+```
+
+=== Credit Layer
+**What it does:** Updates loan balances and calculates interest
+```
+ExampleCreditPayment → Credit Calculation → Updated Balances
+```
+
+=== Core Components
+
+The payment transaction system includes:
+
+* **`PaymentTransaction`** - Base record for all payment attempts
+* **`BorrowerTransaction`** - Example project's payment transaction type
+* **`PaymentGateway`** - Interface for connecting to payment processors
+* **`PaymentMethod`** - How customer wants to pay (bank account, card, etc.)
+* **`BorrowerTransactionService`** - Converts successful payments to credit operations
+
+== Real-World Basis Principle
+
+All operations in the credit system must have verifiable real-world foundations:
+
+=== Payment Operations Foundation
+**Payment operations** must originate from actual payment transactions:
+```
+Real Payment → PaymentTransaction → Success Handler → CreditOperation → Balance Update
+```
+
+=== Other Operations Foundations
+While payment operations require transactions, other operations have their own real-world basis:
+
+* **Accrual Operations** → Contract terms and offer conditions (interest rates, payment schedules)
+* **Past Due Operations** → Payment schedule agreements (contractual due dates)
+* **Charge Operations** → Should be based on disbursements or outgoing transactions
+
+[IMPORTANT]
+====
+The example project may have a flaw with charge operations - they should typically be tied to disbursement transactions, outgoing transactions, or regulatory events rather than being manually created without clear business justification.
+====
+
+This principle ensures:
+* **Regulatory Compliance** - Every financial change can be traced to a real event
+* **Audit Trail Integrity** - Complete documentation of why changes occurred
+* **Business Logic Accuracy** - Operations reflect actual business events
+* **Fraud Prevention** - Prevents unauthorized or fictitious transactions
+
+== Transaction Entity Structure
+
+Every payment attempt creates a `PaymentTransaction` record that tracks the payment from start to finish.
+
+=== BorrowerTransaction Example
+
+The example project uses `BorrowerTransaction` for loan payments:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("BORROWER")
+public class BorrowerTransaction extends PaymentTransaction {
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    private ExampleCredit credit;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @NotAudited
+    private CreditOperation operation;
+
+    public BorrowerTransaction(TransactionType type, MonetaryAmount amount, 
+                              PaymentMethod paymentMethod, ExampleCredit credit) {
+        super(type, amount);
+        this.credit = credit;
+        setPaymentMethod(paymentMethod);
+    }
+
+    public ExampleCredit getCredit() { return credit; }
+    public CreditOperation getOperation() { return operation; }
+    public void setOperation(CreditOperation operation) { this.operation = operation; }
+}
+----
+
+Key fields:
+* **`credit`** - Which loan this payment is for
+* **`operation`** - The credit operation created when payment succeeds
+* **`amount`** - How much money (uses `MonetaryAmount` for currency handling)
+* **`type`** - `INCOMING` (customer pays) or `OUTGOING` (refund/disbursement)
+* **`status`** - Current state of the payment
+* **`paymentMethod`** - How the customer is paying (bank account, card, etc.)
+
+=== Transaction Status Lifecycle
+
+Transactions go through these states:
+
+```
+DRAFT → READY_FOR_EXECUTION → IN_PROGRESS → SUCCEED
+  ↓              ↓                 ↓           ↓
+CANCELLED    CANCELLED         FAILED    (Create Operation)
+                                 ↓
+                            UNAVAILABLE
+                                 ↓
+                          (Manual Review)
+```
+
+=== Understanding Transaction Status
+
+The `TransactionStatus` enum has three important properties:
+
+[source,java]
+----
+public enum TransactionStatus {
+    SUCCEED(800, true, true),    // successful=true, complete=true
+    FAILED(700, false, true),    // successful=false, complete=true  
+    IN_PROGRESS(400, false, false); // successful=false, complete=false
+    
+    private boolean successful; // Did the payment work?
+    private boolean complete;   // Is processing finished?
+}
+----
+
+**Status meanings:**
+* **`DRAFT`** - Transaction created, not yet sent to payment processor
+* **`IN_PROGRESS`** - Sent to payment processor, waiting for response
+* **`SUCCEED`** - Payment processor approved the payment
+* **`FAILED`** - Payment processor declined the payment
+* **`UNAVAILABLE`** - System error or payment processor is down
+* **`CHARGEBACK`** - Bank reversed a previously successful payment
+
+=== Transaction Processing Flow
+
+The complete transaction processing follows this pattern:
+
+1. **Transaction Creation**: `BorrowerTransaction` entity created with payment details
+2. **Gateway Submission**: `PaymentTransactionService` submits to appropriate gateway
+3. **Async Processing**: Transaction processed asynchronously to avoid blocking
+4. **Status Updates**: Transaction status updated based on gateway response
+5. **Success Handling**: `BorrowerTransactionService.handle()` creates credit operation
+6. **Error Handling**: Failed transactions trigger appropriate error responses
+
+== Payment Gateways
+
+Payment gateways connect your system to banks and payment processors. Think of them as translators that convert your payment requests into the specific format each processor expects.
+
+=== The Gateway Interface
+
+All payment gateways implement the same interface:
+
+[source,java]
+----
+public interface PaymentGateway {
+    String getMethodType();  // "ACH", "CARD", etc.
+    String getName();        // "Stripe", "Bank_ACH", etc.
+    boolean verify(PaymentMethod method) throws IOException;
+    TransactionResult proceedIncoming(String orderId, PaymentMethod method, MonetaryAmount amount);
+    TransactionResult proceedOutgoing(String orderId, PaymentMethod method, MonetaryAmount amount);
+}
+----
+
+**What each method does:**
+* **`verify()`** - Validate payment method before processing (called by `PaymentTransactionService.verify()`)
+* **`proceedIncoming()`** - Process customer payments (money coming in)
+* **`proceedOutgoing()`** - Process refunds and disbursements (money going out)
+
+=== Gateway Implementation Patterns
+
+Payment gateways can be implemented following these patterns:
+
+===== Real-Time API Gateway Pattern
+
+For immediate credit/debit card processing:
+
+```java
+@Service
+public class CardPaymentGateway implements PaymentGateway {
+    
+    public TransactionResult proceedIncoming(String orderId, PaymentMethod method, MonetaryAmount amount) {
+        // 1. Extract payment method details (tokenized)
+        // 2. Build API request with transaction data
+        // 3. Submit to payment processor via HTTPS
+        // 4. Parse response and map to TransactionResult
+        // 5. Return standardized result with gateway reference
+    }
+}
+```
+
+Key characteristics:
+* **Immediate Processing** - Real-time API calls with instant responses
+* **Token-Based Security** - Uses tokenized payment methods for PCI compliance
+* **Structured Response** - JSON/XML responses parsed into standard result format
+* **Error Detection** - Handles duplicate transactions and various error conditions
+
+===== SOAP Web Service Gateway Pattern
+
+For traditional banking integration:
+
+```java
+@Service
+public class ACHGateway implements PaymentGateway {
+    
+    public TransactionResult proceedOutgoing(String orderId, PaymentMethod method, MonetaryAmount amount) {
+        // 1. Build SOAP command with ACH details
+        // 2. Add merchant credentials and security headers
+        // 3. Submit via SOAP web service
+        // 4. Handle asynchronous ACH processing status
+        // 5. Return result with settlement timing information
+    }
+}
+```
+
+Key characteristics:
+* **SOAP Integration** - XML-based web service communication
+* **Asynchronous Processing** - ACH transactions require settlement time
+* **Comprehensive Logging** - Full request/response logging for audit
+* **Credential Management** - Secure handling of merchant credentials
+
+===== Batch File Gateway Pattern
+
+For bulk ACH processing via NACHA files:
+
+```java
+@Service
+public class NACHABatchGateway implements PaymentGateway {
+    
+    @Scheduled(fixedRate = 3600000) // Hourly batch processing
+    public void processBatch() {
+        // 1. Find transactions ready for batch processing
+        // 2. Create NACHA-compliant file format
+        // 3. Add each transaction to appropriate batch
+        // 4. Generate file and transmit via SFTP
+        // 5. Update transaction statuses
+    }
+}
+```
+
+Key characteristics:
+* **Batch Processing** - Multiple transactions in single file
+* **File-Based Transport** - SFTP or similar file delivery
+* **NACHA Compliance** - Proper ACH file format generation
+* **Delayed Settlement** - Transactions marked successful when file sent, not when settled
+
+=== Gateway Configuration
+
+Different gateways can be configured for different payment types:
+
+```java
+@Service
+public class ACHGateway implements PaymentGateway {
+    public String getMethodType() { return "ACH"; }
+    public String getName() { return "Bank_ACH"; }
+}
+
+@Service  
+public class CardGateway implements PaymentGateway {
+    public String getMethodType() { return "CARD"; }
+    public String getName() { return "Stripe"; }
+}
+```
+
+The system selects the appropriate gateway based on the payment method type.
+
+== Payment Methods
+
+Payment methods represent how customers want to pay - bank account, credit card, etc. Each payment method stores the necessary information to process payments through the appropriate gateway.
+
+=== Example: LiquidityClientPaymentMethod
+
+The example project includes a simple payment method for testing:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue(LiquidityClientPaymentMethod.TYPE)
+public class LiquidityClientPaymentMethod extends PaymentMethod {
+
+    public static final String TYPE = LiquidityPaymentGateway.GATEWAY_TYPE;
+
+    @Column(name = "processed_date")
+    private LocalDate processedDate;
+
+    @Embedded
+    private MonetaryAmount amount;
+
+    @Column(name = "name")
+    private String ownerName;
+
+    public LiquidityClientPaymentMethod(LocalDate processedDate, MonetaryAmount amount, 
+                                       TransactionType transactionType, String ownerName) {
+        super(TYPE);
+        this.processedDate = processedDate;
+        this.amount = amount;
+        this.transactionType = transactionType;
+        this.ownerName = ownerName;
+    }
+
+    public LocalDate getProcessedDate() { return processedDate; }
+    public MonetaryAmount getAmount() { return amount; }
+    public String getOwnerName() { return ownerName; }
+}
+----
+
+This payment method:
+* **Stores an amount** - For testing, it has a fixed amount
+* **Has a processed date** - When the "payment" was processed
+* **Works with gateways** - Can be used by payment gateways that support this type
+
+=== Payment Method Types
+
+Different payment method types serve different use cases:
+
+[cols="1,2,2,2"]
+|===
+|Type |Use Case |Processing Pattern |Security Model
+
+|**ACH**
+|Bank account transfers
+|Batch or real-time
+|Account number encryption
+
+|**Debit/Credit Cards**
+|Card payments
+|Real-time API
+|PCI tokenization
+
+|**Digital Wallets**
+|Mobile payments
+|Real-time API
+|OAuth tokens
+
+|**Wire Transfers**
+|Large amounts
+|Manual processing
+|Bank verification
+|===
+
+=== Payment Method Implementation Patterns
+
+When implementing new payment method types:
+
+==== ACH Payment Method Pattern
+
+```java
+@Entity
+@DiscriminatorValue("ACH")
+public class ACHPaymentMethod extends PaymentMethod {
+    
+    // Encrypted bank account details
+    private String ownerName;
+    private String accountNumber;    // Encrypted
+    private String routingNumber;
+    private AccountType accountType; // CHECKING, SAVINGS
+    
+    // Validation and security methods
+    public boolean isValid() {
+        return validateRoutingNumber() && validateAccountNumber();
+    }
+}
+```
+
+Key features:
+* **Bank Account Details** - Routing and account numbers for ACH processing
+* **Account Type Classification** - Checking vs savings account handling
+* **Validation Logic** - Routing number format and account number validation
+* **Encryption** - Sensitive account data encrypted at rest
+
+==== Card Payment Method Pattern
+
+```java
+@Entity
+@DiscriminatorValue("CARD")
+public class CardPaymentMethod extends PaymentMethod {
+    
+    // Tokenized card data - no sensitive information stored
+    private String token;           // From payment processor
+    private String lastFourDigits;  // For display only
+    private String expiryMonth;
+    private String expiryYear;
+    
+    public boolean isExpired() {
+        return LocalDate.now().isAfter(getExpiryDate());
+    }
+}
+```
+
+Key characteristics:
+* **Tokenization** - Card numbers replaced with secure tokens from payment processor
+* **PCI Compliance** - No sensitive card data stored in application database
+* **Display Information** - Only last four digits stored for user interface
+* **Expiry Validation** - Built-in expiration checking
+
+=== Payment Method Security
+
+The framework implements comprehensive security patterns:
+
+==== Data Protection
+```java
+// Sensitive data encrypted at rest
+@Convert(converter = EncryptedStringConverter.class)
+private String accountNumber;
+
+// Tokens from external processors
+private String processorToken;
+
+// Display-only information
+private String maskedAccountNumber; // "****1234"
+```
+
+==== Validation and Verification
+```java
+public interface PaymentMethodValidator {
+    boolean validate(PaymentMethod method);
+    ValidationResult verify(PaymentMethod method) throws IOException;
+}
+
+// Gateway-specific validation
+@Override
+public boolean verify(PaymentMethod method) throws IOException {
+    // Real-time validation with payment processor
+    return gateway.validatePaymentMethod(method);
+}
+```
+
+==== Access Control
+```java
+@PreAuthorize("hasPermission(#method, 'USE')")
+public TransactionResult processPayment(PaymentMethod method, MonetaryAmount amount) {
+    // Role-based access control for payment method usage
+}
+```
+
+== How Transactions Become Operations
+
+When a payment succeeds, the system needs to update the loan balance. This happens in `BorrowerTransactionService.handle()`.
+
+=== The Conversion Process
+
+Here's what happens when a payment succeeds:
+
+[source,java]
+----
+@Override
+public void handle(PaymentTransaction t) {
+    BorrowerTransaction transaction = (BorrowerTransaction) t;
+    
+    if (transaction.getStatus() == TransactionStatus.SUCCEED) {
+        ExampleCredit credit = transaction.getCredit();
+        LocalDate date = getProcessedDate(transaction);
+        
+        // Create the right type of operation
+        CreditOperation operation = switch (transaction.getType()) {
+            case INCOMING -> handleIncoming(credit, transaction, date);  // Customer payment
+            case OUTGOING -> handleOutgoing(credit, transaction, date);  // Refund/disbursement
+        };
+        
+        // Link them together for audit trail
+        transaction.setOperation(operation);
+    }
+}
+----
+
+=== Customer Payments (INCOMING)
+
+When a customer makes a payment:
+
+```java
+private CreditPayment handleIncoming(ExampleCredit credit, BorrowerTransaction transaction, LocalDate date) {
+    // Create payment operation
+    CreditPayment payment = new ExampleCreditPayment(date, transaction.getAmount());
+    
+    // Register with credit system
+    return paymentService.registerPayment(credit, payment);
+}
+```
+
+This creates an `ExampleCreditPayment` operation that reduces the loan balance.
+
+=== Refunds and Disbursements (OUTGOING)
+
+When money goes to the customer:
+
+```java
+private ChargeOperation handleOutgoing(ExampleCredit credit, BorrowerTransaction transaction, LocalDate date) {
+    // Create charge operation (increases balance)
+    return chargeOperationService.createOperation(credit.getId(), date, transaction.getAmount());
+}
+```
+
+This creates a `ChargeOperation` that increases the loan balance (for disbursements) or reverses payments (for refunds).
+
+=== The Audit Trail
+
+The system maintains complete traceability:
+
+1. **Transaction Record** - Shows the real-world payment attempt
+2. **Gateway Response** - Stored in `transaction.trace` field  
+3. **Operation Link** - `transaction.operation` points to the credit operation
+4. **Credit Update** - Operation appears in credit's operation list
+
+This means you can always trace a balance change back to the original payment.
+
+== Processing Payments Asynchronously
+
+Payment processing happens in the background so users don't have to wait. When someone submits a payment, the system:
+
+1. **Creates transaction record** - Saves it immediately
+2. **Returns to user** - Shows "processing" message  
+3. **Processes in background** - Calls payment gateway
+4. **Updates status** - Success or failure
+5. **Creates operation** - If payment succeeded
+
+=== Why Async Processing?
+
+* **Faster user experience** - Don't wait for slow payment processors
+* **Better error handling** - Can retry failed payments
+* **Scalability** - Handle many payments at once
+
+=== Error Handling
+
+When processing payments, three things can happen:
+
+**Payment Declined**
+```java
+// Gateway says "insufficient funds" or "invalid card"
+transaction.setStatus(TransactionStatus.FAILED);
+transaction.addTrace("Gateway declined: " + result.getMessage());
+```
+
+**System Error**  
+```java
+// Code bug or unexpected error
+transaction.setStatus(TransactionStatus.UNAVAILABLE);
+transaction.addTrace("System error: " + e.getMessage());
+```
+
+**Gateway Down**
+```java  
+// Payment processor is unavailable
+transaction.setStatus(TransactionStatus.UNAVAILABLE);
+transaction.addTrace("Gateway unavailable: " + e.getMessage());
+// Can retry later
+```
+
+=== Monitoring
+
+Since processing happens in background, you need to monitor:
+* **Failed transactions** - Show in admin dashboard for investigation
+* **Stuck transactions** - Alert if too many stay "IN_PROGRESS"
+* **Gateway errors** - Monitor payment processor uptime
+
+== Transaction Types and Patterns
+
+Different transaction types serve different business purposes and follow specific processing patterns.
+
+=== Incoming Payment Transactions
+
+Borrower payments to reduce credit balances:
+
+```java
+BorrowerTransaction payment = new BorrowerTransaction(
+    TransactionType.INCOMING,
+    credit,
+    paymentMethod,
+    paymentAmount,
+    "Borrower payment"
+);
+```
+
+Processing flow:
+1. **User Initiates** - Borrower submits payment through portal
+2. **Transaction Created** - `BorrowerTransaction` entity persisted
+3. **Gateway Processing** - Payment method charged via appropriate gateway
+4. **Success Handling** - `ExampleCreditPayment` operation created
+5. **Balance Update** - Credit calculation applies payment to debt accounts
+
+=== Outgoing Payment Transactions
+
+Disbursements or refunds to borrowers:
+
+```java
+BorrowerTransaction disbursement = new BorrowerTransaction(
+    TransactionType.OUTGOING,
+    credit,
+    paymentMethod,
+    disbursementAmount,
+    "Loan disbursement"
+);
+```
+
+Processing flow:
+1. **System Initiates** - Loan approval triggers disbursement
+2. **Transaction Created** - Outgoing transaction entity
+3. **Gateway Processing** - Funds sent to borrower account
+4. **Success Handling** - Disbursement operation created
+5. **Balance Update** - Principal balance increased
+
+=== Chargeback Transactions
+
+Handling payment reversals:
+
+```java
+// Original payment is reversed
+originalTransaction.setStatus(TransactionStatus.CHARGEBACK);
+
+// Chargeback operation created to reverse the payment
+ChargebackOperation chargeback = new ChargebackOperation(
+    originalPayment.getAmount().negate(),
+    "Chargeback: " + originalTransaction.getOrderId()
+);
+```
+
+=== Retry Patterns
+
+Failed transactions may be retried based on failure type:
+
+```java
+if (canRetry(transaction, result)) {
+    scheduleRetry(transaction, calculateBackoffDelay(transaction.getRetryCount()));
+} else {
+    markPermanentFailure(transaction, result);
+}
+```
+
+Retry logic considers:
+* **Failure Type** - Network errors retryable, declines usually not
+* **Retry Count** - Exponential backoff with maximum attempts
+* **Time Limits** - Don't retry indefinitely old transactions
+
+== Testing Payment Transactions
+
+Testing payment transactions requires careful consideration of external dependencies and asynchronous processing.
+
+=== Test Gateway Implementation
+
+For testing, implement a controllable test gateway:
+
+```java
+@Service
+public class TestPaymentGateway implements PaymentGateway {
+    
+    @Override
+    public TransactionResult proceedIncoming(String orderId, PaymentMethod method, MonetaryAmount amount) {
+        // Simulate different scenarios based on test data
+        if (amount.getNumber().doubleValue() == 999.99) {
+            return new TransactionResult(orderId, amount, Status.FAIL, false, "Test decline");
+        }
+        
+        if ("ERROR_TOKEN".equals(method.getToken())) {
+            throw new RuntimeException("Test gateway error");
+        }
+        
+        return new TransactionResult(orderId, amount, Status.SUCCESS, false, "Test success");
+    }
+}
+```
+
+=== Integration Testing Patterns
+
+Test the complete transaction-to-operation flow:
+
+```java
+@Test
+@Transactional
+public void testSuccessfulPayment() {
+    // Setup: Create credit and payment method
+    UUID creditId = createTestCredit();
+    PaymentMethod paymentMethod = createTestPaymentMethod();
+    
+    // Execute: Process payment transaction
+    BorrowerTransaction transaction = new BorrowerTransaction(
+        TransactionType.INCOMING, credit, paymentMethod, 
+        MonetaryAmount.of(500, "USD"), "Test payment"
+    );
+    
+    paymentTransactionService.processTransaction(transaction.getId());
+    
+    // Wait for async processing
+    await().atMost(5, SECONDS).until(() -> 
+        transactionRepository.findById(transaction.getId()).getStatus() == TransactionStatus.SUCCEED
+    );
+    
+    // Verify: Check operation was created and credit updated
+    ExampleCredit updatedCredit = creditRepository.findById(creditId);
+    assertThat(updatedCredit.getOperations(ExampleCreditPayment.class)).hasSize(1);
+    
+    ExampleCreditPayment payment = updatedCredit.getOperations(ExampleCreditPayment.class).iterator().next();
+    assertThat(payment.getAmount()).isEqualTo(MonetaryAmount.of(500, "USD"));
+    assertThat(payment.getTransaction()).isEqualTo(transaction);
+}
+```
+
+=== Mocking External Dependencies
+
+For unit tests, mock gateway dependencies:
+
+```java
+@MockBean
+PaymentGateway mockGateway;
+
+@Test
+public void testGatewayFailure() {
+    // Setup: Mock gateway to return failure
+    when(mockGateway.proceedDebit(any(), any(), any()))
+        .thenReturn(new TransactionResult("123", amount, Status.FAIL, false, "Declined"));
+    
+    // Execute: Process transaction
+    paymentTransactionService.processTransaction(transactionId);
+    
+    // Verify: Transaction marked as failed
+    BorrowerTransaction transaction = transactionRepository.findById(transactionId);
+    assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.FAILED);
+    
+    // Verify: No operation created
+    assertThat(credit.getOperations()).isEmpty();
+}
+```
+
+== Security and Compliance
+
+Payment transaction processing requires adherence to strict security and compliance standards.
+
+=== PCI DSS Compliance
+
+For card payments:
+
+* **No Card Storage** - Card numbers never stored in application database
+* **Tokenization** - Sensitive data replaced with non-sensitive tokens
+* **Secure Transmission** - All payment data encrypted in transit
+* **Access Controls** - Role-based access to payment functionality
+
+=== Bank Security Standards
+
+For ACH payments:
+
+* **Encryption at Rest** - Bank account data encrypted in database
+* **Secure APIs** - TLS encryption for all gateway communication
+* **Credential Management** - Secure storage of gateway credentials
+* **Audit Logging** - Complete transaction audit trails
+
+=== Regulatory Compliance
+
+Financial regulations require:
+
+* **Transaction Traceability** - Complete audit trail from user action to balance change
+* **Data Retention** - Transaction records maintained for required periods
+* **Reporting** - Transaction data available for regulatory reporting
+* **Error Handling** - Proper handling and reporting of failed transactions
+
+== Best Practices
+
+=== Transaction Design Principles
+
+* **Idempotency** - Transactions should produce same result when retried
+* **Atomicity** - Each transaction represents a single business event
+* **Traceability** - Complete audit trail from initiation to completion
+* **Error Recovery** - Graceful handling of all failure scenarios
+
+=== Gateway Integration Best Practices
+
+* **Timeout Handling** - Appropriate timeouts for gateway calls
+* **Retry Logic** - Intelligent retry strategies for transient failures
+* **Rate Limiting** - Respect gateway rate limits and quotas
+* **Monitoring** - Comprehensive monitoring of gateway performance
+
+=== Security Best Practices
+
+* **Token Management** - Secure handling of payment method tokens
+* **Credential Security** - Proper storage and rotation of gateway credentials
+* **Data Minimization** - Store only necessary payment data
+* **Audit Logging** - Complete logging of all payment activities
+
+=== Performance Optimization
+
+* **Async Processing** - Non-blocking transaction processing
+* **Connection Pooling** - Efficient gateway connection management
+* **Caching** - Cache gateway configuration and metadata
+* **Batch Processing** - Group transactions where possible (NACHA)
+
+== Summary
+
+The Payment Transactions Framework ensures every credit operation has a real-world basis:
+
+**The Flow:**
+```
+Customer Payment → BorrowerTransaction → PaymentGateway → Bank/Processor
+     ↓
+Payment Succeeds → BorrowerTransactionService.handle() → ExampleCreditPayment → Updated Loan Balance
+```
+
+**Key Benefits:**
+* **Complete audit trail** - Every balance change traces to a real payment
+* **Async processing** - Fast user experience, reliable background processing  
+* **Multiple gateways** - Support different payment processors
+* **Error handling** - Graceful handling of declined payments and system errors
+* **Regulatory compliance** - Full documentation for audits
+
+**For Developers:**
+* Extend `PaymentTransaction` for your transaction types
+* Implement `PaymentGateway` for new payment processors  
+* Use `PaymentTransactionHandler` to convert transactions to operations
+* Always maintain the transaction → operation link for audit trails
+
+This foundation supports any type of payment processing while ensuring complete traceability and regulatory compliance.

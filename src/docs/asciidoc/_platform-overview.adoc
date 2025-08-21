@@ -1,0 +1,133 @@
+= Platform Overview
+
+Build lending applications fast with pre-built components.
+
+== What You Get
+
+✅ **Forms** - Collect customer data with built-in validation  
+✅ **Database** - Automatic setup for loan data  
+✅ **Payments** - Connect to banks and card processors  
+✅ **UI Components** - Works on desktop and mobile  
+✅ **Business Rules** - Automate loan decisions  
+
+## What You Build
+
+🎯 **Your loan products** (personal loans, mortgages, etc.)  
+🎯 **Your approval rules** (credit scores, income requirements, etc.)  
+🎯 **Your customer experience** (application flow, portal design, etc.)
+
+== Three Parts
+
+### 🏗️ Basic - Foundation
+Forms, database, templates, documents  
+*Used by everything*
+
+### 📝 Origination - New Loans  
+Applications, customers, approvals  
+*Getting loans started*
+
+### 💰 Servicing - Active Loans
+Payments, interest, account management  
+*Day-to-day loan operations*
+
+== How It Works
+
+```
+Basic (foundation) → Origination (new loans) → Servicing (active loans)
+```
+
+**Example:** Personal loan process
+1. Customer applies → forms, documents *(Basic + Origination)*
+2. Loan approved → credit check, terms *(Origination)*  
+3. Loan created → account setup *(Origination → Servicing)*
+4. Customer pays → balance updates *(Servicing + Basic)*
+
+== Key Platform Features
+
+The platform provides several key features that make building lending applications easier:
+
+=== 1. Consistent Patterns
+
+Everything follows the same pattern, so once you learn one part, you understand the whole platform:
+
+* **Entities** - Store your business data (customers, loans, payments)
+* **Forms** - Collect information from users with built-in validation
+* **Controllers** - Handle user actions like creating or editing records
+* **Templates** - Display information to users in web pages
+
+**Example:** Whether you're working with customers, loan applications, or payments, they all follow the same pattern.
+
+=== 2. Automatic Business Rules
+
+The platform can automatically handle business logic for you:
+
+* When a loan application is approved → automatically create the loan account
+* When a payment is received → automatically update the loan balance
+* When a payment is late → automatically calculate late fees
+* When a loan is paid off → automatically close the account
+
+**Example:** You define the rule "charge a $25 late fee if payment is 10 days late" and the platform handles it automatically.
+
+=== 3. Complete Audit Trail
+
+Everything is tracked automatically for compliance and troubleshooting:
+
+* Who made each change and when
+* What the data looked like before and after changes
+* Why each change happened (payment received, fee charged, etc.)
+* Complete history of every loan account
+
+**Example:** You can see that on March 15th, John Smith made a $500 payment, which reduced his loan balance from $5,000 to $4,500.
+
+== What You Need to Know
+
+To get started with the platform, you need to understand a few key concepts:
+
+=== 1. Everything Builds on Basic
+
+No matter what you're building, you'll always use Basic components:
+* Every application needs forms to collect data
+* Every application needs a database to store information  
+* Every application needs templates to show information to users
+
+**Start here:** Learn the Basic components first, then move to Origination or Servicing.
+
+=== 2. Choose Your Focus
+
+Decide what type of application you're building:
+
+**Building a loan application system?** → Focus on Origination
+* Customer registration and applications
+* Credit scoring and risk assessment
+* Loan approval workflows
+
+**Building a loan management system?** → Focus on Servicing  
+* Payment processing and account management
+* Interest calculations and late fees
+* Customer account portals
+
+**Building both?** → Start with Origination, then add Servicing
+
+=== 3. The Platform Does the Hard Work
+
+You don't need to build everything from scratch:
+* Database setup is automatic
+* Form validation is built-in
+* Payment processing is pre-built
+* Interest calculations are handled for you
+* Audit trails are automatic
+
+**Focus on:** Your business rules, your loan products, and your customer experience.
+
+== Next Steps
+
+Now that you understand the platform basics:
+
+1. **Start with Getting Started** - Set up your first application and see how it works
+2. **Learn the Basic Components** - Master forms, database, and templates (you'll use these everywhere)
+3. **Pick your focus:**
+   - **For loan applications:** Learn about customers, applications, and risk assessment
+   - **For loan management:** Learn about credits, payments, and operations
+4. **Build your application** - Start simple and add features as you learn
+
+The platform handles the complex technical details so you can focus on your business logic and customer experience.

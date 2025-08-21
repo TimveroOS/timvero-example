@@ -26,15 +26,12 @@ import jakarta.persistence.OneToOne;
 import jakarta.persistence.Table;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.UUID;
 import org.hibernate.envers.Audited;
-import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 
 @Entity
 @Table
 @Audited
-@Indexed
-public class Application extends AbstractAuditable<UUID> implements NamedEntity {
+public class Application extends AbstractAuditable implements NamedEntity {
 
     @Column(nullable = false)
     @Enumerated(STRING)

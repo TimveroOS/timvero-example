@@ -1,0 +1,985 @@
+= Credit Operations Framework
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The Credit Operations Framework provides a powerful, extensible system for managing financial operations throughout the credit lifecycle. This framework handles everything from loan disbursements and payments to interest accruals and account closures, with full audit trails and automated processing capabilities.
+
+[NOTE]
+====
+The `example` project demonstrates one possible implementation of credit operations. Real-world implementations may differ significantly based on business requirements, regulatory needs, and the types of financial products being offered.
+====
+
+== Operations Architecture Overview
+
+The operations framework is built on a flexible, event-driven architecture that separates operation definitions from their processing logic, enabling customization for various lending products and business models.
+
+=== Core Components
+
+The loan servicing module (`com.timvero.servicing`) provides the foundation:
+
+* **`CreditOperation`** - Base entity for all credit operations
+* **`CreditOperationHandler<O>`** - Interface for operation processing logic
+* **`Snapshot`** - Point-in-time credit state representation
+* **`AccrualEngine`** - Interface for time-based calculations
+* **`PreCalculateSynchronizer`** - Interface for operation synchronization
+* **`CreditCalculationService`** - Core calculation engine that processes operations
+
+== Operation Processing Flow
+
+The credit calculation system processes operations through a sophisticated pipeline that ensures correct chronological execution and state management.
+
+=== The Calculation Pipeline
+
+When `CreditCalculationService.calculate()` is called, the system follows this flow:
+
+1. **Synchronization Phase**: `PreCalculateSynchronizer` implementations (like `AccrualOperationService`) ensure all necessary operations exist
+2. **Date Range Processing**: The system processes each date from the start date to the target date
+3. **Daily Operation Processing**: For each date, operations are sorted by their `getOrder()` value and processed sequentially
+4. **Snapshot Creation**: After processing all operations for a date, a `CreditSnapshot` is created and stored
+5. **State Updates**: The credit's actual snapshot and calculation date are updated
+
+=== Operation Processing Order
+
+Operations are processed in a specific order determined by their `getOrder()` method. Lower numbers execute first:
+
+[cols="1,2,1,3"]
+|===
+|Order |Operation Type |Example Type Code |Purpose
+
+|101
+|Charge Operations
+|901
+|Add fees, penalties, or other charges to the credit
+
+|111
+|Accrual Operations  
+|950
+|Calculate and apply interest, late fees, and other time-based charges
+
+|200
+|Payment Operations
+|200
+|Process borrower payments and apply to debt balances
+
+|900
+|Past Due Operations
+|900
+|Move current debt to past due status when payments are missed
+
+|995
+|Void Operations
+|995
+|Cancel or void credit operations
+
+|999
+|Close Operations
+|999
+|Close and finalize credit accounts
+|===
+
+=== End-of-Day vs Intraday Operations
+
+Each operation implements `isEndDayOperation()` to control **when** during the day it should be processed:
+
+* **`isEndDayOperation() = false`**: **Intraday operations** - processed immediately when encountered
+* **`isEndDayOperation() = true`**: **End-of-day operations** - processed only when the date is "closed"
+
+This distinction is crucial for business logic:
+
+==== Intraday Operations (Most Operations)
+```java
+@Override
+public boolean isEndDayOperation() {
+    return false; // Process immediately
+}
+```
+
+* **Charges** - Applied immediately when created
+* **Payments** - Processed as soon as received
+* **Accruals** - Applied when calculation runs
+
+==== End-of-Day Operations (Special Cases)
+```java
+@Override
+public boolean isEndDayOperation() {
+    return true; // Process only at end of day
+}
+```
+
+* **Past Due Operations** - Only processed when the day is "closed" to ensure all payments for that day have been received
+
+This design prevents premature past due processing if a payment arrives later in the same business day.
+
+=== Operation Handler Execution
+
+Within each date, the `OperationProcessor` handles individual operations:
+
+1. **Handler Discovery**: The system finds the appropriate `CreditOperationHandler` for each operation type
+2. **Snapshot Application**: Each handler modifies the current `Snapshot` to reflect the operation's effect
+3. **Debt Tracking**: The system tracks how each operation changes the debt balances
+4. **State Management**: Operations can modify both debt balances and credit status
+
+=== Transaction and Locking
+
+The calculation service uses sophisticated transaction management:
+
+* **Pessimistic Locking**: Credits are locked during calculation to prevent concurrent modifications
+* **Separate Transactions**: Synchronization and calculation run in separate transactions
+* **Event Publishing**: Status changes and snapshot updates trigger events for other system components
+
+== Operation Entity Structure
+
+=== Base Operation Entity
+
+All credit operations extend the base `CreditOperation` class:
+
+[source,java]
+----
+@Entity
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@DiscriminatorColumn(name = "operation_type", discriminatorType = DiscriminatorType.INTEGER)
+public abstract class CreditOperation extends AbstractAuditable<UUID> {
+    
+    @Column(nullable = false)
+    private Integer type;
+    
+    @Column(nullable = false)
+    private LocalDate date;
+    
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private OperationStatus status;
+    
+    // Abstract methods that subclasses must implement
+    public abstract boolean isEndDayOperation();
+    public abstract int getOrder();
+}
+----
+
+Key features:
+* **Single Table Inheritance**: All operations stored in one table with discriminator
+* **Type Identification**: Each operation type has a unique integer identifier
+* **Date-based Processing**: Operations are tied to specific business dates
+* **Status Management**: Operations can be APPROVED, CANCELED, DECLINED, or PENDING
+* **Audit Trail**: Full change history via `AbstractAuditable`
+
+=== Operation Status Lifecycle
+
+Operations follow a defined status lifecycle:
+
+[source]
+----
+PENDING → APPROVED → (Applied to Credit)
+    ↓
+DECLINED → (Rejected, not applied)
+    ↓  
+CANCELED → (Removed from processing)
+----
+
+== Implementing Custom Operations
+
+To implement custom operations, follow the same patterns demonstrated in the example project. You'll need to:
+
+1. **Create the Operation Entity** - Extend `CreditOperation` with your specific fields and behavior
+2. **Implement the Operation Handler** - Create a service that implements `CreditOperationHandler<YourOperation>`
+3. **Configure the Handler** - Add the handler as a Spring bean in your configuration
+4. **Define Processing Order** - Set appropriate `getOrder()` and `isEndDayOperation()` values
+
+The example project's `ChargeOperation` and `ChargeOperationService` demonstrate the simplest implementation pattern, while `AccrualOperation` and `AccrualOperationService` show more complex synchronization behavior.
+
+== Standard Operation Types
+
+The example project demonstrates key operation types that represent the core concepts of credit operations.
+
+=== Charge Operations
+
+Charge operations represent the simplest operation type - they add a monetary amount to a credit account.
+
+[source,java]
+----
+include::{sourcedir}/operation/charge/ChargeOperation.java[tag=entity]
+----
+
+Key characteristics:
+* **Type Code**: `901` - Unique identifier for database discrimination
+* **Order**: `101` - Early processing order to apply charges before other operations
+* **Monetary Amount**: Embedded amount to be added to the debt
+
+=== Payment Operations
+
+Payment operations process borrower payments and distribute them across debt accounts according to business rules.
+
+[source,java]
+----
+include::{sourcedir}/operation/payment/ExampleCreditPayment.java[tag=entity]
+----
+
+The payment distribution order is configured in `CreditCalculationConfiguration`:
+
+[source,java]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[tag=payment-distribution]
+----
+
+This defines the payment waterfall: past due amounts first, then fees, current interest, and finally principal. Overpayments are credited to the `OVERPAYMENT` account.
+
+=== Accrual Operations
+
+Accrual operations represent a sophisticated concept for calculating time-based charges like interest and late fees. Unlike other operations that are created manually, accrual operations are **automatically synchronized** with significant credit events.
+
+==== The Accrual Concept
+
+The key insight behind accrual operations is that interest and fees need to be calculated whenever the debt balance changes. The system automatically creates accrual operations on dates when:
+
+* **Payments are made** - Interest must be calculated up to the payment date
+* **Past due events occur** - Balances move to past due status, affecting future calculations
+
+This synchronization is handled by the `AccrualOperationService` which implements `PreCalculateSynchronizer`. It scans for payment and past due operations and ensures corresponding accrual operations exist for those dates.
+
+==== Accrual Engines
+
+The actual calculation logic is delegated to specialized **accrual engines**:
+
+* **`InterestAccrualEngine`** - Calculates interest on the `PRINCIPAL` balance using the credit's interest rate
+* **`LateFeeAccrualEngine`** - Calculates late fees on past due principal and interest using the late fee rate
+
+These engines extend `BasisAccrualEngine` which provides sophisticated day-count calculations, handling rate changes over time, and pro-rated calculations between significant dates.
+
+==== How It Works
+
+1. **Event Detection**: When payments or past due operations are processed, the synchronizer identifies dates needing accrual calculations
+2. **Accrual Creation**: `AccrualOperation` entities are automatically created for these dates
+3. **Engine Calculation**: During credit calculation, accrual engines compute the exact amounts based on outstanding balances, rates, and time periods
+4. **Balance Application**: The calculated accruals are added to the appropriate debt accounts (`INTEREST`, `LATE_FEE`, etc.)
+
+This design ensures that time-based charges are accurately calculated and applied, even when payments are made on irregular dates or when credit terms change over time.
+
+=== Past Due Operations
+
+Past due operations handle one of the most critical business processes in lending - managing overdue debt. When borrowers miss scheduled payments, the system must reorganize debt balances to reflect the new risk profile and enable different treatment of overdue amounts.
+
+==== The Past Due Concept
+
+The fundamental principle is that **overdue debt behaves differently** from current debt:
+
+* **Late fees accrue** only on past due balances, not current balances
+* **Collection processes** target past due amounts with different strategies
+* **Reporting and risk assessment** treat past due debt as higher risk
+* **Payment distribution** prioritizes past due amounts over current debt
+
+When a scheduled payment date passes without sufficient payment, current debt must be "moved" to past due accounts to enable this differentiated treatment.
+
+==== Scheduled Payment Detection
+
+Past due operations are triggered by the credit's **payment schedule**, which is defined in the credit condition. The system monitors for:
+
+* **Regular payment dates** - monthly, weekly, or other periodic payments based on the credit terms
+* **Maturity date** - the final payment date when the entire remaining balance becomes due
+* **Missed payment amounts** - comparing expected payments against actual payments received
+
+==== Debt Movement Logic
+
+When a past due event occurs, the operation performs **account transfers**:
+
+* `INTEREST` balance → `PAST_DUE_INTEREST` account
+* `PRINCIPAL` balance → `PAST_DUE_PRINCIPAL` account
+
+This reorganization enables the accrual engines to calculate late fees specifically on past due amounts, while new interest continues to accrue on any remaining current principal.
+
+==== Maturity vs Regular Past Due
+
+The `maturity` flag in the operation distinguishes between two scenarios:
+
+* **Regular Past Due**: Borrower missed a scheduled payment but loan hasn't matured - partial amounts may move to past due
+* **Maturity Past Due**: Loan has reached its final payment date - typically the entire remaining balance becomes past due
+
+This distinction allows for different business rules, such as accelerated collection procedures or different late fee calculations for matured loans.
+
+==== Integration with Credit Lifecycle
+
+Past due operations integrate with other parts of the system:
+
+* **Accrual Operations**: Automatically created to calculate late fees on the newly past due amounts
+* **Credit Labels**: Display indicators like `PastDueLabel` to show past due status without changing the core credit status
+* **Notification Systems**: Often trigger automated borrower communications
+* **Collection Workflows**: May initiate collection processes or escalation procedures
+
+This design ensures that the transition from current to past due debt is handled consistently and triggers all necessary downstream processes.
+
+== Account Structure and Debt Management
+
+The operations framework uses a flexible account-based debt structure defined in the configuration.
+
+=== Account Type Constants
+
+The example project defines these account types in `CreditCalculationConfiguration`:
+
+[source,java]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[tag=account-types]
+----
+
+These accounts represent different types of debt:
+* **`PRINCIPAL`** - Outstanding loan principal amount
+* **`INTEREST`** - Accrued interest charges
+* **`PAST_DUE_PRINCIPAL`** - Overdue principal amounts
+* **`PAST_DUE_INTEREST`** - Overdue interest amounts
+* **`LATE_FEE`** - Late payment penalties
+* **`OVERPAYMENT`** - Credit balance from overpayments
+
+== Operation Configuration
+
+The operations framework requires careful configuration to define how operations behave, how payments are distributed, and how the overall credit system operates. The example project demonstrates a complete configuration approach.
+
+=== Configuration Architecture
+
+All operation-related configuration is centralized in `CreditCalculationConfiguration`, which serves as the single source of truth for:
+
+* **Credit Status Definitions** - Available credit states and their properties
+* **Account Structure** - Debt account types and their relationships
+* **Operation Handlers** - Services that process each operation type
+* **Payment Distribution** - Rules for how payments are applied to debt
+* **Accrual Engines** - Time-based calculation components
+* **Credit View Options** - UI display configuration
+
+=== Credit Status Configuration
+
+The framework defines credit statuses with specific properties:
+
+[source,java]
+----
+public static final CreditStatus PENDING = new CreditStatus("PENDING", 1000, false);
+public static final CreditStatus ACTIVE = new CreditStatus("ACTIVE", 1100, false);
+public static final CreditStatus CLOSED = new CreditStatus("CLOSED", 2000, true);
+public static final CreditStatus VOID = new CreditStatus("VOID", 2100, true);
+----
+
+Each status includes:
+* **Name**: Human-readable identifier
+* **Order**: Numeric value for status progression logic
+* **Ending Flag**: Whether this status represents a terminal state
+
+=== Account Structure Configuration
+
+The debt account structure is defined as constants:
+
+[source,java]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[tag=account-types]
+----
+
+These accounts represent different types of debt and credit balances:
+* **Current Debt**: `PRINCIPAL`, `INTEREST` - active loan balances
+* **Past Due Debt**: `PAST_DUE_PRINCIPAL`, `PAST_DUE_INTEREST` - overdue amounts
+* **Penalties**: `LATE_FEE` - fees for late payments
+* **Credits**: `OVERPAYMENT` - borrower credit balances
+
+=== Operation Handler Configuration
+
+Each operation type requires a corresponding handler bean:
+
+==== Charge Operation Handler
+
+[source,java]
+----
+@Bean
+ChargeOperationService chargeOperationService() {
+    return new ChargeOperationService();
+}
+----
+
+The `ChargeOperationService` implements `CreditOperationHandler<ChargeOperation>` and defines how charge operations affect debt balances.
+
+==== Payment Operation Handler
+
+[source,java]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[tag=payment-distribution]
+----
+
+The payment handler configuration is critical as it defines:
+* **Overpayment Account**: Where excess payments are credited (`OVERPAYMENT`)
+* **Payment Waterfall**: The order in which payments are applied to debt accounts
+
+==== Past Due Operation Handler
+
+[source,java]
+----
+@Bean
+PastDueOperationService pastDueOperationService() {
+    LinkedHashMap<String, String> map = new LinkedHashMap<>();
+    map.put(INTEREST, PAST_DUE_INTEREST);
+    map.put(PRINCIPAL, PAST_DUE_PRINCIPAL);
+    return new PastDueOperationService(map);
+}
+----
+
+The mapping defines how current debt accounts are transferred to past due accounts when payments are missed.
+
+==== Accrual Operation Handler
+
+[source,java]
+----
+@Bean
+AccrualOperationService accrualOperationService() {
+    return new AccrualOperationService();
+}
+----
+
+The accrual service coordinates with accrual engines to calculate time-based charges.
+
+=== Accrual Engine Configuration
+
+Accrual engines handle specific types of time-based calculations:
+
+==== Interest Accrual Engine
+
+[source,java]
+----
+@Bean
+InterestAccrualEngine interestAccrualEngine() {
+    return new InterestAccrualEngine();
+}
+----
+
+Calculates interest on the `PRINCIPAL` balance and adds it to the `INTEREST` account.
+
+==== Late Fee Accrual Engine
+
+[source,java]
+----
+@Bean
+LateFeeAccrualEngine lateFeeAccrualEngine() {
+    return new LateFeeAccrualEngine();
+}
+----
+
+Calculates late fees on past due balances and adds them to the `LATE_FEE` account.
+
+=== Loan Engine Configuration
+
+The loan engine orchestrates the overall calculation process:
+
+[source,java]
+----
+@Bean
+LoanEngine loanEngine() {
+    return new BasicLoanEngine(PENDING);
+}
+----
+
+The `BasicLoanEngine` is initialized with the default credit status (`PENDING`) for new credits.
+
+=== Credit View Configuration
+
+The view configuration determines which accounts are displayed in the user interface:
+
+[source,java]
+----
+@Bean
+CreditViewOptions creditViewOptions() {
+    return new CreditViewOptions(PRINCIPAL, INTEREST, PAST_DUE_PRINCIPAL, PAST_DUE_INTEREST, LATE_FEE);
+}
+----
+
+This configuration excludes the `OVERPAYMENT` account from standard credit displays, as it represents a credit balance rather than debt.
+
+=== Customizing Configuration for Different Credit Products
+
+Different credit products require different configurations. Common customization patterns include:
+
+==== Custom Account Structures and Payment Distribution
+
+```java
+// Credit card configuration
+public static final String PURCHASES = "PURCHASES";
+public static final String CASH_ADVANCES = "CASH_ADVANCES";
+public static final String FEES = "FEES";
+
+// Payment order: fees first, then cash advances, then purchases
+new CreditPaymentOperationHandler<>("CREDIT_BALANCE", 
+    List.of("FEES", "CASH_ADVANCES", "PURCHASES"));
+
+// Mortgage configuration with escrow
+public static final String ESCROW = "ESCROW";
+public static final String PMI = "PMI";
+
+// Payment order: fees, past due, escrow, current debt
+new CreditPaymentOperationHandler<>("ESCROW_SURPLUS", 
+    List.of("LATE_FEE", "PAST_DUE_PRINCIPAL", "ESCROW", "PRINCIPAL"));
+```
+
+=== Configuration Validation
+
+The framework automatically validates configuration consistency:
+
+* **Handler Registration**: Ensures all operation types have corresponding handlers
+* **Account References**: Validates that payment distribution references valid account types
+* **Engine Registration**: Confirms accrual engines are properly registered
+* **Status Consistency**: Checks that status definitions are logically consistent
+
+=== Configuration Best Practices
+
+1. **Centralized Configuration**: Keep all operation configuration in a single class for maintainability
+
+2. **Meaningful Constants**: Use descriptive names for account types and statuses
+
+3. **Documented Relationships**: Clearly document how accounts relate to each other
+
+4. **Environment-Specific Beans**: Use Spring profiles or conditions for product-specific configurations
+
+5. **Validation**: Implement configuration validation to catch setup errors early
+
+6. **Consistent Naming**: Use consistent naming patterns across account types and operation handlers
+
+The configuration approach in the example project provides a flexible foundation that can be adapted for various lending products while maintaining consistency and clarity.
+
+== Operation Synchronization
+
+The `PreCalculateSynchronizer` interface enables operations to maintain consistency with related events.
+
+=== Synchronization Example
+
+The `AccrualOperationService` demonstrates how synchronization works by automatically creating accrual operations when payments or past due events occur. The service implements `PreCalculateSynchronizer` and scans for trigger operations, ensuring that accrual operations exist for dates when debt balances change.
+
+You can examine the complete implementation in the source code: `AccrualOperationService.java`.
+
+== Real-world Usage Patterns
+
+Understanding how operations work together in practice is essential for implementing robust credit systems. The example project's test cases demonstrate several real-world scenarios that show the complete operation flow.
+
+=== Scenario 1: Loan Disbursement and Interest Accrual
+
+This scenario demonstrates the basic credit lifecycle from disbursement through interest calculation.
+
+==== The Flow
+
+1. **Credit Creation**: A new credit is created with defined terms (principal amount, interest rate, payment schedule)
+2. **Principal Disbursement**: A `ChargeOperation` adds the loan principal to the `PRINCIPAL` account
+3. **Time Progression**: As time passes, the calculation engine processes each day
+4. **Interest Accrual**: `AccrualOperationService` automatically creates `AccrualOperation` entities for interest calculation
+5. **Balance Updates**: Interest is calculated and added to the `INTEREST` account
+
+==== Key Insights
+
+* **Automatic Synchronization**: Accrual operations are created automatically when needed
+* **Daily Processing**: The calculation engine processes operations chronologically
+* **Time-based Calculations**: Interest accrues based on outstanding principal and elapsed time
+
+==== From the Test Case
+
+The `chargeOperation()` test in `CalculationTest` demonstrates this pattern:
+
+```
+Credit Start → Charge Principal → Calculate to Today → Verify Interest Accrued
+```
+
+The test verifies that interest is correctly calculated using the formula: `principal × (rate / 100) × (days / 360)`
+
+=== Scenario 2: Payment Processing and Distribution
+
+This scenario shows how borrower payments are processed and distributed across debt accounts.
+
+==== The Flow
+
+1. **Outstanding Debt**: Credit has balances in multiple accounts (principal, interest, fees)
+2. **Payment Received**: An `ExampleCreditPayment` operation is created
+3. **Payment Distribution**: The payment handler applies the payment according to the configured waterfall
+4. **Balance Updates**: Debt accounts are reduced according to priority order
+5. **Continued Accruals**: Interest continues to accrue on remaining balances
+
+==== Payment Waterfall Logic
+
+The example project uses this payment priority:
+1. `PAST_DUE_PRINCIPAL` - Overdue principal first
+2. `PAST_DUE_INTEREST` - Overdue interest second  
+3. `LATE_FEE` - Late fees third
+4. `INTEREST` - Current interest fourth
+5. `PRINCIPAL` - Current principal last
+
+==== From the Test Cases
+
+The `paymentOperation1()` and `paymentOperation2()` tests demonstrate:
+
+**Partial Payment Scenario**:
+```
+Charge Principal → Partial Payment → Verify Interest Paid → Verify Principal Unchanged
+```
+
+**Full Payment Scenario**:
+```
+Charge Principal → Full Payment → Verify Interest Paid → Verify Principal Reduced
+```
+
+=== Scenario 3: Past Due Processing and Late Fees
+
+This scenario illustrates the complex process of handling missed payments and calculating late fees.
+
+==== The Flow
+
+1. **Payment Due Date**: A scheduled payment date arrives
+2. **Insufficient Payment**: Borrower makes no payment or insufficient payment
+3. **Past Due Operation**: System automatically creates `PastDueOperation` 
+4. **Account Transfers**: Current debt moves to past due accounts
+5. **Late Fee Accrual**: `LateFeeAccrualEngine` begins calculating fees on past due amounts
+6. **Payment Priority Change**: Future payments prioritize past due amounts
+
+==== Account Movement Logic
+
+When past due occurs:
+* `INTEREST` balance → `PAST_DUE_INTEREST` account
+* `PRINCIPAL` balance → `PAST_DUE_PRINCIPAL` account
+
+==== From the Test Case
+
+The `pastDue1()` test demonstrates this complex scenario:
+
+```
+Charge Principal → Insufficient Payment → Calculate Past Due Date → Verify Account Transfers → Verify Late Fees
+```
+
+The test shows how the system:
+- Moves unpaid amounts to past due accounts
+- Calculates late fees on the past due balances
+- Maintains accurate balance tracking across account types
+
+=== Scenario 4: End-of-Day vs Intraday Processing
+
+This scenario highlights the importance of operation timing in business logic.
+
+==== The Concept
+
+* **Intraday Operations**: Charges, payments, and accruals process immediately
+* **End-of-Day Operations**: Past due operations wait until the business day is "closed"
+
+==== Business Rationale
+
+Past due operations use `isEndDayOperation() = true` to prevent premature past due status if a payment arrives later in the same business day.
+
+==== Example Timeline
+
+```
+9:00 AM  - Payment due date arrives
+10:00 AM - Borrower payment received (processed immediately)
+11:00 AM - Another payment received (processed immediately)  
+End of Day - Past due operation processes only if still insufficient payment
+```
+
+This prevents false past due situations when payments arrive throughout the day.
+
+=== Scenario 5: Operation Synchronization in Action
+
+This scenario demonstrates how the synchronization system maintains data consistency.
+
+==== The Challenge
+
+Accrual operations must exist for every date when:
+- Payments are made (to calculate interest up to payment date)
+- Past due events occur (to recalculate accruals on new account structure)
+
+==== The Solution
+
+`AccrualOperationService` implements `PreCalculateSynchronizer`:
+
+1. **Scan for Trigger Events**: Finds all payment and past due operations
+2. **Identify Required Dates**: Determines which dates need accrual calculations
+3. **Create Missing Operations**: Adds `AccrualOperation` entities for missing dates
+4. **Cancel Unnecessary Operations**: Removes accrual operations for dates without triggers
+
+==== Result
+
+The system ensures accurate interest calculations even when:
+- Payments are made on irregular dates
+- Past due events change the debt structure
+- Operations are added or modified after the fact
+
+=== Key Patterns from Real Usage
+
+==== 1. Event-Driven Architecture
+
+Operations trigger other operations automatically:
+- Payments trigger accrual calculations
+- Past due events trigger late fee calculations
+- Each operation maintains referential integrity
+
+==== 2. Chronological Processing
+
+The calculation engine processes operations in strict date order:
+- Earlier operations affect later operations
+- Processing order within a date matters (`getOrder()` values)
+- State changes are cumulative and consistent
+
+==== 3. Business Rule Flexibility
+
+The framework accommodates complex business rules:
+- Different payment priorities for different products
+- Time-sensitive processing (end-of-day vs intraday)
+- Automatic synchronization of dependent operations
+
+==== 4. Audit and Traceability
+
+Every operation maintains complete audit trails:
+- Who created the operation and when
+- What the operation changed (debt account effects)
+- Why the operation was created (business event triggers)
+
+=== Testing Real-World Scenarios
+
+The example project's `CalculationTest` demonstrates how to test these scenarios:
+
+1. **Setup Realistic Conditions**: Create credits with proper terms and schedules
+2. **Apply Operations in Sequence**: Mirror real-world event timing
+3. **Verify All Effects**: Check not just primary changes but secondary effects
+4. **Test Edge Cases**: Include scenarios like overpayments and zero balances
+
+These patterns provide a foundation for implementing robust credit operations that handle the complexity of real-world lending scenarios while maintaining accuracy and auditability.
+
+== Best Practices
+
+=== Operation Design Principles
+
+* **Immutability**: Operations should be immutable once created and approved
+* **Idempotency**: Operations should produce the same result when applied multiple times
+* **Atomicity**: Each operation should represent a single, atomic business transaction
+* **Auditability**: All operations must be fully auditable with complete change history
+* **Extensibility**: Design operations to be easily extended for new business requirements
+
+=== Performance Optimization
+
+* **Batch Processing**: Group related operations for efficient processing
+* **Lazy Loading**: Use lazy loading for operation collections to avoid N+1 queries
+* **Indexing**: Create appropriate database indexes for operation queries
+* **Caching**: Cache frequently accessed operation handlers and calculation results
+
+=== Error Handling
+
+* **Validation**: Validate operations before processing to catch errors early
+* **Retry Logic**: Implement retry mechanisms for transient failures
+* **Compensation**: Design compensation operations for failed transactions
+* **Monitoring**: Monitor operation processing for performance and error patterns
+
+=== Security Considerations
+
+* **Authorization**: Ensure proper authorization for operation creation and modification
+* **Data Protection**: Protect sensitive operation data with encryption
+* **Audit Logging**: Maintain comprehensive audit logs for regulatory compliance
+* **Access Control**: Implement role-based access control for operation management
+
+== Testing Operations
+
+The operations framework provides comprehensive testing capabilities that allow you to verify operation behavior, calculation accuracy, and integration between different operation types.
+
+=== Integration Testing Approach
+
+The example project demonstrates a complete integration testing strategy using `CalculationTest` that tests the entire operation processing pipeline.
+
+==== Test Configuration
+
+The test uses a comprehensive Spring configuration that mirrors the production setup:
+
+[source,java]
+----
+@DataJpaTest
+@AutoConfigureEmbeddedDatabase(provider = DatabaseProvider.ZONKY)
+@ContextConfiguration(classes = {CreditCalculationConfiguration.class, CalculationTest.CalculationTestConfig.class})
+----
+
+Key testing components:
+* **Embedded Database**: Uses Zonky for isolated database testing
+* **Transaction Management**: `TransactionTemplateBuilder` for proper transaction handling
+* **Real Services**: Uses actual `CreditCalculationService` and `AccrualService` instances
+* **Complete Configuration**: Includes all operation handlers and accrual engines
+
+==== Testing Patterns
+
+The example project demonstrates several essential testing patterns:
+
+===== 1. Credit Lifecycle Testing
+
+Testing the complete credit lifecycle from creation through operations:
+
+[source,java]
+----
+// Create credit with realistic conditions
+UUID creditId = initCredit(startDate, TODAY);
+
+// Apply operations
+charge(creditId, chargeDate, principalAmount);
+registerPayment(creditId, paymentDate, paymentAmount);
+
+// Trigger calculation
+calculate(creditId, startDate, TODAY);
+
+// Verify results
+ExampleCredit credit = entityManager.find(ExampleCredit.class, creditId);
+Assertions.assertEquals(expectedBalance, credit.getActualSnapshot().getDebt().getAccount(PRINCIPAL).get());
+----
+
+===== 2. Operation Interaction Testing
+
+Testing how different operations interact with each other:
+
+```java
+@Test
+public void paymentOperation1() {
+    // Setup: Create credit and charge principal
+    charge(creditId, chargeDate, principal);
+    
+    // Test: Make partial payment
+    registerPayment(creditId, paymentDate, partialPayment);
+    calculate(creditId, startDate, TODAY);
+    
+    // Verify: Check payment distribution and remaining balances
+    ExampleCreditPayment payment = credit.getOperations(ExampleCreditPayment.class, APPROVED).findAny().get();
+    assertEquals(expectedInterestPayment, payment.getFinalDebt().get().getAccount(INTEREST).get());
+    assertEquals(expectedRemainingInterest, credit.getActualSnapshot().getDebt().getAccount(INTEREST).get());
+}
+```
+
+===== 3. Accrual Calculation Testing
+
+Testing time-based calculations and accrual accuracy:
+
+```java
+@Test
+public void chargeOperation() {
+    charge(creditId, chargeDate, principal);
+    calculate(creditId, startDate, TODAY);
+    
+    // Verify accrued interest calculation
+    MonetaryAmount expectedInterest = principal.multiply(
+        (INTEREST_RATE.doubleValue() / 100d) * (daysBetween / 360d)
+    );
+    
+    Debt accruals = accrualService.calculateCurrentAccurals(credit);
+    assertEquals(expectedInterest, accruals.getAccount(INTEREST).get());
+}
+```
+
+===== 4. Past Due Processing Testing
+
+Testing complex past due scenarios:
+
+```java
+@Test
+public void pastDue1() {
+    // Setup credit with insufficient payment
+    charge(creditId, chargeDate, principal);
+    registerPayment(creditId, paymentDate, insufficientPayment);
+    
+    // Calculate beyond payment due date
+    calculate(creditId, startDate, TODAY.plusMonths(1));
+    
+    // Verify past due balances and late fee accruals
+    assertEquals(expectedPastDueInterest, credit.getActualSnapshot().getDebt().getAccount(PAST_DUE_INTEREST).get());
+    assertEquals(expectedLateFee, accrualService.calculateCurrentAccurals(credit).getAccount(LATE_FEE).get());
+}
+```
+
+=== Testing Utilities
+
+The test class provides reusable utility methods for common testing scenarios:
+
+==== Credit Initialization
+
+```java
+public UUID initCredit(LocalDate startDate, LocalDate today) {
+    return transactionTemplateBuilder.requiresNew().execute(s -> {
+        // Create complete credit structure: product, condition, application, credit
+        // Return credit ID for use in tests
+    });
+}
+```
+
+==== Operation Creation
+
+```java
+public void charge(UUID creditId, LocalDate operationDate, MonetaryAmount amount) {
+    transactionTemplateBuilder.requiresNew().executeWithoutResult(status -> {
+        chargeOperationService.createOperation(creditId, operationDate, amount);
+    });
+}
+
+public void registerPayment(UUID creditId, LocalDate paymentDate, MonetaryAmount amount) {
+    transactionTemplateBuilder.requiresNew().executeWithoutResult(status -> {
+        entityManager.find(ExampleCredit.class, creditId).getOperations()
+            .add(new ExampleCreditPayment(paymentDate, amount));
+    });
+}
+```
+
+==== Calculation Execution
+
+```java
+public void calculate(UUID creditId, LocalDate from, LocalDate today) {
+    transactionTemplateBuilder.requiresNew().executeWithoutResult(status -> {
+        calculationService.calculate(creditId, from, today);
+    });
+}
+```
+
+=== Test Data Management
+
+The tests use realistic financial data and calculations:
+
+```java
+private static final BigDecimal INTEREST_RATE = BigDecimal.valueOf(12); // 12% annual
+private static final BigDecimal LATE_FEE_RATE = BigDecimal.valueOf(24); // 24% annual
+private static final BigDecimal PRINCIPAL = BigDecimal.valueOf(2_000_000); // 2M ZWL
+```
+
+Interest calculations use proper day-count methods:
+```java
+MonetaryAmount interest = principal.multiply(
+    (INTEREST_RATE.doubleValue() / 100d) * (ChronoUnit.DAYS.between(chargeDate, TODAY) / 360d)
+);
+```
+
+=== Assertion Strategies
+
+The tests demonstrate comprehensive assertion patterns:
+
+==== Balance Verification
+```java
+assertEquals(expectedAmount, credit.getActualSnapshot().getDebt().getAccount(PRINCIPAL).get());
+```
+
+==== Operation Effect Verification
+```java
+ExampleCreditPayment payment = credit.getOperations(ExampleCreditPayment.class, APPROVED).findAny().get();
+assertEquals(paymentAmount.negate(), payment.getFinalDebt().get().getAccount(INTEREST).get());
+```
+
+==== Accrual Verification
+```java
+Debt accruals = accrualService.calculateCurrentAccurals(credit);
+assertEquals(expectedLateFee, accruals.getAccount(LATE_FEE).get());
+assertEquals(2, accruals.getAccounts().keySet().size()); // Verify account count
+```
+
+==== State Verification
+```java
+assertEquals(expectedDate, credit.getActualSnapshot().getDate());
+assertEquals(calculationDate, credit.getCalculationDate());
+assertTrue(credit.getActualSnapshot().getDebt().getTotal().isEmpty()); // For zero balance
+```
+
+=== Best Practices for Operation Testing
+
+1. **Use Realistic Data**: Test with actual financial amounts and rates that reflect real-world scenarios
+
+2. **Test Operation Sequences**: Verify that operations work correctly when applied in different orders
+
+3. **Verify Time-based Calculations**: Ensure accruals calculate correctly across different time periods
+
+4. **Test Edge Cases**: Include scenarios like overpayments, zero balances, and boundary conditions
+
+5. **Use Proper Transactions**: Each operation should be in its own transaction to mirror production behavior
+
+6. **Verify All Accounts**: Check not just the primary effects but also secondary account impacts
+
+7. **Test Calculation Accuracy**: Use precise mathematical calculations to verify financial accuracy
+
+The testing approach in the example project provides a solid foundation for ensuring operation correctness and can be extended for custom operation types and business scenarios.
+
+The Credit Operations Framework provides a solid foundation for building sophisticated financial applications while maintaining flexibility for customization and extension. By following these patterns and best practices, you can create robust, scalable operation processing systems that meet your specific business requirements.

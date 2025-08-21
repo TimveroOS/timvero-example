@@ -20,7 +20,7 @@ public class ParticipantDocumentTypesConfiguration {
     public static final SignableDocumentType APPLICATION_CONTRACT =
         new SignableDocumentType("APPLICATION_CONTRACT", ApplicationContractDocumentCategory.TYPE);
 
-    public static final EntityDocumentType OTHER = new EntityDocumentType("OTHER");
+    public static final EntityDocumentType OTHER = EntityDocumentType.OTHER;
     public static final EntityDocumentType ID_SCAN = new EntityDocumentType("ID_SCAN");
 
     private static final Predicate<Participant> PARTICIPANT_GUARANTOR =

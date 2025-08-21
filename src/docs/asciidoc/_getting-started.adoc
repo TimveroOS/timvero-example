@@ -52,6 +52,213 @@ Once running, you should see:
 * Sample data (if configured)
 * No compilation errors in the console
 
+=== Troubleshooting Setup Issues
+
+==== Application Won't Start
+
+**Problem**: `Application failed to start` with database connection errors
+
+**Solution**:
+
+1. **Check database is running**:
++
+```bash
+# PostgreSQL status check
+sudo systemctl status postgresql
+# Or for Docker
+docker ps | grep postgres
+```
+
+2. **Verify database connection**:
++
+```bash
+# Test connection manually
+psql -h localhost -p 5432 -U your_username -d your_database
+```
+
+3. **Check application.properties**:
++
+```properties
+# Ensure these match your database setup
+spring.datasource.url=jdbc:postgresql://localhost:5432/your_database
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+```
+
+**Common database URL mistakes**:
+* Wrong port (default PostgreSQL is 5432)
+* Database name doesn't exist
+* User lacks permissions
+
+==== Flyway Migration Errors
+
+**Problem**: `FlywayException: Migration checksum mismatch` or migration failures
+
+**Solution**:
+
+1. **Check migration file integrity**:
++
+```sql
+-- View migration history
+SELECT * FROM flyway_schema_history ORDER BY installed_rank DESC;
+```
+
+2. **Reset migrations (development only)**:
++
+```bash
+# WARNING: This deletes all data
+mvn flyway:clean flyway:migrate
+```
+
+3. **Skip problematic migration (careful!)**:
++
+```bash
+# Only if you understand the implications
+mvn flyway:repair
+```
+
+==== Port Already in Use
+
+**Problem**: `Port 8081 was already in use` or similar port conflicts
+
+**Solution**:
+
+1. **Find what's using the port**:
++
+```bash
+# Linux/Mac
+lsof -i :8081
+# Windows
+netstat -ano | findstr :8081
+```
+
+2. **Change application ports**:
++
+```properties
+# In application.properties
+server.port=8090
+management.server.port=8091
+```
+
+3. **Kill conflicting process**:
++
+```bash
+# Linux/Mac (replace PID with actual process ID)
+kill -9 PID
+# Windows
+taskkill /PID PID /F
+```
+
+==== Java Version Issues
+
+**Problem**: `UnsupportedClassVersionError` or compilation failures
+
+**Solution**:
+
+1. **Check Java version**:
++
+```bash
+java -version
+javac -version
+echo $JAVA_HOME
+```
+
+2. **Ensure Java 21+**:
++
+```bash
+# Install Java 21 if needed
+# Ubuntu/Debian
+sudo apt install openjdk-21-jdk
+# macOS with Homebrew
+brew install openjdk@21
+```
+
+3. **Set JAVA_HOME**:
++
+```bash
+# Linux/Mac - add to ~/.bashrc or ~/.zshrc
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+# Windows - set in System Properties
+```
+
+==== Maven Build Failures
+
+**Problem**: Maven dependency resolution or compilation errors
+
+**Solution**:
+
+1. **Clean and rebuild**:
++
+```bash
+mvn clean compile
+mvn clean install -U  # Force update dependencies
+```
+
+2. **Check Maven version**:
++
+```bash
+mvn --version  # Should be 3.8+
+```
+
+3. **Clear local repository**:
++
+```bash
+# Nuclear option - deletes all cached dependencies
+rm -rf ~/.m2/repository
+mvn clean install
+```
+
+==== Can't Access Admin UI
+
+**Problem**: Browser shows "This site can't be reached" or connection refused
+
+**Solution**:
+
+1. **Verify application started successfully**:
++
+```bash
+# Check logs for "Started Application in X seconds"
+tail -f logs/application.log
+```
+
+2. **Check correct URL**:
++
+```
+# Default URLs
+Admin UI: http://localhost:8081
+Portal API: http://localhost:8082
+# NOT http://localhost:8080 (that's often Spring Boot default)
+```
+
+3. **Check firewall/network**:
++
+```bash
+# Test port connectivity
+telnet localhost 8081
+# Or
+curl -I http://localhost:8081
+```
+
+==== Database Tables Not Created
+
+**Problem**: Application starts but database is empty
+
+**Solution**:
+
+1. **Verify migration files exist**:
++
+```bash
+ls -la src/main/resources/db/migration/
+# Should see V*.sql files
+```
+
+3. **Check database permissions**:
++
+```sql
+-- User needs privileges to execute migration
+ALTER DATABASE your_database OWNER TO your_username;
+```
+
 == Your First Entity: Client Management (15 minutes)
 
 Let's explore how the Client entity demonstrates the platform's core patterns. The Client entity is already implemented in the example project, so you can see a complete working example.
@@ -247,6 +454,77 @@ User Input → Form Validation → Controller → Service → Mapper → Entity 
                      ↓
              Template Rendering ← Form Object ← Mapper ← Entity ← Database Query
 ----
+
+=== Troubleshooting Entity-Form-Controller Issues
+
+==== Form Validation Not Working
+
+**Problem**: Form submits with invalid data or validation messages don't appear
+
+**Solution**:
+
+1. **Check validation annotations**:
++
+```java
+// Ensure @Valid is present on nested objects
+@Valid
+@NotNull
+private IndividualInfoForm individualInfo;
+```
+
+2. **Verify form component validation classes**:
++
+```html
+<!-- Ensure validation CSS classes are included -->
+<th:block th:insert="~{/form/components :: text(
+    #{client.individualInfo.fullName},
+    'individualInfo.fullName', 
+    'v-required v-name')}" />
+```
+
+==== Controller Actions Not Appearing
+
+**Problem**: Create/Edit buttons don't show up in the UI
+
+**Solution**:
+
+1. **Check controller annotations**:
++
+```java
+@Controller  // Must be @Controller, not @RestController
+public class CreateClientAction extends EntityCreateController<UUID, Client, ClientForm> {
+}
+```
+
+2. **Check template includes actions**:
++
+```html
+<!-- Ensure action templates are included -->
+<div th:replace="~{/entity/actions :: entityActions}"></div>
+```
+
+==== Form Fields Not Displaying
+
+**Problem**: Form renders but specific fields are missing or empty
+
+**Solution**:
+
+1. **Check form component syntax**:
++
+```html
+<!-- Ensure proper Thymeleaf fragment syntax -->
+<th:block th:insert="~{/form/components :: text(
+    #{client.individualInfo.fullName},
+    'individualInfo.fullName', 
+    'v-required v-name')}" />
+```
+
+2. **Verify i18n message keys exist**:
++
+```properties
+# In messages.properties
+client.individualInfo.fullName=Full Name
+```
 
 == Common Scenarios (20 minutes)
 
@@ -445,3 +723,12 @@ Study these complete examples in the project:
 - [ ] Deploy to a staging environment for testing
 
 You're now ready to build powerful financial applications with the Timvero platform!
+
+---
+
+**Next Chapter:** <<data-model-setup>> - SQL autogeneration and Flyway migration workflows
+
+**Related Chapters:**
+* <<form-classes-setup-and-usage>> - Form classes, validation, MapStruct mappers, and service layers
+* <<html-template-integration>> - Thymeleaf components, validation classes, and UI integration  
+* <<entity-checkers-setup-and-usage>> - Entity Checkers for event-driven business rules

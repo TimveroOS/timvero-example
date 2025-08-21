@@ -107,3 +107,199 @@ include::{migrationdir}/V250609220043__participantStatus.sql[tags=add-status-col
 ----
 
 This approach ensures that your database schema evolves in a controlled, versioned manner while maintaining data integrity throughout the development lifecycle.
+
+== Troubleshooting Data Model Issues
+
+=== SQL Generation Problems
+
+==== No SQL Files Generated
+
+**Problem**: Need to generate SQL migration files but no files appear in `hbm2ddl` directory
+
+**Solution**:
+
+1. **Check application.home property**:
++
+```properties
+# In application.properties
+application.home=/path/to/your/project
+# Or use relative path
+application.home=.
+```
+
+2. **Verify entities are detected**:
++
+```java
+// Ensure entities have proper annotations
+@Entity
+@Table(name = "your_table_name")
+public class YourEntity extends AbstractAuditable<UUID> {
+}
+```
+
+3. **Check entity scanning configuration**:
++
+```java
+// Ensure entities are in scanned packages
+@EntityScan(basePackages = {"com.yourpackage.entity"})
+@SpringBootApplication
+public class Application {
+}
+```
+
+=== Flyway Migration Issues
+
+==== Wrong Migration Order
+
+**Problem**: Migrations execute in wrong order due to versioning issues
+
+**Solution**:
+
+1. **Check version numbering**:
++
+```
+# Correct format: VyyyyMMddHHmmss__description.sql
+V250610120000__add_participant_status.sql
+V250610130000__add_participant_employment.sql
+
+# Wrong (will execute in wrong order):
+V1__add_status.sql
+V10__add_employment.sql  # This executes before V2!
+```
+
+2. **Use consistent timestamp format**:
++
+```bash
+# Generate timestamp for new migration
+date +"%y%m%d%H%M%S"
+# Use this in filename: V250610143022__your_description.sql
+```
+
+3. **Fix ordering with new migration**:
++
+```sql
+-- If wrong order was applied, create corrective migration
+-- V250610150000__correct_previous_changes.sql
+```
+
+=== Database Connection Issues
+
+==== Connection Pool Exhaustion
+
+**Problem**: `HikariPool: Connection is not available` errors
+
+**Solution**:
+
+1. **Check connection pool settings**:
++
+```properties
+# In application.properties
+spring.datasource.hikari.maximum-pool-size=20
+spring.datasource.hikari.minimum-idle=5
+spring.datasource.hikari.connection-timeout=20000
+spring.datasource.hikari.idle-timeout=300000
+```
+
+2. **Monitor connection usage**:
++
+```properties
+# Enable connection pool metrics
+spring.datasource.hikari.register-mbeans=true
+management.endpoints.web.exposure.include=metrics
+```
+
+3. **Check for connection leaks**:
++
+```java
+// Ensure @Transactional is used properly
+@Service
+@Transactional  // This ensures connections are properly closed
+public class YourService {
+}
+```
+
+==== Database Lock Issues
+
+**Problem**: Migrations hang or fail with lock timeout errors
+
+**Solution**:
+
+1. **Check for long-running transactions**:
++
+```sql
+-- PostgreSQL: Find blocking queries
+SELECT pid, usename, application_name, state, query 
+FROM pg_stat_activity 
+WHERE state != 'idle' ORDER BY query_start;
+```
+
+2. **Kill blocking sessions (carefully)**:
++
+```sql
+-- Terminate specific session
+SELECT pg_terminate_backend(12345);  -- Replace with actual PID
+```
+
+=== Performance Issues
+
+==== Slow Entity Loading
+
+**Problem**: Entity queries are slow or cause N+1 query problems
+
+**Solution**:
+
+1. **Add database indexes using Hibernate annotations**:
++
+```java
+@Entity
+@Table(name = "participants", indexes = {
+    @Index(name = "idx_participants_status", columnList = "status"),
+    @Index(name = "idx_participants_employment", columnList = "employment"),
+    @Index(name = "idx_participants_application_id", columnList = "application_id")
+})
+public class Participant extends AbstractAuditable<UUID> {
+    
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status")
+    private ParticipantStatus status;
+    
+    @Enumerated(EnumType.STRING)
+    @Column(name = "employment")
+    private Employment employment;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "application_id")
+    private Application application;
+}
+```
++
+**Alternative: Add indexes via migration file**:
++
+```sql
+-- V250610120000__add_performance_indexes.sql
+CREATE INDEX idx_participants_status ON participants(status);
+CREATE INDEX idx_participants_employment ON participants(employment);
+CREATE INDEX idx_participants_application_id ON participants(application_id);
+```
+
+2. **Use proper fetch strategies**:
++
+```java
+@Entity
+public class Participant {
+    @ManyToOne(fetch = FetchType.LAZY)  // Don't use EAGER unless necessary
+    private Application application;
+    
+    @OneToMany(fetch = FetchType.LAZY, mappedBy = "participant")
+    private List<Document> documents;
+}
+```
+
+3. **Enable query logging to diagnose**:
++
+```properties
+# In application.properties (development only)
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+logging.level.org.hibernate.SQL=DEBUG
+```

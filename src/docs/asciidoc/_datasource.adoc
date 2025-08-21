@@ -2,56 +2,520 @@
 
 :sourcedir: ../../main/java/com/timvero/example/admin
 
-This section describes how to implement and use DataSource interfaces for integrating external data sources into the Feature Store system.
+External data integration powers modern lending decisions through the DataSource framework and Feature Store. DataSources fetch raw data from external APIs, while the Feature Store transforms this data into usable features for business logic and decision workflows.
 
-== DataSource Overview
+== Architecture Overview
 
-The DataSource framework provides a standardized way to fetch and process data from external sources. It consists of two main interfaces:
+The TimveroOS data integration follows a three-layer architecture:
 
-* **`DataSource<E>`** - Basic interface for fetching raw data with `getData(E subject)` method
-* **`MappedDataSource<E, T>`** - Extended interface that adds automatic parsing to typed objects with `parseRecord(Content data)` and `getType()` methods
+1. **DataSource Layer** - Fetches raw data from external APIs
+2. **DataSourceManager** - Manages caching, loading modes, and data lifecycle  
+3. **Feature Store** - Transforms raw data into business features through configurable mappings
 
-When external data is unavailable or the service returns an error, implementations should throw `DataUnavaliableException` to indicate the data cannot be retrieved.
+[source]
+----
+External API → DataSource → DataSourceManager → Feature Store → Business Logic
+----
 
-== Implementation Example: GitHub DataSource
+**Key Principle:** DataSources should never be used directly. Always access them through DataSourceManager or Feature Store.
 
-The GitHub DataSource demonstrates a complete implementation that fetches user data from the GitHub API.
+== DataSource Framework
 
-=== Class Structure
+=== Core Interfaces
 
 [source,java]
 ----
-include::{sourcedir}/risk/github/GithubDataSource.java[lines=15..22]
+public interface DataSource<E extends DataSourceSubject> {
+    Content getData(E subject) throws Exception;
+    Duration lifespan(); // How long data remains valid
+    
+    class Content {
+        private final byte[] body;
+        private final String mime;
+        // getters...
+    }
+}
 ----
+
+[source,java]
+----
+public interface MappedDataSource<E, T> extends DataSource<E> {
+    Class<T> getType();           // Target parsing type
+    T parseRecord(Content data);  // Parse raw data to typed object
+}
+----
+
+=== DataSourceManager - The Proper Access Layer
+
+**Never use DataSources directly.** Always use DataSourceManager which provides:
+
+* **Intelligent caching** - Avoids redundant API calls
+* **Loading modes** - Control when to fetch vs use cached data
+* **Data lifecycle** - Automatic expiration and invalidation
+* **Error handling** - Graceful degradation when data unavailable
+
+[source,java]
+----
+public interface DataSourceManager {
+    <E extends DataSourceSubject> Optional<DataSourceRecord> getData(
+        E entity, String dataSourceName, LoadingMode mode) throws IOException;
+    
+    enum LoadingMode {
+        READ,   // Use cached data only
+        QUERY,  // Use cache or fetch if missing
+        FORCE   // Always fetch fresh data
+    }
+}
+----
+
+== Complete Implementation Example: GitHub DataSource
+
+The GitHub DataSource demonstrates a production-ready implementation that fetches user data from the GitHub API for risk assessment purposes.
+
+=== Service Declaration
+
+[source,java]
+----
+@Service(GithubDataSource.DATASOURCE_NAME)
+public class GithubDataSource implements MappedDataSource<GithubDataSourceSubject, GithubUser> {
+    public static final String DATASOURCE_NAME = "github";
+    
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final String GITHUB_API_BASE_URL = "https://api.github.com";
+----
+
+**Key Points:**
+* **`@Service` with name** - Makes DataSource discoverable by the platform
+* **Constant naming** - Consistent reference for DataSource identification
+* **RestTemplate** - Spring's HTTP client for API calls
+* **ObjectMapper** - Jackson for JSON parsing with flexible configuration
+
+=== HTTP Configuration
+
+[source,java]
+----
+{
+    objectMapper.configure(FAIL_ON_UNKNOWN_PROPERTIES, false);
+}
+
+private HttpEntity<String> createHttpEntity() {
+    HttpHeaders headers = new HttpHeaders();
+    headers.set("Accept", "application/vnd.github.v3+json");
+    return new HttpEntity<>(headers);
+}
+----
+
+**Best Practices:**
+* **Flexible JSON parsing** - `FAIL_ON_UNKNOWN_PROPERTIES = false` handles API changes
+* **API versioning** - Explicit version headers ensure consistent responses
+* **Reusable headers** - Centralized HTTP configuration
 
 === Data Retrieval Implementation
 
 [source,java]
 ----
-include::{sourcedir}/risk/github/GithubDataSource.java[lines=34..48]
+@Override
+public Content getData(GithubDataSourceSubject subject) throws Exception {
+    try {
+        String url = GITHUB_API_BASE_URL + "/users/" + subject.getGithubUsername();
+        ResponseEntity<byte[]> response = restTemplate.exchange(
+            url,
+            HttpMethod.GET,
+            createHttpEntity(),
+            byte[].class
+        );
+        return new Content(response.getBody(), MediaType.APPLICATION_JSON_VALUE);
+    } catch (HttpClientErrorException.NotFound e) {
+        throw new DataUnavailableException("User not found: " + subject.getGithubUsername());
+    }
+}
 ----
 
-=== Data Parsing Implementation
+**Implementation Details:**
+* **URL construction** - Safe string concatenation with subject data
+* **Byte array response** - Preserves raw data for Content object
+* **Exception mapping** - HTTP 404 becomes `DataUnavailableException`
+* **Media type preservation** - Maintains content type for parsing
+
+=== Type Information and Parsing
 
 [source,java]
 ----
-include::{sourcedir}/risk/github/GithubDataSource.java[lines=50..53]
+@Override
+public Class<GithubUser> getType() {
+    return GithubUser.class;
+}
+
+@Override
+public GithubUser parseRecord(Content data) throws IOException {
+    return objectMapper.readValue(data.getBody(), GithubUser.class);
+}
 ----
 
-=== Subject and Target Objects
+**Type Safety:**
+* **Generic type preservation** - `getType()` enables runtime type checking
+* **Automatic parsing** - Platform can automatically parse Content to target type
+* **Exception handling** - Jackson exceptions bubble up as DataSource exceptions
 
-The subject object defines what data to fetch. In this example, it's a simple wrapper for the GitHub username:
+== Subject and Target Objects
+
+=== Subject Interface
+
+The subject defines what data to fetch from the external source:
 
 [source,java]
 ----
-include::{sourcedir}/risk/github/GithubDataSourceSubject.java[lines=1..10]
+public interface GithubDataSourceSubject {
+    String getGithubUsername();
+}
 ----
 
-The target object represents the parsed data structure:
+**Design Principles:**
+* **Interface-based** - Allows multiple entities to implement the same subject
+* **Minimal contract** - Only required data for the external API call
+* **Clear naming** - Method names match the external API requirements
+
+=== Target Data Class
+
+The target object represents the parsed external data:
 
 [source,java]
 ----
-include::{sourcedir}/risk/github/GithubUser.java[lines=1..15]
+public class GithubUser {
+    private String login;
+    private String name;
+    @JsonProperty("followers")
+    private int followersCount;
+    @JsonProperty("following")
+    private int followingCount;
+    @JsonProperty("public_repos")
+    private int publicRepos;
+    @JsonProperty("avatar_url")
+    private String avatarUrl;
+    
+    // Constructors, getters, and setters...
+}
 ----
 
-NOTE: In the platform, `Participant` entity implements the DataSource Subject pattern and can be used directly as a subject for various data sources.
+**JSON Mapping:**
+* **`@JsonProperty`** - Maps JSON field names to Java properties
+* **Selective fields** - Only include relevant data for your application
+* **Type safety** - Strong typing for external API responses
+
+== Entity Integration Pattern
+
+The power of DataSources comes from integrating them directly with your business entities:
+
+=== Entity Implementation
+
+[source,java]
+----
+@Entity
+public class Participant extends AbstractAuditable<UUID> 
+    implements GithubDataSourceSubject {
+    
+    @Column
+    private String githubUsername;
+    
+    @Override
+    public String getGithubUsername() {
+        return githubUsername;
+    }
+    
+    // Other entity fields and methods...
+}
+----
+
+**Integration Benefits:**
+* **Direct entity support** - No additional mapping layers needed
+* **Type safety** - Compile-time checking of subject contracts
+* **Automatic discovery** - Platform can find applicable DataSources
+
+=== Proper Usage Through DataSourceManager
+
+**❌ WRONG - Never use DataSources directly:**
+[source,java]
+----
+@Autowired
+@Qualifier("github")
+private MappedDataSource<GithubDataSourceSubject, GithubUser> githubDataSource;
+
+// DON'T DO THIS - bypasses caching and lifecycle management
+GithubUser data = githubDataSource.parseRecord(githubDataSource.getData(participant));
+----
+
+**✅ CORRECT - Use DataSourceManager:**
+[source,java]
+----
+@Autowired
+private DataSourceManager dataSourceManager;
+
+public void enrichParticipantData(Participant participant) {
+    try {
+        Optional<DataSourceRecord> record = dataSourceManager.getData(
+            participant, "github", LoadingMode.QUERY);
+        
+        if (record.isPresent()) {
+            GithubUser githubData = (GithubUser) record.get().getData();
+            assessDeveloperRisk(participant, githubData);
+        }
+    } catch (IOException e) {
+        log.warn("GitHub data unavailable for participant: {}", participant.getId());
+        // Continue without GitHub data
+    }
+}
+----
+
+**Loading Mode Benefits:**
+* **`READ`** - Fast, uses only cached data for performance-critical paths
+* **`QUERY`** - Balanced, fetches if needed for standard workflows  
+* **`FORCE`** - Fresh data for critical decisions or data refresh workflows
+
+== Feature Store Integration
+
+The Feature Store is the **primary way** to consume DataSource data in business logic. It transforms raw external data into structured features through configurable field mappings.
+
+=== What are Features?
+
+A feature is a data transformation that converts raw data from integrated sources into a format usable by workflow decision logic:
+
+* **Direct value extractions** - Credit scores from bureau data
+* **Calculated values** - Debt-to-income ratios  
+* **Derived indicators** - Payment pattern analysis
+* **Aggregated metrics** - Total outstanding debt
+
+=== Feature Store Benefits
+
+✅ **Configurable transformations** - Change feature extraction without code changes  
+✅ **Automatic caching** - Features are computed once and stored  
+✅ **Version management** - Track changes to feature definitions  
+✅ **Type safety** - Features have defined data types  
+✅ **Error handling** - Graceful handling of transformation failures  
+✅ **Audit trail** - Complete history of feature values  
+✅ **Performance** - Bulk feature extraction and caching  
+
+The Feature Store automatically uses DataSourceManager to fetch data with appropriate caching and lifecycle management, then applies configurable transformations to create business-ready features.
+
+**Note:** Feature Store implementation and usage is covered in the Feature Store documentation. This chapter focuses on the underlying DataSource implementation that powers the Feature Store.
+
+== Advanced Patterns
+
+=== Multiple DataSource Support
+
+Entities can implement multiple subject interfaces for different data sources:
+
+[source,java]
+----
+@Entity
+public class Participant implements GithubDataSourceSubject, CreditBureauSubject {
+    
+    @Override
+    public String getGithubUsername() {
+        return githubUsername;
+    }
+    
+    @Override
+    public String getNationalId() {
+        return getClient().getIndividualInfo().getNationalId();
+    }
+}
+----
+
+=== DataSource Lifespan Configuration
+
+Configure how long data remains valid to balance freshness vs performance:
+
+[source,java]
+----
+@Service("github")
+public class GithubDataSource implements MappedDataSource<GithubDataSourceSubject, GithubUser> {
+    
+    @Override
+    public Duration lifespan() {
+        return Duration.ofHours(24); // GitHub data valid for 24 hours
+    }
+    
+    @Override
+    public Content getData(GithubDataSourceSubject subject) throws Exception {
+        // Implementation...
+    }
+}
+----
+
+=== Error Recovery Strategies
+
+Implement fallback mechanisms for critical data sources using DataSourceManager:
+
+[source,java]
+----
+@Autowired
+private DataSourceManager dataSourceManager;
+
+public GithubUser getGithubDataWithFallback(Participant participant) {
+    try {
+        Optional<DataSourceRecord> record = dataSourceManager.getData(
+            participant, "github", LoadingMode.QUERY);
+        
+        if (record.isPresent()) {
+            return (GithubUser) record.get().getData();
+        }
+    } catch (IOException e) {
+        log.warn("Primary GitHub data unavailable, trying fallback", e);
+    }
+    
+    // Try with cached data only as fallback
+    try {
+        Optional<DataSourceRecord> cachedRecord = dataSourceManager.getData(
+            participant, "github", LoadingMode.READ);
+        
+        if (cachedRecord.isPresent()) {
+            log.info("Using cached GitHub data for participant: {}", participant.getId());
+            return (GithubUser) cachedRecord.get().getData();
+        }
+    } catch (IOException e) {
+        log.warn("Cached GitHub data also unavailable", e);
+    }
+    
+    return null; // No data available
+}
+----
+
+== Common Use Cases
+
+=== Credit Bureau Integration
+
+[source,java]
+----
+@Service("creditBureau")
+public class CreditBureauDataSource 
+    implements MappedDataSource<CreditBureauSubject, CreditReport> {
+    
+    @Override
+    public Content getData(CreditBureauSubject subject) throws Exception {
+        // Call credit bureau API with SSN/National ID
+        // Handle authentication, rate limiting, etc.
+    }
+}
+----
+
+=== KYC Provider Integration
+
+[source,java]
+----
+@Service("kycProvider")
+public class KYCDataSource 
+    implements MappedDataSource<KYCSubject, KYCResult> {
+    
+    @Override
+    public Content getData(KYCSubject subject) throws Exception {
+        // Document verification, sanctions screening, etc.
+    }
+}
+----
+
+=== Bank Account Verification
+
+[source,java]
+----
+@Service("bankVerification")
+public class BankVerificationDataSource 
+    implements MappedDataSource<BankAccountSubject, AccountVerification> {
+    
+    @Override
+    public Content getData(BankAccountSubject subject) throws Exception {
+        // Verify bank account ownership and status
+    }
+}
+----
+
+== Testing DataSources
+
+=== Unit Testing
+
+[source,java]
+----
+@Test
+public void testGithubDataSource() throws Exception {
+    GithubDataSourceSubject subject = () -> "octocat";
+    
+    Content content = githubDataSource.getData(subject);
+    GithubUser user = githubDataSource.parseRecord(content);
+    
+    assertThat(user.getLogin()).isEqualTo("octocat");
+    assertThat(user.getPublicRepos()).isGreaterThan(0);
+}
+----
+
+=== Integration Testing
+
+[source,java]
+----
+@Test
+public void testDataUnavailableHandling() {
+    GithubDataSourceSubject subject = () -> "nonexistentuser12345";
+    
+    assertThatThrownBy(() -> githubDataSource.getData(subject))
+        .isInstanceOf(DataUnavailableException.class)
+        .hasMessageContaining("User not found");
+}
+----
+
+== Best Practices
+
+=== Architecture Patterns
+
+✅ **Use Feature Store for business logic** - Primary pattern for consuming external data  
+✅ **Use DataSourceManager for direct access** - When you need raw data or custom processing  
+✅ **Never use DataSources directly** - Always go through DataSourceManager or Feature Store  
+✅ **Choose appropriate loading modes** - READ for performance, QUERY for balance, FORCE for freshness  
+✅ **Handle data unavailability gracefully** - Continue workflow when external data is missing  
+✅ **Implement proper subject interfaces** - Clear contracts for what data to fetch  
+✅ **Use typed target objects** - Strong typing for external API responses  
+
+=== DataSource Implementation
+
+✅ **Use meaningful service names** - `@Service("github")` not `@Service("ds1")`  
+✅ **Handle errors gracefully** - Always throw `DataUnavailableException` for missing data  
+✅ **Configure JSON parsing** - Use `FAIL_ON_UNKNOWN_PROPERTIES = false` for API resilience  
+✅ **Set appropriate lifespans** - Balance freshness vs API call costs  
+✅ **Version your APIs** - Use explicit API version headers  
+✅ **Test thoroughly** - Test both success and failure scenarios  
+✅ **Implement proper parsing** - Handle all expected data formats and edge cases  
+
+=== DataSourceManager Usage
+
+✅ **Use appropriate loading modes** - Match mode to business requirements  
+✅ **Handle Optional results** - Check if data is present before using  
+✅ **Catch IOException properly** - Handle network and data access failures  
+✅ **Log data access patterns** - Monitor usage for performance optimization  
+✅ **Implement fallback strategies** - Use cached data when fresh data unavailable  
+
+=== Security and Performance
+
+✅ **Log appropriately** - Log errors but not sensitive data  
+✅ **Add retry logic** - Handle temporary network failures  
+✅ **Set reasonable timeouts** - Don't block indefinitely  
+✅ **Monitor data freshness** - Track when data was last updated  
+✅ **Use lifespans effectively** - Avoid unnecessary API calls  
+
+=== Anti-Patterns
+
+❌ **Don't use DataSources directly** - Bypasses caching and lifecycle management  
+❌ **Don't bypass Feature Store for business logic** - Use Feature Store instead of raw DataSource data  
+❌ **Don't ignore Optional results** - Always check if data is present  
+❌ **Don't hardcode loading modes** - Choose based on business requirements  
+❌ **Don't expose sensitive data** - Never log API keys or personal information  
+❌ **Don't hardcode URLs** - Use configuration properties for API endpoints  
+❌ **Don't ignore exceptions** - Handle `IOException` and `DataUnavailableException`  
+
+=== Production Checklist
+
+- [ ] DataSources use meaningful service names
+- [ ] All external calls have appropriate timeouts
+- [ ] Error handling covers `DataUnavailableException` and `IOException`
+- [ ] Loading modes are chosen appropriately for each use case
+- [ ] Sensitive data is never logged
+- [ ] DataSource lifespans balance freshness vs cost
+- [ ] Subject interfaces are properly implemented
+- [ ] Target objects handle all expected data formats

@@ -1,0 +1,842 @@
+= Offer Engine & Credit Products
+:sourcedir: ../../main/java
+
+**Purpose**: Generate personalized loan offers based on credit products, participant data, and business rules.
+
+The Offer Engine transforms static credit product templates into personalized offers by evaluating participant risk data, workflow results, and business rules through configurable scripts.
+
+== Process Flow
+
+The offer generation follows this sequence:
+
+[cols="1,1,1,1,1", options="header"]
+|===
+|Product Template |Risk Assessment |Personalized Offer |Select Condition |Active Credit
+
+|• Amount ranges
+• Interest rates  
+• Terms
+• Payment engine
+|• Credit score
+• Income data
+• Workflow results
+• External data
+|• Adjusted amounts
+• Final rates
+• Secured options
+|• Participant chooses offer
+• Payment schedule
+• Signs contract
+|• Credit entity
+• Active servicing
+|===
+
+== What You'll Build
+
+* **Credit Products**: Loan product templates with terms and parameters
+* **Product Additives**: Specific configurations within products (rates, conditions)
+* **Offer Generation**: Automated personalized offer creation
+* **Secured Offers**: Collateral-based offer variants
+* **Integration**: Workflow-driven offer generation
+
+== Core Concepts
+
+=== Credit Products
+
+Credit products define the basic parameters for loan types - amounts, terms, currencies, and fees.
+
+[source,java]
+----
+@Entity
+public class ExampleCreditProduct extends CreditProduct {
+    private CurrencyUnit currency;        // USD, EUR, etc.
+    private BigDecimal minAmount;         // $1,000
+    private BigDecimal maxAmount;         // $50,000
+    private Integer minTerm;              // 6 months
+    private Integer maxTerm;              // 60 months
+    private BigDecimal lateFeeRate;       // 5% late fee
+    private String engineName;            // "SimpleScheduledEngine"
+    
+    // Constructor and getters/setters omitted for brevity
+}
+----
+
+**Key Features:**
+* **Amount Ranges**: Min/max loan amounts with currency
+* **Term Ranges**: Min/max loan terms in months
+* **Fee Structure**: Late fee rates and other charges
+* **Engine Integration**: Links to offer generation engines
+
+==== Payment Calculation Engines
+
+Credit products integrate with payment calculation engines to generate detailed payment schedules. The `engineName` field references a Spring service that implements the `ScheduledEngine` interface to calculate how loan amounts are split into principal and interest payments over time.
+
+[source,java]
+----
+// Example: SimpleScheduledEngine for standard annuity payments
+@Service("SimpleScheduledEngine")
+public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondition> {
+    
+    @Override
+    public List<PaymentSegment> payments(ExampleCreditCondition condition, 
+                                       LocalDate interestStart, LocalDate paymentStart,
+                                       MonetaryAmount principal, MonetaryAmount interest) {
+        // Calculate payment schedule based on loan terms
+        // Each PaymentSegment contains payment date, principal/interest breakdown,
+        // and remaining balances after payment
+        return payments;
+    }
+}
+----
+
+**Engine Purpose:**
+* **Payment Breakdown**: Calculates how much of each payment goes to principal vs interest
+* **Schedule Generation**: Creates complete payment timeline with remaining balances
+* **Algorithm Flexibility**: Different engines can implement various payment calculation methods (annuity, differentiated, interest-only, etc.)
+
+**Integration:**
+* **Product Configuration**: Credit product's `engineName` field matches Spring service name
+* **Automatic Discovery**: Platform automatically finds and manages all ScheduledEngine beans
+* **Validation**: System ensures payment calculations are mathematically correct (remaining debt = 0)
+
+=== Product Additives
+
+Additives are specific configurations within products that define interest rates, procuring types, and offer generation rules.
+
+[source,java]
+----
+@Entity
+public class ExampleCreditProductAdditive extends CreditProductAdditive {
+    private String name;                  // "Prime Rate", "Standard Rate"
+    private BigDecimal interestRate;      // 8.5%, 12.9%
+    private BigDecimal minAmount;         // Refined amount ranges
+    private BigDecimal maxAmount;         // within product limits
+    private Integer minTerm;              // Refined term ranges
+    private Integer maxTerm;              // within product limits
+
+    @Override
+    public ExampleProductOffer createOffer() {
+        return new ExampleProductOffer();
+    }
+    
+    // Standard getters/setters omitted for brevity
+}
+----
+
+**Additive Purpose:**
+* **Interest Rates**: Specific rates for different risk segments
+* **Procuring Types**: Collateral or guarantee requirements  
+* **Offer Engines**: Scripts that generate personalized offers
+* **Term Variations**: Different terms within product ranges
+
+=== Product Offers
+
+Generated offers are personalized versions of product additives tailored to specific participants.
+
+[source,java]
+----
+@Entity
+public class ExampleProductOffer extends ProductOffer {
+    private UUID uuid;                    // Unique offer identifier
+    private Participant participant;      // Who gets this offer
+    private BigDecimal minAmount;         // Personalized min amount
+    private BigDecimal maxAmount;         // Personalized max amount  
+    private Integer minTerm;              // Personalized min term
+    private Integer maxTerm;              // Personalized max term
+
+    // Links back to product and participant's application
+    public Application getApplication() {
+        return participant.getApplication();
+    }
+    
+    // Standard getters/setters omitted for brevity
+}
+----
+
+**Offer Characteristics:**
+* **Personalized Terms**: Adjusted amounts and terms based on risk assessment
+* **Participant Link**: Connected to specific application participant
+* **Product Reference**: Links back to originating additive and product
+* **UUID Tracking**: Unique identifier for offer selection and tracking
+
+== Offer Generation Process
+
+=== Core Engine
+
+The `OfferEngine` orchestrates the generation process by combining product configurations with participant data.
+
+**Generation Flow:**
+1. **Product Selection**: Find products matching participant's execution result type
+2. **Data Processing**: Extract participant data using configured processor
+3. **Script Execution**: Run offer generation scripts for each additive
+4. **Offer Creation**: Generate personalized offers based on script results
+5. **Persistence**: Save offers and link to participant
+
+=== Data Processing
+
+Implement `OfferEngineDataProcessor` to map participant data for offer generation:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/offer/ExampleDataProcessor.java[tags=processor]
+----
+
+**Data Sources:**
+* **Workflow Results**: Decision process outcomes and scoring
+* **Pending Decisions**: Incomplete workflow data
+* **Participant Profile**: Personal and financial information
+* **Risk Assessment**: External data source results
+
+=== Offer Service
+
+The service layer coordinates offer generation with error handling:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/offer/ProductOfferService.java[tags=service]
+----
+
+**Service Responsibilities:**
+* **Transaction Management**: Ensures atomic offer generation
+* **Error Handling**: Captures and stores generation exceptions
+* **Product Loading**: Retrieves active products for generation
+* **Offer Persistence**: Saves generated offers to database
+
+== Secured Offers & Procuring Engines
+
+Secured offers extend basic offers with collateral or guarantee requirements through the ProcuringEngine pattern.
+
+=== Procuring Engine Pattern
+
+The `ProcuringEngine` transforms basic product offers into secured variants with specific collateral requirements:
+
+[source,java]
+----
+@Component
+public class PenaltyProcuringEngine implements ProcuringEngine {
+
+    @Override
+    public ProcuringType procuringType() {
+        return PENALTY;
+    }
+
+    @Override
+    public Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer productOffer) {
+        return List.of(new PenaltySecuredOffer((ExampleProductOffer) productOffer));
+    }
+}
+----
+
+**Engine Responsibilities:**
+* **Procuring Type**: Defines what type of collateral/guarantee required
+* **Offer Generation**: Creates secured variants from basic offers
+* **Business Logic**: Implements specific procuring strategies
+* **Flexibility**: Multiple engines can handle different collateral types
+
+=== Procuring Types
+
+Define the types of collateral or guarantee requirements:
+
+[source,java]
+----
+@Configuration
+public class ExampleProcuringType {
+
+    public static final String CODE_PENALTY = "PENALTY";
+    public static final ProcuringType PENALTY = new ProcuringType(CODE_PENALTY);
+    
+    // Other procuring types:
+    // VEHICLE_COLLATERAL, PROPERTY_COLLATERAL, COSIGNER, etc.
+}
+----
+
+**Common Procuring Types:**
+* **NO_PROCURING**: Unsecured loans based on creditworthiness
+* **PENALTY**: Higher rates with penalty clauses for default
+* **VEHICLE_COLLATERAL**: Car loans with vehicle as collateral
+* **PROPERTY_COLLATERAL**: Mortgages with property as collateral
+* **COSIGNER**: Loans requiring guarantor/co-signer
+
+=== Secured Offer Structure
+
+Secured offers link to original offers while adding procuring-specific terms:
+
+[source,java]
+----
+@Entity
+@Table(name = "penalty_secured_offer")
+@DiscriminatorValue(ExampleProcuringType.CODE_PENALTY)
+public class PenaltySecuredOffer extends ExampleSecuredOffer {
+
+    protected PenaltySecuredOffer() {
+    }
+
+    public PenaltySecuredOffer(ExampleProductOffer originalOffer) {
+        super(originalOffer, ExampleProcuringType.PENALTY);
+    }
+
+    @Override
+    public String getOfferKey() {
+        return getOriginalOffer().getUuid() + ":PENALTY";
+    }
+}
+----
+
+**Base Secured Offer:**
+[source,java]
+----
+@Entity
+@Table(name = "secured_offer")
+@Inheritance(strategy = InheritanceType.JOINED)
+@DiscriminatorColumn(name = "procuring_type", discriminatorType = DiscriminatorType.STRING)
+public abstract class ExampleSecuredOffer extends SecuredOffer {
+
+    @ManyToOne(fetch = FetchType.EAGER, optional = false)
+    private ExampleProductOffer originalOffer;
+
+    @Column(name = "procuring_type", insertable = false, updatable = false)
+    private ProcuringType procuringType;
+
+    public ExampleSecuredOffer(ExampleProductOffer originalOffer, ProcuringType procuringType) {
+        this.originalOffer = originalOffer;
+        this.procuringType = procuringType;
+    }
+
+    // Abstract method for unique offer identification
+    public abstract String getOfferKey();
+}
+----
+
+**Secured Offer Features:**
+* **Original Offer Reference**: Links to base product offer terms
+* **Procuring Type**: Specifies collateral/guarantee requirements
+* **Inheritance Strategy**: Supports multiple secured offer types
+* **Offer Key**: Unique identifier combining offer UUID and procuring type
+* **Flexible Structure**: Each procuring type can have custom fields and logic
+
+=== Procuring Engine Integration
+
+Procuring engines integrate with the main offer generation flow:
+
+**Generation Process:**
+1. **Basic Offers**: OfferEngine generates standard ProductOffers
+2. **Procuring Analysis**: System identifies applicable procuring types
+3. **Secured Generation**: Each ProcuringEngine creates secured variants
+4. **Offer Portfolio**: Participant receives both basic and secured options
+5. **Selection**: Participant chooses preferred offer type
+
+**Business Benefits:**
+* **Risk Mitigation**: Collateral reduces lender risk
+* **Rate Optimization**: Secured offers can have lower interest rates
+* **Market Expansion**: Serve customers who need collateral-based options
+* **Regulatory Compliance**: Meet requirements for different loan types
+
+=== Custom Procuring Engines
+
+**1. Define Procuring Type**
+```java
+@Configuration
+public class MyProcuringTypes {
+    public static final String CODE_VEHICLE = "VEHICLE_COLLATERAL";
+    public static final ProcuringType VEHICLE = new ProcuringType(CODE_VEHICLE);
+}
+```
+
+**2. Implement Procuring Engine**
+```java
+@Component
+public class VehicleProcuringEngine implements ProcuringEngine {
+    
+    @Override
+    public ProcuringType procuringType() {
+        return MyProcuringTypes.VEHICLE;
+    }
+    
+    @Override
+    public Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer productOffer) {
+        // Business logic for vehicle-secured offers
+        VehicleSecuredOffer securedOffer = new VehicleSecuredOffer((MyProductOffer) productOffer);
+        // Adjust terms based on vehicle value, age, etc.
+        return List.of(securedOffer);
+    }
+}
+```
+
+**3. Create Secured Offer Entity**
+```java
+@Entity
+@Table(name = "vehicle_secured_offer")
+@DiscriminatorValue(MyProcuringTypes.CODE_VEHICLE)
+public class VehicleSecuredOffer extends MySecuredOffer {
+    
+    @Column(name = "vehicle_value")
+    private BigDecimal vehicleValue;
+    
+    @Column(name = "vehicle_year")
+    private Integer vehicleYear;
+    
+    // Vehicle-specific offer logic
+}
+```
+
+== Integration Patterns
+
+=== Offer to Credit Conversion
+
+The conversion from offer to active credit happens in two phases: **condition selection** and **contract signature**.
+
+**Phase 1: Offer Selection & Condition Creation**
+
+When a participant selects an offer, the system creates a credit condition and prepares for contract signature:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/submit-regular")
+public class SelectRegularConditionAction extends SelectConditionAction<ExampleProductOffer, ConditionForm> {
+
+    @Override
+    protected EntityAction<? super ExampleProductOffer, ConditionForm> action() {
+        return when(o -> o.getApplication().getCondition() == null
+            && o.getApplication().getStatus().equals(ApplicationStatus.CONDITION_CHOOSING)
+            && o.getParticipant().getStatus() == ParticipantStatus.APPROVED).then((offer, form, user) -> {
+                
+                Application application = offer.getApplication();
+                ExampleSecuredOffer securedOffer = findSecuredOffer(offer, form.getSecuredOfferKey());
+
+                // Calculate payment terms
+                MonetaryAmount principal = form.getPrincipal();
+                BigDecimal interestRate = offer.getProductAdditive().getInterestRate();
+                Integer term = form.getTerm();
+                
+                MonetaryAmount regularPayment = PaymentCalculator.calcAnnuityPayment(
+                    principal, MonetaryUtil.zero(principal.getCurrency()), 
+                    periodicInterest(Period.ofMonths(1), interestRate), term, 0);
+
+                // Create credit condition
+                ExampleCreditCondition condition = new ExampleCreditCondition(
+                    principal, offer.getCreditProduct().getEngineName(), 
+                    interestRate, offer.getCreditProduct().getLateFeeRate(),
+                    Method_30_360_BB.NAME, Period.ofMonths(1), term, 
+                    regularPayment, securedOffer);
+                
+                application.setCondition(condition);
+
+                // Generate payment schedule
+                PaymentSchedule paymentSchedule = scheduledService.getPaymentSchedule(
+                    condition, form.getPrincipal(), form.getStart());
+                application.setPaymentSchedule(paymentSchedule);
+
+                // Move to contract signature phase
+                application.setStatus(ApplicationStatus.PENDING_CONTRACT_SIGNATURE);
+                
+                // Generate contract document
+                documentService.generate(application.getBorrowerParticipant(),
+                    ParticipantDocumentTypesConfiguration.APPLICATION_CONTRACT,
+                    offer.getCreditProduct().getUuidContractTemplate());
+            });
+    }
+}
+----
+
+**Phase 2: Contract Signature & Credit Creation**
+
+When the contract is signed, an EntityChecker automatically creates the active credit:
+
+[source,java]
+----
+@Component
+public class ContractSignChecker extends EntityChecker<Application, UUID> {
+
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<Application> registry) {
+        registry.entityChange(SignableDocument.class,
+                d -> participantRepository.getReferenceById(d.getOwnerId()).getApplication())
+            .updated(SignableDocument_.STATUS)
+            .and(d -> d.getStatus() == SignatureStatus.SIGNED
+                && d.getDocumentType() == ParticipantDocumentTypesConfiguration.APPLICATION_CONTRACT);
+    }
+
+    @Override
+    protected boolean isAvailable(Application application) {
+        return application.getStatus().equals(ApplicationStatus.PENDING_CONTRACT_SIGNATURE);
+    }
+
+    @Override
+    protected void perform(Application application) {
+        // Update application status
+        application.setStatus(ApplicationStatus.SERVICING);
+
+        // Get contract signature date
+        LocalDate signDate = documentFinder
+            .latest(application.getBorrowerParticipant(), 
+                   ParticipantDocumentTypesConfiguration.APPLICATION_CONTRACT)
+            .get().getDecisionMadeAt().atZone(ZoneId.systemDefault()).toLocalDate();
+
+        // Create active credit
+        ExampleCredit credit = new ExampleCredit();
+        credit.setApplication(application);
+        credit.setCondition(application.getCondition());
+        credit.setStartDate(signDate);
+        entityManager.persist(credit);
+
+        // Initialize credit calculations
+        calculationService.calculate(credit.getId(), signDate, signDate);
+    }
+}
+----
+
+**Complete Conversion Flow:**
+
+1. **Offer Generation**: Participant gets approved → offers generated via `GenerateOffersParticipantAction`
+2. **Offer Selection**: Participant selects offer → `SelectRegularConditionAction` creates `CreditCondition`
+3. **Contract Generation**: System generates contract document for signature
+4. **Contract Signature**: Participant signs contract → triggers `ContractSignChecker`  
+5. **Credit Creation**: Checker creates `ExampleCredit` and initializes calculations
+6. **Servicing**: Credit becomes active and ready for operations
+
+**Key Components:**
+* **ConditionForm**: Captures participant's chosen amount, term, and start date
+* **CreditCondition**: Immutable terms including payment calculation and secured offer reference
+* **PaymentSchedule**: Pre-calculated payment schedule based on selected terms
+* **EntityChecker**: Automated credit creation triggered by contract signature
+* **CreditCalculationService**: Initializes credit balances and schedules
+
+=== Workflow Integration
+
+Offers are typically generated after participant approval:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/participant/action/GenerateOffersParticipantAction.java[tags=action]
+----
+
+**Integration Points:**
+* **Status Checking**: Only approved participants get offers
+* **Error Recovery**: Regenerate offers if previous attempt failed  
+* **Timing Control**: Manual or automated generation triggers
+* **UI Integration**: Action buttons and status indicators
+
+=== Display Integration
+
+Format offers for user interface display:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/application/ExampleProductOfferViewService.java[tags=view]
+----
+
+**Display Features:**
+* **Localization**: Multi-language offer descriptions
+* **Formatting**: Monetary amounts and interest rates
+* **Details**: Product names and procuring type descriptions
+* **Comparison**: Consistent format for offer comparison
+
+== Implementation Guide
+
+=== Creating Credit Products
+
+**1. Define Product Entity**
+```java
+@Entity
+public class MyLoanProduct extends CreditProduct {
+    // Custom fields for your loan type
+    private BigDecimal originationFee;
+    private Integer gracePeriodDays;
+    private String collateralRequirement;
+    
+    // Constructor and getters/setters omitted for brevity
+}
+```
+
+**2. Configure Product Additives**
+```java
+@Entity  
+public class MyLoanAdditive extends CreditProductAdditive {
+    private String riskSegment;
+    private BigDecimal baseRate;
+    private Boolean allowsSecuredOffers;
+    
+    @Override
+    public ProductOffer createOffer() {
+        return new MyLoanOffer();
+    }
+    
+    // Getters/setters omitted for brevity
+}
+```
+
+**3. Implement Custom Offers**
+```java
+@Entity
+public class MyLoanOffer extends ProductOffer {
+    private BigDecimal finalRate;
+    private String approvalConditions;
+    private BigDecimal loanToValueRatio;
+    
+    // Getters/setters omitted for brevity
+}
+```
+
+=== Implementing Secured Offers
+
+**1. Define Procuring Types**
+```java
+@Configuration
+public class MyProcuringTypes {
+    public static final String CODE_VEHICLE = "VEHICLE_COLLATERAL";
+    public static final String CODE_PROPERTY = "PROPERTY_COLLATERAL";
+    public static final String CODE_COSIGNER = "COSIGNER";
+    
+    public static final ProcuringType VEHICLE = new ProcuringType(CODE_VEHICLE);
+    public static final ProcuringType PROPERTY = new ProcuringType(CODE_PROPERTY);
+    public static final ProcuringType COSIGNER = new ProcuringType(CODE_COSIGNER);
+}
+```
+
+**2. Create Base Secured Offer**
+```java
+@Entity
+@Table(name = "my_secured_offer")
+@Inheritance(strategy = InheritanceType.JOINED)
+@DiscriminatorColumn(name = "procuring_type", discriminatorType = DiscriminatorType.STRING)
+public abstract class MySecuredOffer extends SecuredOffer {
+
+    @ManyToOne(fetch = FetchType.EAGER, optional = false)
+    private MyLoanOffer originalOffer;
+
+    @Column(name = "procuring_type", insertable = false, updatable = false)
+    private ProcuringType procuringType;
+    
+    @Column(name = "adjusted_interest_rate")
+    private BigDecimal adjustedInterestRate;
+
+    protected MySecuredOffer() {}
+
+    public MySecuredOffer(MyLoanOffer originalOffer, ProcuringType procuringType) {
+        this.originalOffer = originalOffer;
+        this.procuringType = procuringType;
+    }
+
+    public abstract String getOfferKey();
+    
+    // Getters/setters omitted for brevity
+}
+```
+
+**3. Implement Specific Secured Offers**
+```java
+@Entity
+@Table(name = "vehicle_secured_offer")
+@DiscriminatorValue(MyProcuringTypes.CODE_VEHICLE)
+public class VehicleSecuredOffer extends MySecuredOffer {
+    
+    @Column(name = "vehicle_value")
+    private BigDecimal vehicleValue;
+    
+    @Column(name = "vehicle_year")
+    private Integer vehicleYear;
+    
+    @Column(name = "vehicle_make")
+    private String vehicleMake;
+    
+    @Column(name = "loan_to_value_ratio")
+    private BigDecimal loanToValueRatio;
+
+    protected VehicleSecuredOffer() {}
+
+    public VehicleSecuredOffer(MyLoanOffer originalOffer) {
+        super(originalOffer, MyProcuringTypes.VEHICLE);
+    }
+
+    @Override
+    public String getOfferKey() {
+        return getOriginalOffer().getUuid() + ":VEHICLE";
+    }
+    
+    // Business logic methods
+    public boolean isEligibleVehicle() {
+        return vehicleYear >= 2015 && vehicleValue.compareTo(BigDecimal.valueOf(5000)) >= 0;
+    }
+    
+    // Getters/setters omitted for brevity
+}
+
+@Entity
+@Table(name = "cosigner_secured_offer")
+@DiscriminatorValue(MyProcuringTypes.CODE_COSIGNER)
+public class CosignerSecuredOffer extends MySecuredOffer {
+    
+    @Column(name = "cosigner_credit_score")
+    private Integer cosignerCreditScore;
+    
+    @Column(name = "cosigner_income")
+    private BigDecimal cosignerIncome;
+    
+    @Column(name = "relationship_type")
+    private String relationshipType;
+
+    protected CosignerSecuredOffer() {}
+
+    public CosignerSecuredOffer(MyLoanOffer originalOffer) {
+        super(originalOffer, MyProcuringTypes.COSIGNER);
+    }
+
+    @Override
+    public String getOfferKey() {
+        return getOriginalOffer().getUuid() + ":COSIGNER";
+    }
+    
+    // Getters/setters omitted for brevity
+}
+```
+
+=== Creating Procuring Engines
+
+**1. Vehicle Collateral Engine**
+```java
+@Component
+public class VehicleProcuringEngine implements ProcuringEngine {
+    
+    @Override
+    public ProcuringType procuringType() {
+        return MyProcuringTypes.VEHICLE;
+    }
+    
+    @Override
+    public Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer productOffer) {
+        MyLoanOffer offer = (MyLoanOffer) productOffer;
+        VehicleSecuredOffer securedOffer = new VehicleSecuredOffer(offer);
+        
+        // Apply vehicle-specific business logic
+        BigDecimal baseRate = offer.getProductAdditive().getInterestRate();
+        
+        // Vehicle collateral typically reduces rate by 1-2%
+        BigDecimal adjustedRate = baseRate.subtract(BigDecimal.valueOf(0.015));
+        securedOffer.setAdjustedInterestRate(adjustedRate);
+        
+        // Set loan-to-value ratio (typically 80-90% for vehicles)
+        securedOffer.setLoanToValueRatio(BigDecimal.valueOf(0.85));
+        
+        return List.of(securedOffer);
+    }
+}
+```
+
+**2. Cosigner Engine**
+```java
+@Component
+public class CosignerProcuringEngine implements ProcuringEngine {
+    
+    @Override
+    public ProcuringType procuringType() {
+        return MyProcuringTypes.COSIGNER;
+    }
+    
+    @Override
+    public Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer productOffer) {
+        MyLoanOffer offer = (MyLoanOffer) productOffer;
+        CosignerSecuredOffer securedOffer = new CosignerSecuredOffer(offer);
+        
+        // Cosigner reduces risk, so lower interest rate
+        BigDecimal baseRate = offer.getProductAdditive().getInterestRate();
+        BigDecimal adjustedRate = baseRate.subtract(BigDecimal.valueOf(0.02));
+        securedOffer.setAdjustedInterestRate(adjustedRate);
+        
+        return List.of(securedOffer);
+    }
+}
+```
+
+**3. Property Collateral Engine**
+```java
+@Component
+public class PropertyProcuringEngine implements ProcuringEngine {
+    
+    private final PropertyValuationService propertyService;
+    
+    public PropertyProcuringEngine(PropertyValuationService propertyService) {
+        this.propertyService = propertyService;
+    }
+    
+    @Override
+    public ProcuringType procuringType() {
+        return MyProcuringTypes.PROPERTY;
+    }
+    
+    @Override
+    public Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer productOffer) {
+        MyLoanOffer offer = (MyLoanOffer) productOffer;
+        
+        // Only generate if participant has property
+        if (!hasEligibleProperty(offer.getParticipant())) {
+            return Collections.emptyList();
+        }
+        
+        PropertySecuredOffer securedOffer = new PropertySecuredOffer(offer);
+        
+        // Property collateral gets best rates
+        BigDecimal baseRate = offer.getProductAdditive().getInterestRate();
+        BigDecimal adjustedRate = baseRate.multiply(BigDecimal.valueOf(0.7)); // 30% reduction
+        securedOffer.setAdjustedInterestRate(adjustedRate);
+        
+        return List.of(securedOffer);
+    }
+    
+    private boolean hasEligibleProperty(Participant participant) {
+        // Business logic to check property ownership
+        return propertyService.hasVerifiedProperty(participant);
+    }
+}
+```
+
+=== Custom Data Processing
+
+**1. Implement Data Processor**
+```java
+@Component
+public class MyDataProcessor extends OfferEngineDataProcessor<UUID, MyEntity> {
+    
+    @Override
+    public ExecutionResultType getResultType() {
+        return new ExecutionResultType("MY_LOAN");
+    }
+    
+    @Override
+    public Collection<Map<String, Object>> mapToData(MyEntity entity) {
+        // Map entity data for offer generation
+        Map<String, Object> data = new HashMap<>();
+        data.put("creditScore", entity.getCreditScore());
+        data.put("income", entity.getMonthlyIncome());
+        return List.of(data);
+    }
+}
+```
+
+**2. Configure Offer Generation Scripts**
+
+Scripts evaluate participant data and return offer parameters:
+
+```javascript
+// Example offer generation script
+if (profile.creditScore >= 700) {
+    offer.interestRate = productAdditive.interestRate * 0.9; // 10% discount
+    offer.maxAmount = Math.min(profile.income * 12, productAdditive.maxAmount);
+    return offer;
+} else if (profile.creditScore >= 600) {
+    offer.interestRate = productAdditive.interestRate;
+    offer.maxAmount = Math.min(profile.income * 8, productAdditive.maxAmount);
+    return offer;
+} else {
+    return null; // No offer for low credit scores
+}
+```
+
+== Next Steps
+
+* **<<credit-management>>**: Convert selected offers into active credits
+* **<<workflow-integration>>**: Automate offer generation through workflows  
+* **<<operations>>**: Handle offer-related operations and modifications
+* **<<payment-transactions>>**: Process payments for accepted offers
+
+The Offer Engine provides the foundation for personalized lending by transforming static products into dynamic, risk-adjusted offers tailored to each participant's profile and circumstances.

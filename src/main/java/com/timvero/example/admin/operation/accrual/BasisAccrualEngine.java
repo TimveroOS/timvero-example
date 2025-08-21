@@ -6,9 +6,9 @@ import static com.timvero.servicing.engine.CreditCalculatorUtils.calcRangeAccura
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.scheduled.day_count.DayCountMethod;
+import com.timvero.scheduled.day_count.DayCounter;
 import com.timvero.scheduled.day_count.PaymentGrid;
 import com.timvero.servicing.credit.entity.debt.Debt;
-import com.timvero.servicing.engine.accural.AbstractAccrualEngine.DayCounter;
 import com.timvero.servicing.engine.distribution.OperationRecord;
 import com.timvero.servicing.engine.distribution.SnapshotRecord;
 import java.math.BigDecimal;

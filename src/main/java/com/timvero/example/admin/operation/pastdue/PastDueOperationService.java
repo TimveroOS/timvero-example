@@ -21,6 +21,7 @@ import com.timvero.servicing.engine.general.Snapshot;
 import com.timvero.servicing.engine.general.Snapshot.MutableDebt;
 import java.time.LocalDate;
 import java.time.Period;
+import java.time.temporal.ChronoUnit;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -149,6 +150,19 @@ public class PastDueOperationService implements CreditOperationHandler<PastDueOp
             .map(MonetaryAmount::negate).reduce(operation.getCondition().getRegularPayment(), MonetaryAmount::add);
     }
 
+    public int daysPastDue(Credit credit) {
+        LocalDate today = credit.getCalculationDate();
+        LocalDate pastDueDay = today;
+        for (CreditSnapshot snapshot : credit.getCreditSnapshots().reversed().values()) {
+            if (isPastDue(snapshot)) {
+                pastDueDay = snapshot.getDate();
+            } else {
+                continue;
+            }
+        }
+        return (int) ChronoUnit.DAYS.between(pastDueDay, today);
+    }
+
     public boolean isPastDue(CreditSnapshot creditSnapshot) {
         final Map<String, MonetaryAmount> accounts = creditSnapshot.getDebt().getAccounts();
         return SHIFT_ACCOUNTS.values().stream().anyMatch(accounts::containsKey);
@@ -161,6 +175,10 @@ public class PastDueOperationService implements CreditOperationHandler<PastDueOp
 
     public Optional<MonetaryAmount> getPastDueTotal(CreditSnapshot creditSnapshot) {
         return pastDue(creditSnapshot.getDebt());
+    }
+
+    public Optional<MonetaryAmount> getPastDueTotal(PastDueOperation operation) {
+        return operation.getFinalDebt().flatMap(this::pastDue);
     }
 
     private Optional<MonetaryAmount> pastDue(Debt debt) {
