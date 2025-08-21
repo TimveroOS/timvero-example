@@ -3,6 +3,7 @@ package com.timvero.example.admin.document.action;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.ParticipantRepository;
 import com.timvero.ground.action.EntityAction;
+import com.timvero.ground.document.exception.SignatureException;
 import com.timvero.ground.document.signable.SignableDocument;
 import com.timvero.ground.document.signable.SignatureStatus;
 import com.timvero.integration.docusign.DocusignSignatureService;
@@ -39,7 +40,7 @@ public class DocusignAction extends SimpleActionController<UUID, SignableDocumen
                 Participant participant = participantRepository.getReferenceById(document.getOwnerId());
                 try {
                     signatureService.sign(participant, document);
-                } catch (IOException e) {
+                } catch (IOException | SignatureException e) {
                     throw new RuntimeException(e);
                 }
             });

@@ -2,6 +2,7 @@ package com.timvero.example.admin.scheduled;
 
 import static com.timvero.ground.hibernate.type.ColumnDefenition.NUMERIC;
 
+import com.timvero.base.entity.UUIDPersistable;
 import com.timvero.example.admin.offer.entity.ExampleSecuredOffer;
 import com.timvero.scheduled.entity.CreditCondition;
 import jakarta.persistence.CascadeType;
@@ -15,15 +16,13 @@ import jakarta.persistence.Table;
 import jakarta.validation.constraints.NotNull;
 import java.math.BigDecimal;
 import java.time.Period;
-import java.util.UUID;
 import javax.money.MonetaryAmount;
 import org.hibernate.annotations.Immutable;
-import org.springframework.data.jpa.domain.AbstractPersistable;
 
 @Entity
 @Table(name = "credit_condition")
 @Immutable
-public class ExampleCreditCondition extends AbstractPersistable<UUID> implements CreditCondition {
+public class ExampleCreditCondition extends UUIDPersistable implements CreditCondition {
 
     @Embedded
     private MonetaryAmount principal;

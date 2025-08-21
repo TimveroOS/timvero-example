@@ -1,0 +1,387 @@
+= Docusign Integration
+
+:sourcedir: ../../main/java/com/timvero/example
+
+This section describes how to integrate Docusign electronic signature service into your Timvero application for document signing workflows.
+
+== Integration Overview
+
+The framework reduces DocuSign integration to three simple steps:
+
+1. **Entity implements DocusignSigner** - delegate to existing entity fields
+2. **Service calls framework** - one method call handles everything  
+3. **Optional webhook** - extend default for custom business logic
+
+**What the framework handles:**
+- DocuSign API authentication and session management
+- Envelope creation and document upload
+- Signer management and embedded URL generation  
+- Status polling fallback when webhooks fail
+- Multi-party signing workflows with routing order
+- Document template integration for signature placement
+
+**What you implement:**
+- Business logic for document selection based on application state
+- Mapping entity fields to signer information
+- Custom webhook logic (optional)
+
+== Configuration Setup
+
+=== Properties Configuration
+
+Add the following properties to your application configuration file (e.g., `application.properties`, `application.yml`, or environment-specific property files):
+
+[source,properties]
+----
+# DocuSign Configuration
+docusign.api.base.path=https://demo.docusign.net/restapi
+docusign.oauth.base.path=account-d.docusign.com
+docusign.rsa.key.file=classpath:/docusign/private.key
+docusign.client.id=602c4320-5b82-48bf-b0c9-9d47a84de053
+docusign.user.id=c2e5a6c9-fd35-477f-8104-e2e5385d251a
+----
+
+NOTE: The configuration values shown above are examples only. Your actual configuration will differ and should be obtained from your DocuSign account and environment setup.
+
+==== Property Descriptions
+
+
+**`docusign.api.base.path`**::
+Base URL for DocuSign REST API endpoints. The actual URLs may vary depending on your DocuSign environment and region. Refer to the DocuSign platform documentation for current API endpoints.
+
+**`docusign.oauth.base.path`**::
+OAuth base domain for DocuSign JWT authentication. Check the DocuSign platform documentation for the appropriate OAuth endpoints for your environment.
+
+**`docusign.rsa.key.file`**::
+Spring Resource path to the RSA private key file used for JWT authentication. Supports prefixes like `classpath:`, `file:`, etc.
+
+**`docusign.client.id`**::
+Integration Key (Client ID) for your DocuSign application. This value can be obtained from your DocuSign account on the platform.
+
+**`docusign.user.id`**::
+DocuSign User ID (GUID) associated with your integration. This value can be obtained from your DocuSign account on the platform.
+
+NOTE: All DocuSign-specific configuration values (API endpoints, Client ID, User ID) should be obtained from your DocuSign account dashboard. Refer to the DocuSign developer documentation for detailed instructions on locating these values.
+
+=== Private Key Setup
+
+The DocuSign integration requires an RSA private key for JWT authentication. The `docusign.rsa.key.file` property uses Spring Resource syntax:
+
+**Classpath resource:**
+[source,properties]
+----
+docusign.rsa.key.file=classpath:/docusign/private.key
+----
+Place file at: `src/main/resources/docusign/private.key`
+
+**File system resource:**
+[source,properties]
+----
+docusign.rsa.key.file=file:/path/to/docusign/private.key
+----
+Use absolute path to file on server filesystem.
+
+NOTE: For detailed instructions on generating and configuring DocuSign API credentials and private keys, refer to the https://developers.docusign.com/platform/auth/jwt/jwt-get-token/[DocuSign JWT Authentication Guide].
+
+== Implementation Steps
+
+=== Step 1: Entity Implementation
+
+Your entity must implement the `DocusignSigner` interface to provide signer information:
+
+[source,java]
+----
+@Entity
+public class Participant extends AbstractAuditable implements DocusignSigner {
+    
+    @Override
+    public String getSignerName() {
+        return getClient().getIndividualInfo().getFullName();
+    }
+
+    @Override
+    public String getSignerEmail() {
+        return getClient().getContactInfo().getEmail();
+    }
+    
+    // For multi-party signing (optional)
+    @Override
+    public List<DocusignSignerInfo> getAllSigners() {
+        // Default: single signer with routing order 1
+        return List.of(new DocusignSignerInfo(getId(), getSignerName(), getSignerEmail(), 1, "borrower"));
+    }
+}
+----
+
+**Key points:**
+- Delegate to existing entity fields - no new data storage needed
+- `getAllSigners()` enables multi-party workflows and document template integration
+- Default implementation handles single signer scenarios
+
+=== Step 2: Service Integration
+
+Implement your business logic and call the framework:
+
+[source,java]
+----
+@Service
+public class ApplicationPortalService {
+    
+    @Autowired
+    private DocusignSignatureService docusignSignatureService;
+    
+    @Transactional
+    public String getSignatureUrl(UUID applicationId, String returnUrl) throws IOException, SignatureException {
+        // Your business logic
+        Application application = findApplication(applicationId);
+        SignableDocument document = selectDocumentBasedOnStatus(application);
+        Participant participant = application.getBorrowerParticipant();
+        
+        // Framework handles everything else
+        return docusignSignatureService.getDocusignUrl(participant, document, returnUrl);
+    }
+}
+----
+
+**Framework call does:**
+- Creates DocuSign envelope if needed
+- Uploads document to DocuSign
+- Manages signer creation
+- Returns embedded signing URL
+- Handles status polling fallback
+
+**Status-based document selection pattern:**
+[source,java]
+----
+SignableDocumentType documentType;
+switch (portalStatus) {
+    case IN_PROCESS -> documentType = APPLICATION_FORM;
+    case PENDING_CONTRACT_SIGNATURE -> documentType = APPLICATION_CONTRACT;
+    case null, default -> throw new PreconditionFailedException(
+        "Signature is not available for application status: " + portalStatus);
+}
+----
+
+=== Step 3: Controller Endpoint
+
+Standard REST controller delegates to service:
+
+[source,java]
+----
+@GetMapping("/signature-url")
+@Operation(summary = "Get application signature url")
+@ApiResponses(value = {
+    @ApiResponse(responseCode = "200", description = "Signature URL retrieved successfully"),
+    @ApiResponse(responseCode = "404", description = "Application not found"),
+    @ApiResponse(responseCode = "412", description = "Application with incorrect status provided")
+})
+public ResponseEntity<String> getApplicationSignatureUrl(
+    @RequestParam UUID applicationId, 
+    @RequestParam String returnUrl) throws IOException, SignatureException {
+    
+    String signatureUrl = applicationService.getSignatureUrl(applicationId, returnUrl);
+    return ResponseEntity.ok(signatureUrl);
+}
+----
+
+
+
+=== Step 4: Webhook Implementation (Optional)
+
+The framework provides automatic webhook handling at `/callback/docusign/webhook`. When documents are signed, the framework automatically processes them without additional code.
+
+**Webhook resilience:** Framework ignores webhooks for unknown envelopes and polls DocuSign directly when webhooks fail.
+
+==== Custom Webhook (Optional)
+
+Extend the default webhook for additional business logic:
+
+[source,java]
+----
+@RestController
+@RequestMapping(value = DocusignWebhookController.PATH, produces = MediaType.APPLICATION_JSON_VALUE)
+public class DocusignWebhookController {
+
+    @Autowired
+    private DocusignSignatureService docusignSignatureService;
+
+    @PostMapping(value = "/webhook", produces = "application/json;charset=UTF-8")
+    public void handleWebhook(@RequestBody DocusignWebhookResponse payload) throws IOException {
+        if (payload.getData() != null && payload.getData().getUserId().equals(userId)) {
+            String envelopeId = payload.getData().getEnvelopeId();
+            try {
+                docusignSignatureService.signDocumentByEnvelopeId(envelopeId);
+                // Add your custom logic here: notifications, status updates, etc.
+            } catch (SignatureException e) {
+                // Framework ignores unknown signatures - webhook may arrive for 
+                // signatures not tracked in our system
+            }
+        }
+    }
+}
+----
+
+== Document Templates (Responsive Signing)
+
+DocuSign Responsive Signing allows creating HTML documents with embedded signing fields that automatically adapt to mobile devices. The framework integrates with `getAllSigners()` to map template roles to actual signers.
+
+**Important:** Responsive Signing must be enabled by DocuSign support. Contact DocuSign to request "Enable Smart Sections/API for Responsive Signing" for your account.
+
+=== DocuSign HTML Elements
+
+**Signature and identity fields:**
+[source,html]
+----
+<!-- Signature field -->
+<ds-signature data-ds-role="borrower"></ds-signature>
+
+<!-- Full name (auto-populated) -->
+<ds-fullname data-ds-role="borrower"></ds-fullname>
+
+<!-- Date signed (auto-populated) -->
+<ds-date-signed data-ds-role="borrower"></ds-date-signed>
+----
+
+**Input fields using standard HTML with DocuSign attributes:**
+[source,html]
+----
+<!-- Text input -->
+<input data-ds-type="text" data-ds-role="borrower" />
+
+<!-- Email input with validation -->
+<input data-ds-type="email" data-ds-role="borrower" />
+
+<!-- Optional field -->
+<input data-ds-type="text" data-ds-role="borrower" required="false" />
+----
+
+=== Field Requirements
+
+By default, all fields are required. To make a field optional:
+[source,html]
+----
+<input data-ds-type="text" data-ds-role="borrower" required="false" />
+----
+
+=== Styling and Customization
+
+All standard HTML styling is supported:
+[source,html]
+----
+<!-- Styled signature -->
+<ds-signature data-ds-role="borrower" 
+              style="width:300px;height:100px;border:2px solid #000;">
+</ds-signature>
+
+<!-- Styled date field -->
+<ds-date-signed data-ds-role="borrower" 
+                style="color:red;font-size:18px;font-weight:bold;">
+</ds-date-signed>
+
+<!-- Text input with styling -->
+<input data-ds-type="text" 
+       data-ds-role="borrower" 
+       style="width:200px;font-family:Arial;" 
+       id="borrowerPhone" 
+       class="form-field" />
+----
+
+=== Complete Template Example
+
+[source,html]
+----
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Loan Application</title>
+</head>
+<body>
+    <h1>Personal Loan Agreement</h1>
+    
+    <h3>Borrower Information:</h3>
+    <p>Email: <input data-ds-type="email" data-ds-role="borrower" /></p>
+    <p>Name: <ds-fullname data-ds-role="borrower"></ds-fullname></p>
+    <p>Phone: <input data-ds-type="text" data-ds-role="borrower" required="false" /></p>
+    
+    <div>
+        <br><br>
+        Borrower Signature: <ds-signature data-ds-role="borrower"></ds-signature>
+    </div>
+    
+    <p>Date Signed: <ds-date-signed data-ds-role="borrower"></ds-date-signed></p>
+</body>
+</html>
+----
+
+=== Framework Integration
+
+Template roles must match `timveroRole` values from `getAllSigners()`:
+
+[source,java]
+----
+@Override
+public List<DocusignSignerInfo> getAllSigners() {
+    return List.of(
+        new DocusignSignerInfo(borrowerId, borrowerName, borrowerEmail, 1, "borrower"),
+        new DocusignSignerInfo(guarantorId, guarantorName, guarantorEmail, 2, "guarantor")
+    );
+}
+----
+
+[source,html]
+----
+<!-- Template uses matching role names -->
+<ds-signature data-ds-role="borrower"></ds-signature>
+<ds-signature data-ds-role="guarantor"></ds-signature>
+----
+
+=== Form Data Collection
+
+Input fields automatically populate the `formData` map in `DocusignDocumentSignature`:
+
+[source,html]
+----
+<input data-ds-type="text" data-ds-role="borrower" name="income" />
+<input data-ds-type="email" data-ds-role="borrower" name="contact_email" />
+----
+
+After signing, access the data:
+[source,java]
+----
+DocusignDocumentSignature signature = (DocusignDocumentSignature) document.getSignature();
+Map<String, String> formData = signature.getFormData();
+String income = formData.get("income");
+String email = formData.get("contact_email");
+----
+
+**Key requirements:**
+- `data-ds-role` values must exactly match `timveroRole` from `getAllSigners()`
+- Responsive Signing must be enabled for your DocuSign account
+- All fields are required by default unless `required="false"` is specified
+- Standard HTML styling and attributes are fully supported
+
+=== Additional Resources
+
+For more detailed information about DocuSign Responsive Signing and HTML templates:
+
+**Official DocuSign Documentation:**
+- https://developers.docusign.com/docs/esign-rest-api/how-to/creating-signable-html/[How To Create a Signable HTML Document] - Main guide for creating HTML signing documents
+- https://developers.docusign.com/docs/esign-rest-api/esign101/concepts/responsive/[Responsive Signing Concepts] - Core concepts and principles
+
+**DocuSign Developer Blog:**
+- https://www.docusign.com/blog/developers/the-trenches-please-sign-responsively[From the Trenches: Please sign responsively] - Detailed guide with code examples for `<ds-date-signed>`, `<ds-signature>` and other tags
+- https://www.docusign.com/blog/developers/the-trenches-use-the-apex-toolkit-to-send-responsive-html-documents-dynamically-set[Use the Apex Toolkit to send responsive HTML documents] - Examples using `<input data-ds-type="email">`, `<ds-fullname>` and `<ds-signature>`
+
+**Code Examples:**
+- https://github.com/docusign/docusign-template-library/blob/master/Responsive%20HTML%20Samples/Responsive_AC_Order.html[DocuSign Template Library - HTML Examples] - Real-world HTML template with all field types
+
+==== DocuSign Webhook Configuration
+
+Configure webhooks in your DocuSign account:
+
+1. Go to your DocuSign Admin panel
+2. Navigate to **Integrations > Webhooks**
+3. Create a new webhook with your endpoint URL
+4. Select relevant events (e.g., "Envelope Completed")
+
+For detailed configuration instructions, see the https://developers.docusign.com/platform/webhooks/[DocuSign Webhooks Documentation].

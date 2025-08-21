@@ -1,11 +1,15 @@
-package com.timvero.example.portal.client.form;
+package com.timvero.example.portal.application.form;
 
 import com.timvero.example.admin.participant.entity.Employment;
 import com.timvero.example.admin.participant.entity.Periodicity;
 import jakarta.validation.constraints.NotNull;
 import javax.money.MonetaryAmount;
+import java.util.UUID;
 
 public class CreateApplicationRequest {
+
+    @NotNull
+    private UUID clientId;
     
     @NotNull
     private Employment employment;
@@ -19,6 +23,14 @@ public class CreateApplicationRequest {
     private MonetaryAmount monthlyOutgoings;
 
     private String githubUsername;
+
+    public UUID getClientId() {
+        return clientId;
+    }
+
+    public void setClientId(UUID clientId) {
+        this.clientId = clientId;
+    }
 
     public Employment getEmployment() {
         return employment;
