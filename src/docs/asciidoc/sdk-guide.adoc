@@ -63,9 +63,11 @@ This guide is organized into logical parts that build on each other:
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
 . **<<offer-engine-credit-products>>** - Generate personalized loan offers from credit products and participant data
+. **<<api-integration>>** - REST API setup and external system integration
+. **<<docusign-integration>>** - Document signing integration with DocuSign
 
 === PART IV: FINANCIAL OPERATIONS
-[start=14]
+[start=16]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
@@ -100,6 +102,10 @@ include::_datasource.adoc[leveloffset=+1]
 include::_workflow-integration.adoc[leveloffset=+1]
 
 include::_offer-engine.adoc[leveloffset=+1]
+
+include::_api-integration.adoc[leveloffset=+1]
+
+include::_docusign.adoc[leveloffset=+1]
 
 // PART IV: FINANCIAL OPERATIONS
 include::_credit.adoc[leveloffset=+1]
