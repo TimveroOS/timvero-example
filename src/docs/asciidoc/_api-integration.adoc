@@ -1,0 +1,322 @@
+[[api-integration]]
+= REST API Integration
+
+TimveroOS provides a complete REST API framework that runs as a separate application alongside your main admin interface. This architecture enables clean separation between internal operations and external integrations.
+
+== Multi-Application Architecture
+
+TimveroOS applications can run multiple Spring Boot contexts simultaneously, each serving different purposes:
+
+[source,java]
+----
+public class ExampleApplication {
+    public static void main(String[] args) {
+        SpringApplicationBuilder parentBuilder = new SpringApplicationBuilder(BaseConfiguration.class, CustomConfiguration.class)
+                .web(WebApplicationType.NONE);
+        parentBuilder.run(args);
+        
+        // Admin interface on port 8081
+        parentBuilder.child(WebMvcConfig.class, CustomWebConfiguration.class)
+            .properties("server.port=8081")
+            .run(args);
+            
+        // REST API on port 8082
+        parentBuilder.child(PortalWebConfiguration.class)
+            .properties("server.port=8082")
+            .run(args);
+    }
+}
+----
+
+This pattern allows you to:
+
+* **Scale independently** - API and admin interface can have different resource requirements
+* **Secure separately** - Different authentication mechanisms for different audiences  
+* **Deploy flexibly** - API can be deployed to different environments or behind different load balancers
+* **Version independently** - API versioning without affecting admin functionality
+
+== API Application Setup
+
+The API application requires minimal configuration:
+
+[source,java]
+----
+@SpringBootApplication
+@EnableAutoConfiguration
+@ComponentScan(basePackageClasses = {ApiWebConfig.class, PortalWebConfiguration.class})
+public class PortalWebConfiguration {
+}
+----
+
+Key components provided by the framework:
+
+* **`ApiWebConfig`** - Configures REST endpoints, serialization, and validation
+* **OpenAPI Integration** - Automatic Swagger documentation generation
+* **Exception Handling** - Standardized error responses
+* **Request/Response Processing** - JSON serialization with proper HTTP status codes
+
+== Controller Patterns
+
+TimveroOS API controllers follow enterprise patterns with comprehensive documentation:
+
+[source,java]
+----
+@RestController
+@RequestMapping("clients")
+@SecurityRequirement(name = BASIC_AUTH)
+@Tag(name = "Client Management", description = "API for managing clients")
+public class ClientController {
+
+    @PostMapping
+    @Operation(summary = "Create a new client")
+    @ApiResponses(value = {
+        @ApiResponse(responseCode = "200", description = "Client created successfully"),
+        @ApiResponse(responseCode = "400", description = "Invalid request data")
+    })
+    public ResponseEntity<CreateClientResponse> createClient(
+        @RequestBody @Valid CreateClientRequest form) {
+        UUID clientId = clientService.createClient(form);
+        return ResponseEntity.ok(new CreateClientResponse(clientId));
+    }
+}
+----
+
+**Framework Advantages:**
+
+* **Automatic validation** - Jakarta Bean Validation with detailed error messages
+* **OpenAPI generation** - Complete API documentation without manual maintenance
+* **Type safety** - Request/response DTOs with MapStruct mapping
+* **Consistent error handling** - Framework-provided exception responses
+
+== Service Layer Integration
+
+API controllers leverage your existing business logic without duplication:
+
+[source,java]
+----
+@Service
+public class ClientService {
+    
+    @Autowired
+    private ClientRequiestMapper mapper;  // MapStruct generated
+    
+    @Autowired
+    private ClientRepository clientRepository;  // Your existing repository
+    
+    @Transactional
+    public UUID createClient(@Valid CreateClientRequest form) {
+        Client client = mapper.createEntity(form);  // DTO to Entity mapping
+        Client savedClient = clientRepository.save(client);
+        return savedClient.getId();
+    }
+}
+----
+
+This approach ensures:
+
+* **Single source of truth** - Business logic remains in service layer
+* **Consistent validation** - Same rules for API and admin interface
+* **Transaction management** - Proper database transaction handling
+* **Audit trails** - All operations logged through existing mechanisms
+
+== Authentication & Security
+
+The framework provides configurable authentication:
+
+[source,java]
+----
+@Configuration
+@EnableWebSecurity
+@SecurityScheme(type = SecuritySchemeType.HTTP, name = "basicAuth", scheme = "basic")
+public class InternalApiSecurityConfig {
+    
+    @Value("${internal.api.username:username}")
+    private String internalApiUser;
+    
+    @Value("${internal.api.password:password}")
+    private String internalApiPassword;
+}
+----
+
+**Security Features:**
+
+* **Basic Authentication** - Simple, reliable for internal APIs
+* **Configurable credentials** - Environment-specific configuration
+* **Swagger UI protection** - Documentation access control
+* **Method-level security** - `@PreAuthorize` support for fine-grained access
+
+=== Alternative Authentication Methods
+
+The framework supports multiple authentication strategies beyond Basic Auth:
+
+**JWT Token Authentication:**
+[source,java]
+----
+@SecurityScheme(
+    type = SecuritySchemeType.HTTP,
+    name = "bearerAuth",
+    scheme = "bearer",
+    bearerFormat = "JWT"
+)
+@Configuration
+public class JwtSecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain jwtFilterChain(HttpSecurity http) throws Exception {
+        http.oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
+        return http.build();
+    }
+}
+----
+
+**OAuth2 Integration:**
+[source,java]
+----
+@SecurityScheme(
+    type = SecuritySchemeType.OAUTH2,
+    name = "oauth2",
+    flows = @OAuthFlows(
+        authorizationCode = @OAuthFlow(
+            authorizationUrl = "${oauth2.authorization-uri}",
+            tokenUrl = "${oauth2.token-uri}",
+            scopes = {
+                @OAuthScope(name = "read", description = "Read access"),
+                @OAuthScope(name = "write", description = "Write access")
+            }
+        )
+    )
+)
+----
+
+**API Key Authentication:**
+[source,java]
+----
+@SecurityScheme(
+    type = SecuritySchemeType.APIKEY,
+    name = "apiKey",
+    in = SecuritySchemeIn.HEADER,
+    paramName = "X-API-Key"
+)
+public class ApiKeySecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain apiKeyFilterChain(HttpSecurity http) throws Exception {
+        http.addFilterBefore(new ApiKeyAuthenticationFilter(), UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+}
+----
+
+**Multiple Authentication Schemes:**
+You can configure multiple authentication methods simultaneously:
+
+[source,java]
+----
+@RestController
+@SecurityRequirements({
+    @SecurityRequirement(name = "basicAuth"),
+    @SecurityRequirement(name = "bearerAuth")
+})
+public class FlexibleAuthController {
+    // Accepts both Basic Auth and JWT tokens
+}
+----
+
+**Authentication Strategy Selection:**
+
+* **Basic Auth** - Internal tools, development environments
+* **JWT/OAuth2** - External integrations, mobile applications
+* **API Keys** - Third-party service integrations, webhooks
+* **Mutual TLS** - High-security B2B integrations
+* **Custom schemes** - Proprietary authentication systems
+
+== Request/Response Mapping
+
+MapStruct integration provides type-safe, performant mapping:
+
+[source,java]
+----
+@Mapper
+public interface ClientRequiestMapper {
+    
+    @Mapping(target = "individualInfo.nationalId", source = "nationalId")
+    @Mapping(target = "contactInfo.email", source = "email")
+    @Mapping(target = "participants", ignore = true)
+    Client createEntity(CreateClientRequest form);
+}
+----
+
+**Mapping Advantages:**
+
+* **Compile-time generation** - No runtime reflection overhead
+* **Type safety** - Compilation errors for mismatched fields
+* **Nested object support** - Complex object graph mapping
+* **Validation integration** - Works seamlessly with Jakarta Bean Validation
+
+== API Documentation
+
+OpenAPI documentation is generated automatically and includes:
+
+* **Interactive Swagger UI** - Available at `/swagger-ui.html`
+* **Complete schema definitions** - Request/response models with validation rules
+* **Authentication flows** - Security requirements clearly documented
+* **Example requests** - Generated from your validation annotations
+
+Access the documentation at: `http://localhost:8082/swagger-ui.html`
+
+== Advanced Capabilities
+
+**Webhook Support:**
+[source,java]
+----
+@RestController
+@RequestMapping("webhooks")
+public class WebhookController {
+    
+    @PostMapping("/docusign")
+    public ResponseEntity<Void> handleDocusignWebhook(@RequestBody DocusignEvent event) {
+        // Process external webhook
+        return ResponseEntity.ok().build();
+    }
+}
+----
+
+**Async Processing:**
+[source,java]
+----
+@PostMapping("/applications")
+public ResponseEntity<CreateApplicationResponse> createApplication(@RequestBody CreateApplicationRequest request) {
+    UUID applicationId = applicationService.createApplicationAsync(request);
+    return ResponseEntity.accepted().body(new CreateApplicationResponse(applicationId));
+}
+----
+
+**File Upload Support:**
+[source,java]
+----
+@PostMapping(value = "/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public ResponseEntity<UploadResponse> uploadDocument(@RequestParam("file") MultipartFile file) {
+    // Framework handles file processing
+    return ResponseEntity.ok(uploadResponse);
+}
+----
+
+== Integration Patterns
+
+**External System Integration:**
+The API layer serves as an integration point for external systems while maintaining all business rules and validation from your main application.
+
+**Mobile Application Backend:**
+Provides clean JSON APIs for mobile applications with proper error handling and validation.
+
+**Third-party Service Integration:**
+Webhooks and callbacks from external services (payment processors, document signing, credit bureaus) can be handled through dedicated API endpoints.
+
+**Microservices Communication:**
+When scaling to microservices architecture, the API layer provides a stable interface contract between services.
+
+For detailed Spring Boot and OpenAPI configuration, refer to:
+
+* https://spring.io/projects/spring-boot[Spring Boot Documentation^]
+* https://springdoc.org/[SpringDoc OpenAPI Documentation^]
+* https://mapstruct.org/[MapStruct Reference Guide^]
