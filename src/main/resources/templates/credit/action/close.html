@@ -3,20 +3,19 @@
 <form
     th:action="@{${actionPath}}"
     method="post"
-    class="modal-form"
     th:data-title="#{credit.action.close}"
     id="paper-check"
     th:object="${form}"
 >
   <div class="form-body">
   
-    <th:block S
+    <th:block
         th:insert="~{/form/components :: date (#{credit.closeDate}, 'closeDate', 'v-required')}"
         th:with="minDate = ${minDate}, maxDate = ${maxDate}"
     />
 
   </div>
-  <div class="modal-footer">
+  <div class="form__actions">
     <button
         type="button"
         class="btn btn-secondary"

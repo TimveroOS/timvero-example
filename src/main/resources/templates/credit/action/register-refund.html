@@ -3,7 +3,6 @@
 <form
     th:action="@{${actionPath}}"
     method="post"
-    class="modal-form"
     th:data-title="#{creditPayment.dialog.refund}"
     id="refund"
     th:object="${form}"
@@ -46,7 +45,7 @@
         th:insert="~{/form/components :: textarea(#{common.description}, 'description', 'v-required')}"></th:block>
   </div>
 
-  <div class="modal-footer">
+  <div class="form__actions">
     <button
         type="button"
         class="btn btn-secondary"

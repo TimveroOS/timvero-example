@@ -2,14 +2,14 @@
     xmlns:th="http://www.thymeleaf.org">
 <form method="post"
     th:data-page-title="${isCreate} ? #{client.new} : #{client.edit}"
-    autocomplete="off" class="modal-form" th:action="@{${actionPath}}"
+    autocomplete="off" th:action="@{${actionPath}}"
     th:object="${form}">
     <th:block th:insert="~{/form/loader :: formLoader}" />
 
     <div class="form-body">
         <!-- tag::client-form-fields[] -->
-        <h2 class="form-group__title" th:text="#{client.clientInfo}">Personal
-            Information</h2>
+        <h3 th:text="#{client.clientInfo}">Personal
+            Information</h3>
         <th:block
             th:insert="~{/form/components :: text(#{client.individualInfo.fullName},
                 'individualInfo.fullName', 'v-required v-name')}"
@@ -25,8 +25,8 @@
             th:insert="~{/form/components :: select(#{client.address.stateOfResidence},
                 'individualInfo.residenceCountry', ${countries})}" />
 
-        <h2 class="form-group__title" th:text="#{client.contactInfo}">Contact
-            Information</h2>
+        <h3 th:text="#{client.contactInfo}">Contact
+            Information</h3>
         <th:block
             th:insert="~{/form/components :: text(#{client.contactInfo.email},
                 'contactInfo.email', 'v-required v-email')}" />
@@ -36,7 +36,7 @@
         <!-- end::client-form-fields[] -->
     </div>
 
-    <div class="modal-footer">
+    <div class="form__actions">
         <button type="button" class="btn btn-secondary"
             data-dismiss="modal" th:text="#{button.close}">
             Close</button>
