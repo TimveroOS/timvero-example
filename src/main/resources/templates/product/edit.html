@@ -12,12 +12,12 @@
     >
         <div class="form__actions">
             <h4 th:text="${isCreate ? '__#{credit.product.new}__' : '__#{credit.product.edit}__'}">Edit Product</h4>
-            <div>
+            <div class="ml-auto">
                 <a class="btn btn-secondary" th:href="@{/product}" th:text="#{button.cancel}">Cancel</a>
                 <button class="btn btn-success" th:text="#{button.save}" type="submit">Save</button>
             </div>
         </div>
-        <div class="form__container">
+        <div class="form-body">
             <th:block
                 th:with="selectClassName='v-required'"
                 th:insert="~{/form/components :: select(#{credit.product.creditType}, 'creditType', ${creditTypes})}"/>
@@ -35,9 +35,6 @@
                 ${offerEngineTypes})}"/>
             <th:block
                 th:insert="~{/form/components :: select(#{credit.product.contractTemplate}, 'uuidContractTemplate', ${templates})}"/>
-
-        </div>
-        <div class="form__container">
             <th:block
                 th:with="selectClassName='v-required'"
                 th:insert="~{/form/components :: select(#{credit.product.currency}, 'currency', ${#monetary.availableCurrencies})}"/>

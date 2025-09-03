@@ -2,14 +2,13 @@
     xmlns:th="http://www.thymeleaf.org">
 <form
     th:data-page-title="${isCreate} ? #{application.new} : #{application.edit}"
-    autocomplete="off" class="modal-form" th:action="@{${actionPath}}"
+    autocomplete="off" th:action="@{${actionPath}}"
     th:object="${form}">
     <th:block th:insert="~{/form/loader :: formLoader}" />
 
     <div class="form-body">
         <!-- tag::application-form-fields[] -->
-        <h2 th:text="#{application.borrowerInfo}">Borrower
-            Information</h2>
+        <h3 th:text="#{application.borrowerInfo}">Borrower Information</h3>
         <th:block
             th:insert="~{/form/components :: select(#{participant.employment},
                 'borrowerParticipant.employment', ${employmentTypes})}" />
@@ -17,8 +16,7 @@
             th:insert="~{/form/components :: select(#{participant.howOftenIncomeIsPaid},
                 'borrowerParticipant.howOftenIncomeIsPaid', ${periodicities})}" />
 
-        <h2 class="mt-10" th:text="#{participant.financialInfo}">Financial
-            Information</h2>
+        <h3 th:text="#{participant.financialInfo}">Financial Information</h3>
         <th:block
             th:insert="~{/form/components :: amount(#{participant.totalAnnualIncome},
                 'borrowerParticipant.totalAnnualIncome', 'v-required')}" />
@@ -31,7 +29,7 @@
                 'borrowerParticipant.githubUsername', '')}" />
     </div>
 
-    <div class="modal-footer">
+    <div class="form__actions">
         <button type="button" class="btn btn-secondary"
             data-dismiss="modal" th:text="#{button.close}">
             Close</button>
