@@ -4,17 +4,19 @@ Build lending applications fast with pre-built components.
 
 == What You Get
 
-✅ **Forms** - Collect customer data with built-in validation  
-✅ **Database** - Automatic setup for loan data  
-✅ **Payments** - Connect to banks and card processors  
-✅ **UI Components** - Works on desktop and mobile  
-✅ **Business Rules** - Automate loan decisions  
+[.unstyled]
+* {ok} **Forms** — Collect customer data with built-in validation
+* {ok} **Database** — Automatic setup for loan data
+* {ok} **Payments** — Connect to banks and card processors
+* {ok} **UI Components** — Works on desktop and mobile
+* {ok} **Business Rules** — Automate loan decisions
 
 ## What You Build
 
-🎯 **Your loan products** (personal loans, mortgages, etc.)  
-🎯 **Your approval rules** (credit scores, income requirements, etc.)  
-🎯 **Your customer experience** (application flow, portal design, etc.)
+[.unstyled]
+* 🎯 **Your loan products** (personal loans, mortgages, etc.)
+* 🎯 **Your approval rules** (credit scores, income requirements, etc.)
+* 🎯 **Your customer experience** (application flow, portal design, etc.)
 
 == Three Parts
 
@@ -37,6 +39,7 @@ Basic (foundation) → Origination (new loans) → Servicing (active loans)
 ```
 
 **Example:** Personal loan process
+
 1. Customer applies → forms, documents *(Basic + Origination)*
 2. Loan approved → credit check, terms *(Origination)*  
 3. Loan created → account setup *(Origination → Servicing)*
@@ -86,6 +89,7 @@ To get started with the platform, you need to understand a few key concepts:
 === 1. Everything Builds on Basic
 
 No matter what you're building, you'll always use Basic components:
+
 * Every application needs forms to collect data
 * Every application needs a database to store information  
 * Every application needs templates to show information to users
@@ -97,11 +101,13 @@ No matter what you're building, you'll always use Basic components:
 Decide what type of application you're building:
 
 **Building a loan application system?** → Focus on Origination
+
 * Customer registration and applications
 * Credit scoring and risk assessment
 * Loan approval workflows
 
-**Building a loan management system?** → Focus on Servicing  
+**Building a loan management system?** → Focus on Servicing
+
 * Payment processing and account management
 * Interest calculations and late fees
 * Customer account portals
@@ -111,6 +117,7 @@ Decide what type of application you're building:
 === 3. The Platform Does the Hard Work
 
 You don't need to build everything from scratch:
+
 * Database setup is automatic
 * Form validation is built-in
 * Payment processing is pre-built

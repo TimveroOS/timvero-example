@@ -86,6 +86,7 @@ spring.datasource.password=your_password
 ```
 
 **Common database URL mistakes**:
+
 * Wrong port (default PostgreSQL is 5432)
 * Database name doesn't exist
 * User lacks permissions
@@ -274,20 +275,21 @@ The `Client` entity demonstrates the platform's entity structure:
 @Audited
 @Indexed
 public class Client extends AbstractAuditable<UUID> implements NamedEntity, HasDocuments {
-    
+
     @Embedded
     @Valid
     private IndividualInfo individualInfo;
-    
+
     @Embedded
     @Valid
     private ContactInfo contactInfo;
-    
+
     // getters and setters...
 }
 ----
 
 Key features:
+
 * **Extends `AbstractAuditable`**: Automatic creation/modification tracking
 * **Implements `NamedEntity`**: Provides display name functionality
 * **Composite structure**: Contains `IndividualInfo` and `ContactInfo` components
@@ -301,20 +303,21 @@ The `ClientForm` handles user input with validation:
 [source,java]
 ----
 public class ClientForm {
-    
+
     @Valid
     @NotNull
     private IndividualInfoForm individualInfo;
-    
+
     @Valid
     @NotNull
     private ContactInfoForm contactInfo;
-    
+
     // getters and setters...
 }
 ----
 
 Benefits:
+
 * **Nested validation**: `@Valid` cascades validation to nested objects
 * **Clean separation**: Form objects separate from entities
 * **Type safety**: Strongly typed form fields
@@ -349,12 +352,13 @@ public class EditClientAction extends EditEntityActionController<UUID, Client, C
 }
 ----
 
-What you get automatically:
-* ✅ Create, Read, Update, Delete operations
-* ✅ Form validation and error handling
-* ✅ List view with search and filtering
-* ✅ Responsive web interface
-* ✅ Audit logging of all changes
+.What you get automatically
+[.unstyled]
+* {ok} **Create, Read, Update, Delete operations**
+* {ok} **Form validation and error handling**
+* {ok} **List view with search and filtering**
+* {ok} **Responsive web interface**
+* {ok} **Audit logging of all changes**
 
 === Form Service Layer
 
@@ -386,12 +390,12 @@ The HTML template demonstrates the form component system:
 ----
 <th:block th:insert="~{/form/components :: text(
     #{client.individualInfo.fullName},
-    'individualInfo.fullName', 
+    'individualInfo.fullName',
     'v-required v-name')}" />
 
 <th:block th:insert="~{/form/components :: text(
     #{client.contactInfo.email},
-    'contactInfo.email', 
+    'contactInfo.email',
     'v-required v-email')}" />
 ----
 
@@ -478,7 +482,7 @@ private IndividualInfoForm individualInfo;
 <!-- Ensure validation CSS classes are included -->
 <th:block th:insert="~{/form/components :: text(
     #{client.individualInfo.fullName},
-    'individualInfo.fullName', 
+    'individualInfo.fullName',
     'v-required v-name')}" />
 ```
 
@@ -515,7 +519,7 @@ public class CreateClientAction extends EntityCreateController<UUID, Client, Cli
 <!-- Ensure proper Thymeleaf fragment syntax -->
 <th:block th:insert="~{/form/components :: text(
     #{client.individualInfo.fullName},
-    'individualInfo.fullName', 
+    'individualInfo.fullName',
     'v-required v-name')}" />
 ```
 
@@ -538,15 +542,15 @@ public class ClientForm {
     @NotBlank
     @Size(min = 2, max = 100, message = "Name must be between 2 and 100 characters")
     private String fullName;
-    
+
     @NotBlank
     @Email(message = "Please provide a valid email address")
     private String email;
-    
+
     @NotBlank
     @Phone(message = "Please provide a valid phone number")
     private String phone;
-    
+
     @PastOrPresent(message = "Birth date cannot be in the future")
     private LocalDate dateOfBirth;
 }
@@ -560,20 +564,20 @@ Create automated workflows that respond to client changes:
 ----
 @Component
 public class ClientWelcomeChecker extends EntityChecker<Client> {
-    
+
     @Override
     protected void registerListeners(CheckerListenerRegistry<Client> registry) {
         // Trigger when a new client is created
         registry.entityChange().inserted();
     }
-    
+
     @Override
     protected boolean isAvailable(Client client) {
         // Only for clients with complete contact information
-        return client.getContactInfo() != null 
+        return client.getContactInfo() != null
             && client.getContactInfo().getEmail() != null;
     }
-    
+
     @Override
     protected void perform(Client client) {
         // Send welcome email to new clients
@@ -598,10 +602,10 @@ public class Client extends AbstractAuditable<UUID> implements HasDocuments {
 // 2. Configure document types
 @Configuration
 public class ClientDocumentConfiguration {
-    
+
     public static final EntityDocumentType ID_DOCUMENT = new EntityDocumentType("ID_DOCUMENT");
     public static final EntityDocumentType PROOF_OF_ADDRESS = new EntityDocumentType("PROOF_OF_ADDRESS");
-    
+
     @Bean
     DocumentTypeAssociation<Client> clientRequiredDocuments() {
         return DocumentTypeAssociation.forEntityClass(Client.class)
@@ -615,7 +619,7 @@ public class ClientDocumentConfiguration {
 @Controller
 @Order(1000)
 public class ClientDocumentsTab extends EntityDocumentTabController<Client> {
-    
+
     @Override
     public boolean isVisible(Client client) {
         return true; // Always show documents tab for clients
@@ -638,12 +642,12 @@ public interface CreditCheckSubject {
 // 2. Implement the interface in your entity
 @Entity
 public class Client implements CreditCheckSubject {
-    
+
     @Override
     public String getNationalId() {
         return getIndividualInfo().getNationalId();
     }
-    
+
     @Override
     public String getFullName() {
         return getIndividualInfo().getFullName();
@@ -653,22 +657,22 @@ public class Client implements CreditCheckSubject {
 // 3. Create the data source implementation
 @Service("creditCheck")
 public class CreditCheckDataSource implements MappedDataSource<CreditCheckSubject, CreditReport> {
-    
+
     @Override
     public Class<CreditReport> getType() {
         return CreditReport.class;
     }
-    
+
     @Override
     public Content getData(CreditCheckSubject subject) throws Exception {
         // Call external credit check API
         String response = creditCheckApi.checkCredit(
-            subject.getNationalId(), 
+            subject.getNationalId(),
             subject.getFullName()
         );
         return new Content(response.getBytes(), MediaType.APPLICATION_JSON_VALUE);
     }
-    
+
     @Override
     public CreditReport parseRecord(Content data) throws Exception {
         return objectMapper.readValue(data.getData(), CreditReport.class);
@@ -683,7 +687,7 @@ public class CreditCheckDataSource implements MappedDataSource<CreditCheckSubjec
 Now that you understand the basics, dive deeper into specific areas:
 
 * **Form Classes** - Complex validation, nested forms, and custom components
-* **Entity Checkers** - Business rule automation and workflow triggers  
+* **Entity Checkers** - Business rule automation and workflow triggers
 * **Document Management** - File uploads, document requirements, and digital signatures
 * **DataSource Integration** - External API integration and data enrichment
 * **Template System** - Custom UI components and advanced templating
@@ -714,13 +718,14 @@ Study these complete examples in the project:
 
 === Next Steps Checklist
 
-- [ ] Create your first custom entity following the Client pattern
-- [ ] Add custom validation rules to your forms
-- [ ] Implement an Entity Checker for business logic automation
-- [ ] Set up document management for your entities
-- [ ] Integrate with an external data source
-- [ ] Customize the UI templates for your specific needs
-- [ ] Deploy to a staging environment for testing
+[.unstyled]
+* {todo} Create your first custom entity following the Client pattern
+* {todo} Add custom validation rules to your forms
+* {todo} Implement an Entity Checker for business logic automation
+* {todo} Set up document management for your entities
+* {todo} Integrate with an external data source
+* {todo} Customize the UI templates for your specific needs
+* {todo} Deploy to a staging environment for testing
 
 You're now ready to build powerful financial applications with the Timvero platform!
 
@@ -730,5 +735,5 @@ You're now ready to build powerful financial applications with the Timvero platf
 
 **Related Chapters:**
 * <<form-classes-setup-and-usage>> - Form classes, validation, MapStruct mappers, and service layers
-* <<html-template-integration>> - Thymeleaf components, validation classes, and UI integration  
+* <<html-template-integration>> - Thymeleaf components, validation classes, and UI integration
 * <<entity-checkers-setup-and-usage>> - Entity Checkers for event-driven business rules
