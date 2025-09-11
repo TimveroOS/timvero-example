@@ -10,3 +10,9 @@
 // :imagesdir: {asciidoctorconfigdir}/images
 // 
 // For more information please take a look at https://github.com/de-jcup/eclipse-asciidoctor-editor/wiki/Asciidoctor-configfiles
+:icons: font
+:docinfo: shared
+
+:ok: icon:check-square[role=green]
+:bad: icon:times[role=red]
+:todo: icon:check-square[role=gray]

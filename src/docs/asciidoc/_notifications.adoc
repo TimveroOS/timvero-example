@@ -25,6 +25,7 @@ include::{sourcedir}/notification/LoanApprovedEvent.java[lines=10..27]
 ----
 
 Key components:
+
 * **`NotificationEventType`** - Unique identifier for the event type
 * **`getType()`** - Returns the event type for template matching
 * **`notify()`** - Triggers notification with entity data
@@ -54,6 +55,7 @@ include::{sourcedir}/notification/PaymentReminderEvent.java[lines=18..31]
 ----
 
 EventParameters allow admin users to configure notification behavior:
+
 * **`daysCount`** - Configurable number of days for payment reminders
 * Used in `entityMatchesTemplate()` to control when notifications are sent
 
@@ -124,6 +126,7 @@ Pay online or call (555) 123-4567
 === Available Variables
 
 Templates have access to:
+
 * **Entity data** - All properties from the associated entity (Application, ExampleCredit, etc.)
 * **Model data** - Custom data from NotificationModel subclasses
 * **Built-in filters** - Date formatting, number formatting, string manipulation
@@ -374,6 +377,7 @@ The pattern is: `notification.event.{EVENT_TYPE_NAME}.{PARAMETER_NAME}=Field Lab
 === Usage in Admin Interface
 
 These labels appear in:
+
 - **Notification Templates list** - Event type dropdown and display
 - **Template configuration** - EventParameter field labels
 - **Template testing** - Event selection and parameter forms

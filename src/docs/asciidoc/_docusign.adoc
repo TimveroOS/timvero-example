@@ -355,6 +355,7 @@ String email = formData.get("contact_email");
 ----
 
 **Key requirements:**
+
 - `data-ds-role` values must exactly match `timveroRole` from `getAllSigners()`
 - Responsive Signing must be enabled for your DocuSign account
 - All fields are required by default unless `required="false"` is specified
@@ -365,14 +366,17 @@ String email = formData.get("contact_email");
 For more detailed information about DocuSign Responsive Signing and HTML templates:
 
 **Official DocuSign Documentation:**
+
 - https://developers.docusign.com/docs/esign-rest-api/how-to/creating-signable-html/[How To Create a Signable HTML Document] - Main guide for creating HTML signing documents
 - https://developers.docusign.com/docs/esign-rest-api/esign101/concepts/responsive/[Responsive Signing Concepts] - Core concepts and principles
 
 **DocuSign Developer Blog:**
+
 - https://www.docusign.com/blog/developers/the-trenches-please-sign-responsively[From the Trenches: Please sign responsively] - Detailed guide with code examples for `<ds-date-signed>`, `<ds-signature>` and other tags
 - https://www.docusign.com/blog/developers/the-trenches-use-the-apex-toolkit-to-send-responsive-html-documents-dynamically-set[Use the Apex Toolkit to send responsive HTML documents] - Examples using `<input data-ds-type="email">`, `<ds-fullname>` and `<ds-signature>`
 
 **Code Examples:**
+
 - https://github.com/docusign/docusign-template-library/blob/master/Responsive%20HTML%20Samples/Responsive_AC_Order.html[DocuSign Template Library - HTML Examples] - Real-world HTML template with all field types
 
 ==== DocuSign Webhook Configuration

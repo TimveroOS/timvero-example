@@ -56,6 +56,7 @@ public class Borrower extends AbstractAuditable<UUID>
 ----
 
 **Common ProcessEntity types:**
+
 * **Person**: Borrower, Guarantor, Co-signer (credit checks, income verification)
 * **Property**: House, Vehicle, Asset (appraisals, valuations)  
 * **Business**: Company, Partnership (business credit, financial analysis)
@@ -63,9 +64,11 @@ public class Borrower extends AbstractAuditable<UUID>
 === What Each Interface Does
 
 **ProcessEntity**: "This subject can be evaluated by workflows"
+
 * Requires `getPrimaryId()` - how external data sources identify this subject (SSN, VIN, Tax ID, etc.)
 
-**HasPendingDecisions**: "This subject can receive workflow evaluation results"  
+**HasPendingDecisions**: "This subject can receive workflow evaluation results"
+
 * Stores decisions from workflows (approve/decline/manual review)
 * Tracks decision progress
 
@@ -103,6 +106,7 @@ public class BorrowerCreditCheckTrigger extends EntityChecker<LoanApplication, U
 ----
 
 **Key pattern:**
+
 1. **Listen** for business process events (application submitted, document signed, etc.)
 2. **Check** if subject evaluation should start (`isAvailable`)
 3. **Start** workflow for the **subject** (borrower, property, etc.), not the process
@@ -160,6 +164,7 @@ public class BorrowerEvaluationService {
 ----
 
 Use this when:
+
 * User clicks "Run Credit Check" button for a specific borrower
 * External API triggers evaluation of a person/property
 * Scheduled job needs to re-evaluate subjects
@@ -211,6 +216,7 @@ public class BorrowerEvaluationResultHandler implements EntityEventListener<Fini
 ----
 
 **What this does:**
+
 1. **Listens** for subject evaluation completion events
 2. **Checks** all decisions from the workflow
 3. **Updates** subject status based on results
@@ -301,6 +307,7 @@ public class RetryCreditCheckAction extends SimpleActionController<UUID, Borrowe
 ----
 
 **This creates a "Retry Credit Check" button that:**
+
 * Only shows when borrower evaluation failed
 * Restarts the credit check workflow for that borrower
 * Updates borrower evaluation status
@@ -332,6 +339,7 @@ public class WorkflowConfiguration {
 ----
 
 **Each `DecisionProcessType` specifies:**
+
 * **Name**: Identifier for the workflow process
 * **Entity type**: What type of entity this workflow processes
 
@@ -501,6 +509,7 @@ public class RetryCreditCheckAction extends SimpleActionController<UUID, Borrowe
 ----
 
 **The Flow:**
+
 1. User submits application → Application status changes to SUBMITTED
 2. EntityChecker detects change → Starts credit check workflow for each borrower  
 3. Workflow evaluates borrower → Sends result to your handler

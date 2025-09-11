@@ -29,6 +29,7 @@ include::{sourcedir}/credit/entity/ExampleCredit.java[lines=19..57]
 ----
 
 Key features:
+
 * **Discriminator Value**: `"1"` identifies this credit type in the database
 * **Application Integration**: Links to loan application and borrower
 * **Condition Management**: Contains loan terms (principal, term, interest rate)
@@ -246,6 +247,7 @@ include::{sourcedir}/transaction/BorrowerTransactionService.java[lines=44..65]
 ----
 
 Transaction processing flow:
+
 1. **Transaction Creation**: `BorrowerTransaction` created with payment details
 2. **Payment Gateway**: Transaction sent to payment processor
 3. **Success Handling**: On success, creates `CreditPayment` operation
@@ -291,6 +293,7 @@ creditCalculationService.calculate(creditId, paymentDate, currentCalculationDate
 ----
 
 This recalculates:
+
 * **Debt Balances**: Updates account balances based on payment distribution
 * **Interest Accruals**: Calculates daily interest charges
 * **Past Due Amounts**: Moves overdue balances to past due accounts
@@ -320,6 +323,7 @@ include::{sourcedir}/credit/controller/ExampleCreditController.java[lines=12..20
 ----
 
 The controller provides:
+
 * **List View**: Paginated credit listing with filtering
 * **Detail View**: Comprehensive credit information display
 * **Action Buttons**: Context-sensitive operations based on credit status
@@ -332,6 +336,7 @@ include::{sourcedir}/credit/filter/ExampleCreditFilter.java[lines=9..18]
 ----
 
 Filtering capabilities:
+
 * **Status Filtering**: Filter by credit status (ACTIVE, CLOSED, etc.)
 * **Date Ranges**: Filter by creation date, maturity date, etc.
 * **Amount Ranges**: Filter by principal amount, current balance
@@ -363,6 +368,7 @@ public class CreditDataTab extends EntityTabController<UUID, ExampleCredit> {
 ----
 
 Available tabs:
+
 * **Credit Data**: Current balances, payment status, maturity information
 * **Payments**: Payment history and upcoming payment schedule
 * **Transactions**: All financial transactions related to the credit

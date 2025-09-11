@@ -95,6 +95,7 @@ FastSearchEntity<Client> clientSearchEntity() {
 ----
 
 **Parameters:**
+
 - `Client.class` - The entity class to make searchable
 - `Client::getDisplayedName` - Function that returns the display name for search results
 
@@ -192,11 +193,13 @@ john AND smith         # Boolean operators
 == Common Issues
 
 **No search results?**
+
 1. Check `@Indexed` annotation exists
 2. Verify `FastSearchEntity` bean is configured  
 3. Ensure searchable fields have `@FullTextField` or `@KeywordField`
 
 **Slow search?**
+
 1. Use `@KeywordField` for exact matches
 2. Only index fields users actually search
 

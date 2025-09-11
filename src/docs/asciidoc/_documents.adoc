@@ -28,6 +28,7 @@ include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[line
 ----
 
 This configuration:
+
 * Makes `ID_SCAN` document required
 * Only applies when participant status is `NEW`
 * Only applies to participants with `GUARANTOR` or `BORROWER` roles
@@ -64,6 +65,7 @@ include::{sourcedir}/participant/tab/ParticipantDocumentsTab.java[]
 ----
 
 Key features:
+
 * **`@Order(1500)`** - Controls tab display order in the UI
 * **`isVisible()`** - Determines when the tab should be shown
 * **Automatic functionality** - Upload, download, and delete operations are handled automatically

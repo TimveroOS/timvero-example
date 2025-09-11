@@ -70,6 +70,7 @@ The example project may have a flaw with charge operations - they should typical
 ====
 
 This principle ensures:
+
 * **Regulatory Compliance** - Every financial change can be traced to a real event
 * **Audit Trail Integrity** - Complete documentation of why changes occurred
 * **Business Logic Accuracy** - Operations reflect actual business events
@@ -110,6 +111,7 @@ public class BorrowerTransaction extends PaymentTransaction {
 ----
 
 Key fields:
+
 * **`credit`** - Which loan this payment is for
 * **`operation`** - The credit operation created when payment succeeds
 * **`amount`** - How much money (uses `MonetaryAmount` for currency handling)
@@ -148,6 +150,7 @@ public enum TransactionStatus {
 ----
 
 **Status meanings:**
+
 * **`DRAFT`** - Transaction created, not yet sent to payment processor
 * **`IN_PROGRESS`** - Sent to payment processor, waiting for response
 * **`SUCCEED`** - Payment processor approved the payment
@@ -186,6 +189,7 @@ public interface PaymentGateway {
 ----
 
 **What each method does:**
+
 * **`verify()`** - Validate payment method before processing (called by `PaymentTransactionService.verify()`)
 * **`proceedIncoming()`** - Process customer payments (money coming in)
 * **`proceedOutgoing()`** - Process refunds and disbursements (money going out)
@@ -213,6 +217,7 @@ public class CardPaymentGateway implements PaymentGateway {
 ```
 
 Key characteristics:
+
 * **Immediate Processing** - Real-time API calls with instant responses
 * **Token-Based Security** - Uses tokenized payment methods for PCI compliance
 * **Structured Response** - JSON/XML responses parsed into standard result format
@@ -237,6 +242,7 @@ public class ACHGateway implements PaymentGateway {
 ```
 
 Key characteristics:
+
 * **SOAP Integration** - XML-based web service communication
 * **Asynchronous Processing** - ACH transactions require settlement time
 * **Comprehensive Logging** - Full request/response logging for audit
@@ -262,6 +268,7 @@ public class NACHABatchGateway implements PaymentGateway {
 ```
 
 Key characteristics:
+
 * **Batch Processing** - Multiple transactions in single file
 * **File-Based Transport** - SFTP or similar file delivery
 * **NACHA Compliance** - Proper ACH file format generation
@@ -328,6 +335,7 @@ public class LiquidityClientPaymentMethod extends PaymentMethod {
 ----
 
 This payment method:
+
 * **Stores an amount** - For testing, it has a fixed amount
 * **Has a processed date** - When the "payment" was processed
 * **Works with gateways** - Can be used by payment gateways that support this type
@@ -386,6 +394,7 @@ public class ACHPaymentMethod extends PaymentMethod {
 ```
 
 Key features:
+
 * **Bank Account Details** - Routing and account numbers for ACH processing
 * **Account Type Classification** - Checking vs savings account handling
 * **Validation Logic** - Routing number format and account number validation
@@ -411,6 +420,7 @@ public class CardPaymentMethod extends PaymentMethod {
 ```
 
 Key characteristics:
+
 * **Tokenization** - Card numbers replaced with secure tokens from payment processor
 * **PCI Compliance** - No sensitive card data stored in application database
 * **Display Information** - Only last four digits stored for user interface
@@ -571,6 +581,7 @@ transaction.addTrace("Gateway unavailable: " + e.getMessage());
 === Monitoring
 
 Since processing happens in background, you need to monitor:
+
 * **Failed transactions** - Show in admin dashboard for investigation
 * **Stuck transactions** - Alert if too many stay "IN_PROGRESS"
 * **Gateway errors** - Monitor payment processor uptime
@@ -594,6 +605,7 @@ BorrowerTransaction payment = new BorrowerTransaction(
 ```
 
 Processing flow:
+
 1. **User Initiates** - Borrower submits payment through portal
 2. **Transaction Created** - `BorrowerTransaction` entity persisted
 3. **Gateway Processing** - Payment method charged via appropriate gateway
@@ -615,6 +627,7 @@ BorrowerTransaction disbursement = new BorrowerTransaction(
 ```
 
 Processing flow:
+
 1. **System Initiates** - Loan approval triggers disbursement
 2. **Transaction Created** - Outgoing transaction entity
 3. **Gateway Processing** - Funds sent to borrower account
@@ -649,6 +662,7 @@ if (canRetry(transaction, result)) {
 ```
 
 Retry logic considers:
+
 * **Failure Type** - Network errors retryable, declines usually not
 * **Retry Count** - Exponential backoff with maximum attempts
 * **Time Limits** - Don't retry indefinitely old transactions
@@ -815,6 +829,7 @@ Payment Succeeds → BorrowerTransactionService.handle() → ExampleCreditPaymen
 ```
 
 **Key Benefits:**
+
 * **Complete audit trail** - Every balance change traces to a real payment
 * **Async processing** - Fast user experience, reliable background processing  
 * **Multiple gateways** - Support different payment processors
@@ -822,6 +837,7 @@ Payment Succeeds → BorrowerTransactionService.handle() → ExampleCreditPaymen
 * **Regulatory compliance** - Full documentation for audits
 
 **For Developers:**
+
 * Extend `PaymentTransaction` for your transaction types
 * Implement `PaymentGateway` for new payment processors  
 * Use `PaymentTransactionHandler` to convert transactions to operations

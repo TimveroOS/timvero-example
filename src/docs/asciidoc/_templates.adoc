@@ -18,6 +18,7 @@ include::{templatedir}/client/edit.html[tags=client-form-fields]
 ----
 
 Key features:
+
 * **Nested field access**: Uses dot notation like `individualInfo.fullName`
 * **Validation classes**: CSS classes for client-side validation (`v-required`, `v-email`)
 * **Component reuse**: Uses Thymeleaf fragments for consistent field rendering
@@ -32,6 +33,7 @@ include::{templatedir}/application/edit.html[tags=application-form-fields]
 ----
 
 Features:
+
 * **Enum handling**: Select dropdowns for `employment` and `periodicities`
 * **Monetary amounts**: Special `amount` component for financial fields
 * **Nested participant**: Access to `borrowerParticipant` fields
@@ -368,6 +370,7 @@ The platform uses Thymeleaf fragments for consistent form rendering across all f
 === Component Benefits
 
 This component system ensures:
+
 * **Consistency**: All forms use the same styling and behavior
 * **Maintainability**: Changes to form components affect all forms
 * **Validation Integration**: Client-side validation works seamlessly
