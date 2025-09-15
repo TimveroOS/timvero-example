@@ -1,0 +1,318 @@
+= Launchpad Integration
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:templatedir: ../../main/resources/templates
+
+Integrate your entities with the Launchpad decision-making system to provide users with unified workflow management and pending decision handling.
+
+== What You'll Learn
+
+After reading this chapter, you'll know how to:
+
+* Integrate entities with the Launchpad system for decision management
+* Create custom decision entity extractors for your business entities
+* Configure Launchpad templates for entity-specific workflow display
+* Handle pending decision workflows through Launchpad interface
+* Provide contextual information for decision-making processes
+
+== The Big Picture
+
+The Launchpad system provides a centralized interface where users can:
+
+* View and manage pending decisions across different entity types
+* Access entity-specific context and details for informed decision-making
+* Execute workflow actions directly from a unified dashboard
+* Track decision progress and status for multiple business entities
+
+Think of Launchpad as a **decision workbench** - it aggregates all pending decisions from your application entities and presents them in a consistent, actionable interface.
+
+== Core Components
+
+=== DecisionEntityExtractor
+
+The `DecisionEntityExtractor` interface connects your entities to the Launchpad system. It provides the bridge between pending decisions and entity context.
+
+==== Interface Definition
+
+[source,java]
+----
+public interface DecisionEntityExtractor {
+    String getDecisionOwnerType();
+    LaunchpadEntityDto getByHolderId(Long holderId);
+}
+----
+
+**Key Methods:**
+
+* **`getDecisionOwnerType()`**: Returns the entity type identifier for routing decisions
+* **`getByHolderId(Long holderId)`**: Retrieves entity context by pending decision holder ID
+
+=== LaunchpadEntityDto
+
+The `LaunchpadEntityDto` carries all necessary information for displaying entity context in Launchpad:
+
+[source,java]
+----
+public class LaunchpadEntityDto {
+    private Long targetEntityId;      // Primary entity ID
+    private Object parentEntity;      // Parent/container entity
+    private String parentDisplayName; // Parent entity display name
+    private Object targetEntity;      // Target entity with pending decisions
+    private String targetDisplayName; // Target entity display name
+    private String roleDescription;   // Context description (roles, status, etc.)
+    private String templatePath;      // Path to Launchpad template fragment
+}
+----
+
+== Implementation Example: Participant Launchpad Service
+
+The `ParticipantLaunchpadService` demonstrates how to integrate participant entities with Launchpad:
+
+=== Service Implementation
+
+[source,java]
+----
+@Component
+public class ParticipantLaunchpadService implements DecisionEntityExtractor {
+
+    @Autowired
+    private ParticipantRepository repository;
+
+    @Override
+    public String getDecisionOwnerType() {
+        return Participant.DECISION_OWNER_TYPE;
+    }
+
+    @Override
+    public LaunchpadEntityDto getByHolderId(Long holderId) {
+        Participant participant = repository.findByPendingDecisionHolderId(holderId)
+            .orElseThrow(() -> new RuntimeException("No target entity with holder id " + holderId));
+        Application application = participant.getApplication();
+
+        String roles = participant.getRoles().stream()
+            .map(role -> EnumUtils.getLocalizedValue(role, LocaleContextHolder.getLocale()))
+            .collect(Collectors.joining(", "));
+
+        return new LaunchpadEntityDto(participant.getId(), application, application.getDisplayedName(),
+            participant, participant.getDisplayedName(), roles,
+            "/participant/launchpad-body");
+    }
+}
+----
+
+**Key Implementation Details:**
+
+1. **Decision Owner Type**: Returns `Participant.DECISION_OWNER_TYPE` to identify this extractor
+2. **Entity Retrieval**: Finds participant by pending decision holder ID
+3. **Context Building**: Constructs display information including roles and parent application
+4. **Template Path**: Specifies the template fragment path for rendering participant context
+
+=== Entity Requirements
+
+For entities to work with Launchpad, they must implement `HasPendingDecisions`:
+
+[source,java]
+----
+@Entity
+public class Participant extends AbstractAuditable<UUID> implements HasPendingDecisions {
+
+    public static final String DECISION_OWNER_TYPE = "PARTICIPANT";
+
+    @OneToOne(cascade = CascadeType.ALL)
+    @JoinColumn(nullable = false, updatable = false)
+    private PendingDecisionHolder pendingDecisionHolder =
+        new PendingDecisionHolder(DECISION_OWNER_TYPE);
+
+    @Override
+    public PendingDecisionHolder getPendingDecisionHolder() {
+        return pendingDecisionHolder;
+    }
+}
+----
+
+== Template Integration
+
+=== Launchpad Template Fragment
+
+Create a template fragment for your entity's Launchpad display:
+
+**File**: `src/main/resources/templates/participant/launchpad-body.html`
+
+[source,html]
+----
+include::{templatedir}/participant/launchpad-body.html[]
+----
+
+**Template Structure:**
+
+1. **Pending Decisions Section**: Shows workflow status and available actions
+2. **Entity Details Tabs**: Provides contextual information for decision-making
+3. **Dynamic Content Loading**: Uses AJAX to load tab content dynamically
+
+=== Template Features
+
+**Pending Decisions Fragment:**
+```html
+<th:block th:insert="~{/launchpad/fragment/pending-decisions :: body(${entityDto})}"/>
+```
+This inserts the standard pending decisions interface with entity-specific context.
+
+**Tabbed Content:**
+```html
+<article th:data-url="@{${@pathRegistry.getPath(entityDto.targetEntity) + '/tab/details'}}">
+```
+Dynamically loads tab content using the entity's registered path.
+
+== Configuration
+
+=== Register Your Extractor
+
+Register your `DecisionEntityExtractor` as a Spring component:
+
+[source,java]
+----
+@Component
+public class ParticipantLaunchpadService implements DecisionEntityExtractor {
+    // Implementation...
+}
+----
+
+The Launchpad system automatically discovers all `DecisionEntityExtractor` implementations and routes decisions accordingly.
+
+== Advanced Features
+
+=== Custom Display Logic
+
+Implement sophisticated display logic in your extractor:
+
+[source,java]
+----
+@Override
+    public LaunchpadEntityDto getByHolderId(Long holderId) {
+        Participant participant = repository.findByPendingDecisionHolderId(holderId)
+            .orElseThrow(() -> new RuntimeException("No target entity with holder id " + holderId));
+        Application application = participant.getApplication();
+
+        String roles = participant.getRoles().stream()
+            .map(role -> EnumUtils.getLocalizedValue(role, LocaleContextHolder.getLocale()))
+            .collect(Collectors.joining(", "));
+
+        return new LaunchpadEntityDto(participant.getId(), application, application.getDisplayedName(),
+            participant, participant.getDisplayedName(), roles,
+            "/participant/launchpad-body");
+    }
+
+private String buildContextualInfo(Participant participant) {
+    // Custom logic to build additional context
+    return participant.getStatus() + " | " +
+           participant.getPendingDocumentsCount() + " docs pending";
+}
+----
+
+=== Multiple Entity Type Support
+
+Create extractors for different entity types:
+
+[source,java]
+----
+@Component
+public class ApplicationLaunchpadService implements DecisionEntityExtractor {
+    @Override
+    public String getDecisionOwnerType() {
+        return Application.DECISION_OWNER_TYPE;
+    }
+
+    @Override
+    public LaunchpadEntityDto getByHolderId(Long holderId) {
+        // Implementation for application entities
+    }
+}
+
+@Component
+public class CreditLaunchpadService implements DecisionEntityExtractor {
+    @Override
+    public String getDecisionOwnerType() {
+        return Credit.DECISION_OWNER_TYPE;
+    }
+
+    @Override
+    public LaunchpadEntityDto getByHolderId(Long holderId) {
+        // Implementation for credit entities
+    }
+}
+----
+
+== Best Practices
+
+=== Entity Context Guidelines
+
+**Provide Rich Context**: Include relevant parent/child relationships in the DTO
+```java
+// Good: Include parent application for participant context
+return new LaunchpadEntityDto(
+    participant.getId(),
+    application,              // Parent context
+    application.getDisplayedName(),
+    participant,              // Target entity
+    participant.getDisplayedName(),
+    roles,
+    templatePath
+);
+```
+
+**Meaningful Display Names**: Use business-friendly names, not technical IDs
+```java
+public String getDisplayedName() {
+    return String.format("%s (%s)", fullName, roles.iterator().next());
+}
+```
+
+**Localized Content**: Support internationalization for role descriptions
+```java
+String roles = participant.getRoles().stream()
+    .map(role -> EnumUtils.getLocalizedValue(role, LocaleContextHolder.getLocale()))
+    .collect(Collectors.joining(", "));
+```
+
+=== Performance Considerations
+
+**Efficient Queries**: Use appropriate fetch strategies to avoid N+1 problems
+```java
+@Query("SELECT p FROM Participant p " +
+       "JOIN FETCH p.application " +
+       "JOIN FETCH p.roles " +
+       "WHERE p.pendingDecisionHolder.id = :holderId")
+Optional<Participant> findByPendingDecisionHolderId(@Param("holderId") Long holderId);
+```
+
+**Caching**: Consider caching frequently accessed context data
+```java
+@Cacheable("participant-context")
+public LaunchpadEntityDto getByHolderId(Long holderId) {
+    // Implementation...
+}
+```
+
+== Troubleshooting
+
+=== Common Issues
+
+**ExtractorNotFoundException**: No extractor found for decision owner type
+```
+Solution: Ensure your DecisionEntityExtractor is registered as @Component
+and getDecisionOwnerType() returns the correct entity type constant.
+```
+
+**Template Not Found**: Launchpad template fragment missing
+```
+Solution: Verify template path in LaunchpadEntityDto matches actual file location.
+Template must be in src/main/resources/templates/ directory.
+```
+
+**Entity Not Found**: PendingDecisionHolder ID doesn't match entity
+```
+Solution: Check that findByPendingDecisionHolderId query is correct and
+entity properly implements HasPendingDecisions interface.
+```
+
+The Launchpad system provides a powerful way to centralize decision management across different entity types, giving users a unified interface for workflow operations while maintaining entity-specific context and functionality.
