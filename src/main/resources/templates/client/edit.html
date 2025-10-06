@@ -8,8 +8,8 @@
 
     <div class="form-body">
         <!-- tag::client-form-fields[] -->
-        <h3 th:text="#{client.clientInfo}">Personal
-            Information</h3>
+        <h4 th:text="#{client.clientInfo}">Personal
+            Information</h4>
         <th:block
             th:insert="~{/form/components :: text(#{client.individualInfo.fullName},
                 'individualInfo.fullName', 'v-required v-name')}"
@@ -25,8 +25,8 @@
             th:insert="~{/form/components :: select(#{client.address.stateOfResidence},
                 'individualInfo.residenceCountry', ${countries})}" />
 
-        <h3 th:text="#{client.contactInfo}">Contact
-            Information</h3>
+        <h4 th:text="#{client.contactInfo}">Contact
+            Information</h4>
         <th:block
             th:insert="~{/form/components :: text(#{client.contactInfo.email},
                 'contactInfo.email', 'v-required v-email')}" />
@@ -37,11 +37,13 @@
     </div>
 
     <div class="form__actions">
-        <button type="button" class="btn btn-secondary"
-            data-dismiss="modal" th:text="#{button.close}">
-            Close</button>
-        <button type="submit" class="btn btn-success"
-            th:text="#{button.save}">Save</button>
+        <div class="ml-auto">
+            <button type="button" class="btn btn-secondary"
+                data-dismiss="modal" th:text="#{button.close}">
+                Close</button>
+            <button type="submit" class="btn btn-success"
+                th:text="#{button.save}">Save</button>
+        </div>
     </div>
 </form>
 </html>

@@ -2,53 +2,50 @@
 <html th:data-page-title="${isCreate ? '__#{credit.product.new}__' : '__#{credit.product.edit}__'}"
       xmlns="http://www.w3.org/1999/xhtml"
       xmlns:th="http://www.thymeleaf.org">
-<div class="rui-page-content">
-    <form
-        autocomplete="off"
-        class="content-wrapper settings-wrapper"
-        method="post"
-        th:action="@{${actionPath}}"
-        th:object="${creditProductForm}"
-    >
-        <div class="form__actions">
-            <h4 th:text="${isCreate ? '__#{credit.product.new}__' : '__#{credit.product.edit}__'}">Edit Product</h4>
-            <div class="ml-auto">
-                <a class="btn btn-secondary" th:href="@{/product}" th:text="#{button.cancel}">Cancel</a>
-                <button class="btn btn-success" th:text="#{button.save}" type="submit">Save</button>
-            </div>
+<form
+    autocomplete="off"
+    method="post"
+    th:action="@{${actionPath}}"
+    th:object="${creditProductForm}"
+>
+    <div class="form__actions">
+        <h4 th:text="${isCreate ? '__#{credit.product.new}__' : '__#{credit.product.edit}__'}">Edit Product</h4>
+        <div class="ml-auto">
+            <a class="btn btn-secondary" th:href="@{/product}" th:text="#{button.cancel}">Cancel</a>
+            <button class="btn btn-success" th:text="#{button.save}" type="submit">Save</button>
         </div>
-        <div class="form-body">
-            <th:block
-                th:with="selectClassName='v-required'"
-                th:insert="~{/form/components :: select(#{credit.product.creditType}, 'creditType', ${creditTypes})}"/>
+    </div>
+    <div class="form-body">
+        <th:block
+            th:with="selectClassName='v-required'"
+            th:insert="~{/form/components :: select(#{credit.product.creditType}, 'creditType', ${creditTypes})}"/>
 
-            <th:block th:insert="~{/form/components :: text(#{credit.product.title}, 'title', 'v-required')}"/>
-            <th:block th:insert="~{/form/components :: text(#{credit.product.code}, 'code', 'v-required')}"/>
-            <th:block
-                th:with="selectClassName='v-required'"
-                th:insert="~{/form/components :: select(#{credit.product.engineName}, 'engineName',
-                ${#enums.withNames('credit.product.engine', productEngines)})}"/>
+        <th:block th:insert="~{/form/components :: text(#{credit.product.title}, 'title', 'v-required')}"/>
+        <th:block th:insert="~{/form/components :: text(#{credit.product.code}, 'code', 'v-required')}"/>
+        <th:block
+            th:with="selectClassName='v-required'"
+            th:insert="~{/form/components :: select(#{credit.product.engineName}, 'engineName',
+            ${#enums.withNames('credit.product.engine', productEngines)})}"/>
 
-            <th:block
-                th:with="emptyOption=true, selectClassName='v-required'"
-                th:insert="~{/form/components :: multiselect(#{credit.product.offerEngineTypes}, 'offerEngineTypes',
-                ${offerEngineTypes})}"/>
-            <th:block
-                th:insert="~{/form/components :: select(#{credit.product.contractTemplate}, 'uuidContractTemplate', ${templates})}"/>
-            <th:block
-                th:with="selectClassName='v-required'"
-                th:insert="~{/form/components :: select(#{credit.product.currency}, 'currency', ${#monetary.availableCurrencies})}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{credit.product.minAmount}, 'minAmount', 'v-required app_decimal positive')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{credit.product.maxAmount}, 'maxAmount', 'v-required app_decimal positive')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{credit.product.minTerm}, 'minTerm', 'app_digits v-required positive')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{credit.product.maxTerm}, 'maxTerm', 'app_digits v-required positive')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{credit.product.lateFeeRate}, 'lateFeeRate', 'v-required app_decimal')}"/>
-        </div>
-    </form>
-</div>
+        <th:block
+            th:with="emptyOption=true, selectClassName='v-required'"
+            th:insert="~{/form/components :: multiselect(#{credit.product.offerEngineTypes}, 'offerEngineTypes',
+            ${offerEngineTypes})}"/>
+        <th:block
+            th:insert="~{/form/components :: select(#{credit.product.contractTemplate}, 'uuidContractTemplate', ${templates})}"/>
+        <th:block
+            th:with="selectClassName='v-required'"
+            th:insert="~{/form/components :: select(#{credit.product.currency}, 'currency', ${#monetary.availableCurrencies})}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{credit.product.minAmount}, 'minAmount', 'v-required app_decimal positive')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{credit.product.maxAmount}, 'maxAmount', 'v-required app_decimal positive')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{credit.product.minTerm}, 'minTerm', 'app_digits v-required positive')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{credit.product.maxTerm}, 'maxTerm', 'app_digits v-required positive')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{credit.product.lateFeeRate}, 'lateFeeRate', 'v-required app_decimal')}"/>
+    </div>
+</form>
 </html>
