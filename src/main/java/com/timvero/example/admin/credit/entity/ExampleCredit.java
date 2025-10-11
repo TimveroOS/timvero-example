@@ -3,6 +3,7 @@ package com.timvero.example.admin.credit.entity;
 import com.timvero.example.admin.application.entity.Application;
 import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.ground.entity.NamedEntity;
+import com.timvero.loan.covenantexecution.entity.HasCovenant;
 import com.timvero.servicing.credit.entity.Credit;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.DiscriminatorValue;
@@ -18,7 +19,7 @@ import org.hibernate.annotations.FetchMode;
 
 @Entity
 @DiscriminatorValue("1")
-public class ExampleCredit extends Credit implements NamedEntity {
+public class ExampleCredit extends Credit implements NamedEntity, HasCovenant {
 
     @NotNull
     @OneToOne(fetch = FetchType.EAGER)

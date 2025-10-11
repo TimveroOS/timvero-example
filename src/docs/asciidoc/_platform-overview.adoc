@@ -4,12 +4,11 @@ Build lending applications fast with pre-built components.
 
 == What You Get
 
-[.unstyled]
-* {ok} **Forms** — Collect customer data with built-in validation
-* {ok} **Database** — Automatic setup for loan data
-* {ok} **Payments** — Connect to banks and card processors
-* {ok} **UI Components** — Works on desktop and mobile
-* {ok} **Business Rules** — Automate loan decisions
+* **Forms** — Collect customer data with built-in validation
+* **Database** — Automatic setup for loan data
+* **Payments** — Connect to banks and card processors
+* **UI Components** — Works on desktop and mobile
+* **Business Rules** — Automate loan decisions
 
 ## What You Build
 

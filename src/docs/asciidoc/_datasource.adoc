@@ -294,14 +294,13 @@ A feature is a data transformation that converts raw data from integrated source
 * **Aggregated metrics** - Total outstanding debt
 
 === Feature Store Benefits
-[.unstyled]
-* icon:check-square[role=green] **Configurable transformations** - Change feature extraction without code changes
-* icon:check-square[role=green] **Automatic caching** - Features are computed once and stored
-* icon:check-square[role=green] **Version management** - Track changes to feature definitions
-* icon:check-square[role=green] **Type safety** - Features have defined data types
-* icon:check-square[role=green] **Error handling** - Graceful handling of transformation failures
-* icon:check-square[role=green] **Audit trail** - Complete history of feature values
-* icon:check-square[role=green] **Performance** - Bulk feature extraction and caching
+*  **Configurable transformations** - Change feature extraction without code changes
+*  **Automatic caching** - Features are computed once and stored
+*  **Version management** - Track changes to feature definitions
+*  **Type safety** - Features have defined data types
+*  **Error handling** - Graceful handling of transformation failures
+*  **Audit trail** - Complete history of feature values
+*  **Performance** - Bulk feature extraction and caching
 
 The Feature Store automatically uses DataSourceManager to fetch data with appropriate caching and lifecycle management, then applies configurable transformations to create business-ready features.
 
@@ -473,63 +472,59 @@ public void testDataUnavailableHandling() {
 
 === Architecture Patterns
 
-[.unstyled]
-* icon:check-square[role=green] **Use Feature Store for business logic** - Primary pattern for consuming external data
-* icon:check-square[role=green] **Use DataSourceManager for direct access** - When you need raw data or custom processing
-* icon:check-square[role=green] **Never use DataSources directly** - Always go through DataSourceManager or Feature Store
-* icon:check-square[role=green] **Choose appropriate loading modes** - READ for performance, QUERY for balance, FORCE for freshness
-* icon:check-square[role=green] **Handle data unavailability gracefully** - Continue workflow when external data is missing
-* icon:check-square[role=green] **Implement proper subject interfaces** - Clear contracts for what data to fetch
-* icon:check-square[role=green] **Use typed target objects** - Strong typing for external API responses
+*  **Use Feature Store for business logic** - Primary pattern for consuming external data
+*  **Use DataSourceManager for direct access** - When you need raw data or custom processing
+*  **Never use DataSources directly** - Always go through DataSourceManager or Feature Store
+*  **Choose appropriate loading modes** - READ for performance, QUERY for balance, FORCE for freshness
+*  **Handle data unavailability gracefully** - Continue workflow when external data is missing
+*  **Implement proper subject interfaces** - Clear contracts for what data to fetch
+*  **Use typed target objects** - Strong typing for external API responses
 
 === DataSource Implementation
 
-[.unstyled]
-* icon:check-square[role=green] **Use meaningful service names** - `@Service("github")` not `@Service("ds1")`
-* icon:check-square[role=green] **Handle errors gracefully** - Always throw `DataUnavailableException` for missing data
-* icon:check-square[role=green] **Configure JSON parsing** - Use `FAIL_ON_UNKNOWN_PROPERTIES = false` for API resilience
-* icon:check-square[role=green] **Set appropriate lifespans** - Balance freshness vs API call costs
-* icon:check-square[role=green] **Version your APIs** - Use explicit API version headers
-* icon:check-square[role=green] **Test thoroughly** - Test both success and failure scenarios
-* icon:check-square[role=green] **Implement proper parsing** - Handle all expected data formats and edge cases
+*  **Use meaningful service names** - `@Service("github")` not `@Service("ds1")`
+*  **Handle errors gracefully** - Always throw `DataUnavailableException` for missing data
+*  **Configure JSON parsing** - Use `FAIL_ON_UNKNOWN_PROPERTIES = false` for API resilience
+*  **Set appropriate lifespans** - Balance freshness vs API call costs
+*  **Version your APIs** - Use explicit API version headers
+*  **Test thoroughly** - Test both success and failure scenarios
+*  **Implement proper parsing** - Handle all expected data formats and edge cases
 
 === DataSourceManager Usage
 
-[.unstyled]
-* icon:check-square[role=green] **Use appropriate loading modes** - Match mode to business requirements
-* icon:check-square[role=green] **Handle Optional results** - Check if data is present before using
-* icon:check-square[role=green] **Catch IOException properly** - Handle network and data access failures
-* icon:check-square[role=green] **Log data access patterns** - Monitor usage for performance optimization
-* icon:check-square[role=green] **Implement fallback strategies** - Use cached data when fresh data unavailable
+*  **Use appropriate loading modes** - Match mode to business requirements
+*  **Handle Optional results** - Check if data is present before using
+*  **Catch IOException properly** - Handle network and data access failures
+*  **Log data access patterns** - Monitor usage for performance optimization
+*  **Implement fallback strategies** - Use cached data when fresh data unavailable
 
 === Security and Performance
 
-[.unstyled]
-* icon:check-square[role=green] **Log appropriately** - Log errors but not sensitive data
-* icon:check-square[role=green] **Add retry logic** - Handle temporary network failures
-* icon:check-square[role=green] **Set reasonable timeouts** - Don't block indefinitely
-* icon:check-square[role=green] **Monitor data freshness** - Track when data was last updated
-* icon:check-square[role=green] **Use lifespans effectively** - Avoid unnecessary API calls
+*  **Log appropriately** - Log errors but not sensitive data
+*  **Add retry logic** - Handle temporary network failures
+*  **Set reasonable timeouts** - Don't block indefinitely
+*  **Monitor data freshness** - Track when data was last updated
+*  **Use lifespans effectively** - Avoid unnecessary API calls
 
 === Anti-Patterns
 
 [.unstyled]
-* icon:times[role=red] **Don't use DataSources directly** - Bypasses caching and lifecycle management
-* icon:times[role=red] **Don't bypass Feature Store for business logic** - Use Feature Store instead of raw DataSource data
-* icon:times[role=red] **Don't ignore Optional results** - Always check if data is present
-* icon:times[role=red] **Don't hardcode loading modes** - Choose based on business requirements
-* icon:times[role=red] **Don't expose sensitive data** - Never log API keys or personal information
-* icon:times[role=red] **Don't hardcode URLs** - Use configuration properties for API endpoints
-* icon:times[role=red] **Don't ignore exceptions** - Handle `IOException` and `DataUnavailableException`
+* {bad} **Don't use DataSources directly** - Bypasses caching and lifecycle management
+* {bad} **Don't bypass Feature Store for business logic** - Use Feature Store instead of raw DataSource data
+* {bad} **Don't ignore Optional results** - Always check if data is present
+* {bad} **Don't hardcode loading modes** - Choose based on business requirements
+* {bad} **Don't expose sensitive data** - Never log API keys or personal information
+* {bad} **Don't hardcode URLs** - Use configuration properties for API endpoints
+* {bad} **Don't ignore exceptions** - Handle `IOException` and `DataUnavailableException`
 
 === Production Checklist
 
 [.unstyled]
-* icon:check-square[role=gray] DataSources use meaningful service names
-* icon:check-square[role=gray] All external calls have appropriate timeouts
-* icon:check-square[role=gray] Error handling covers `DataUnavailableException` and `IOException`
-* icon:check-square[role=gray] Loading modes are chosen appropriately for each use case
-* icon:check-square[role=gray] Sensitive data is never logged
-* icon:check-square[role=gray] DataSource lifespans balance freshness vs cost
-* icon:check-square[role=gray] Subject interfaces are properly implemented
-* icon:check-square[role=gray] Target objects handle all expected data formats
+* {todo} DataSources use meaningful service names
+* {todo} All external calls have appropriate timeouts
+* {todo} Error handling covers `DataUnavailableException` and `IOException`
+* {todo} Loading modes are chosen appropriately for each use case
+* {todo} Sensitive data is never logged
+* {todo} DataSource lifespans balance freshness vs cost
+* {todo} Subject interfaces are properly implemented
+* {todo} Target objects handle all expected data formats

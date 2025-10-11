@@ -1,0 +1,1348 @@
+= Covenant Monitoring System
+
+:sourcedir: ../../main/java/com/timvero/loan
+
+The Covenant Monitoring System provides automated control of the financial conditions
+of loan agreements through integration with the Metric System and the Feature Store.
+
+== Architecture Overview
+
+The Covenant Monitoring System follows a four-layer architecture:
+
+* **CovenantSpecification** — versioned monitoring rules
+* **CovenantExecution** — scheduling and performing checks
+* **CovenantResult** — storing check results and managing violations
+* **Metric Integration** — calculation of indicators via `MetricService`
+
+[source]
+----
+Scheduled Task → CovenantSpecification → MetricService → CovenantExecution → CovenantResult
+                                              ↓
+                                    Feature Store + DataSources
+----
+
+**Key Principle:** Covenants always operate through the Metric System.
+Indicators are computed via `MetricMapping`, and validation conditions are defined through `Expression`.
+
+=== Core System Components
+
+[cols="1,3",options="header"]
+|===
+|Component |Description
+
+|**CovenantSpecification**
+|A versioned configuration of a monitoring rule. Defines the holder, subject, metrics, and validation conditions.
+
+|**CovenantExecution**
+|A record of an executed check. Contains status, a collection of results, and error information.
+
+|**CovenantResult**
+|The outcome of a check for a specific subject. Possible states: `CLEAN`, `VIOLATION`, `RESOLVED`, `EXCEPTION`.
+
+|**HasCovenant**
+|Marker interface for entities that own covenants (e.g., `ExampleCredit`).
+
+|**HasMetric**
+|Marker interface for entities being evaluated (e.g., `Participant`, `Collateral`).
+
+|**CovenantHolderResolver**
+|Links a holder with its subjects and defines the logic for resolving the entities to be validated.
+|===
+
+=== What the Framework Does
+
+**Automatic Monitoring:**
+
+* **Periodic Execution** — checks are performed on a schedule
+* **Metric Calculation** — via Feature Store and DataSources
+* **CovenantExecution Creation** — generated for each scheduled check
+* **Result Persistence** — stores outcomes for all subjects
+
+**Lifecycle Management:**
+
+* **Producer** — creates tasks with status `CovenantExecution.NEW`
+* **Consumer** — executes the checks and saves the results
+* **Exception Handling** — automatic processing of metrics in `EXCEPTION` state
+* **Versioning** — managed through `lineageId`
+
+=== What is a Covenant?
+
+A **Covenant** is a contractual financial condition that a borrower agrees to maintain throughout the term of a loan.
+Covenants are used for risk monitoring and early detection of financial distress.
+
+**Typical Covenant Examples:**
+
+* **Borrower Income** — must not decrease by more than 20% from the baseline value
+* **Loan-to-Value (LTV)** — loan amount to collateral value ratio < 80%
+* **Debt-to-Income (DTI)** — debt-to-income ratio < 40%
+* **Minimum Liquidity** — available funds > €10,000
+
+=== CovenantSpecification — Rule Configuration
+
+`CovenantSpecification` defines **what** to check, **who** to check, and **how often** the checks are performed.
+
+[cols="1,3",options="header"]
+|===
+|Field |Description
+
+|**holderType**
+|The type of entity that owns the covenant (`ExampleCredit`). Defined via `CovenantSpecificationHolderType`.
+
+|**subjectKey**
+|Specifies who is being checked: `BORROWER`, `GUARANTOR`, `COLLATERAL`. Must match a key from `CovenantHolderResolver`.
+
+|**metricMapping**
+|The `MetricMapping` used to compute the current value of the indicator (`REGULAR` metric).
+
+|**anchoredMetricMapping**
+|Optional `MetricMapping` used to obtain the baseline value (`ANCHORED` metric).
+
+|**expression**
+|JavaScript/Groovy expression used to evaluate the condition.
+Returns a `boolean`: `true` = `CLEAN`, `false` = `VIOLATION`.
+
+|**executionType**
+|Execution type. Currently only `SCHEDULED` (runs periodically).
+
+|**periodicity**
+|Frequency of execution: `DAYS`, `WEEKS`, `MONTHS`, `YEARS`.
+
+|**numberOfPeriods**
+|Number of periods between executions (e.g., `1` for monthly checks).
+
+|**dateTimeExecution**
+|Date and time of the first scheduled execution. The Producer calculates subsequent ones based on periodicity.
+
+|**additives**
+|List of product additive IDs. The covenant applies only to loans with these products.
+
+|**active**
+|Activity flag. Only active specifications are executed.
+|===
+
+**Versioning:**
+
+* `CovenantSpecification` extends `HistoryEntity` — versioning is supported
+* All versions are linked through a shared `lineageId`
+* When a specification is edited, a new version is created with `active=true`
+* Previous versions remain in history with `active=false`
+
+=== CovenantExecution — Check Record
+
+`CovenantExecution` is created for each run of a check based on a `CovenantSpecification`.
+
+[cols="1,3",options="header"]
+|===
+|Field |Description
+
+|**specification**
+|Reference to the `CovenantSpecification` being executed.
+
+|**periodIndex**
+|The index of the period for scheduled executions. Calculated based on `dateTimeExecution` and `periodicity`.
+
+|**status**
+|`NEW` → `EVALUATED` or `DISABLED`.
+The Consumer processes `NEW` executions and sets the status to `EVALUATED` upon completion.
+
+|**covenantResults**
+|A collection of `CovenantResult` entries for all evaluated subjects.
+
+|**exception**
+|`ExceptionEntity` if the check failed (e.g., script error, timeout, etc.).
+
+|**createdAt**
+|Timestamp when the execution was created.
+
+|**createdBy**
+|User who triggered the execution (for manual runs) or `null` (for scheduled ones).
+|===
+
+=== CovenantResult — Check Result
+
+`CovenantResult` stores the outcome of a check for a specific subject within a `CovenantExecution`.
+
+[cols="1,3",options="header"]
+|===
+|Field |Description
+
+|**execution**
+|Reference to the corresponding `CovenantExecution`.
+
+|**specification**
+|Reference to the `CovenantSpecification` (denormalized for faster access).
+
+|**ownerId**
+|UUID of the holder entity (e.g., `ExampleCredit.id`).
+
+|**subjectId**
+|UUID of the evaluated subject (e.g., `Participant.id`).
+
+|**metric**
+|Reference to the computed `REGULAR` metric.
+
+|**rawContent**
+|The raw result of the expression evaluation (string representation).
+
+|**state**
+|`CLEAN`, `VIOLATION`, `RESOLVED`, `EXCEPTION`.
+
+|**createdAt**
+|Timestamp of result creation.
+|===
+
+**CovenantResult States:**
+
+[.unstyled]
+* {ok} **CLEAN** — condition satisfied, no violations
+* {bad} **VIOLATION** — condition violated
+* {ok} **RESOLVED** — violation manually resolved by a user
+* {bad} **EXCEPTION** — error occurred during metric or expression evaluation
+
+=== HasCovenant and HasMetric
+
+Marker interfaces for type-safe linking of entities.
+
+=== Metric Types: REGULAR vs ANCHORED
+
+The system uses two types of metrics for different monitoring purposes.
+
+==== REGULAR Metrics
+
+**Purpose:** Represents the current value of an indicator during each evaluation.
+
+**When calculated:** On every covenant execution via `MetricService.getMetric()`.
+
+**Examples:**
+
+* Current monthly income of the borrower
+* Current market value of the collateral
+* Current debt-to-income ratio
+
+==== ANCHORED Metrics
+
+**Purpose:** Fixed baseline value used for comparison.
+
+**When set:**
+
+* At loan origination — automatically via `AnchoredMetricService.calculateAnchored()`
+* When conditions change — recalculated via `recalculateAnchored()`
+* Manually by a user — through `UpdateAnchoredMetricAction`
+
+**Examples:**
+
+* Income at the time of loan origination
+* Initial appraised value of the collateral
+* DTI ratio at loan approval
+
+==== HasCovenant Interface
+
+[source,java]
+----
+public interface HasCovenant extends Persistable<UUID> {
+}
+----
+
+**Purpose:** Marks entities that can have covenants (holders).
+
+**Examples:**
+
+* `ExampleCredit` — loans with financial conditions
+
+**Required to implement:**
+
+* `CovenantHolderResolver<T extends HasCovenant>` for this type
+* Define subjects via `getCovenantSubjects()`
+
+==== HasMetric Interface
+
+[source,java]
+----
+public interface HasMetric extends FeaturedSubject {
+    default String details() {
+        return getPrimaryId();
+    }
+}
+----
+
+**Purpose:** Marks entities that can be evaluated (subjects).
+
+**Examples:**
+
+* `Participant` — borrowers and guarantors
+* `Collateral` — pledged assets
+
+**Required to implement:**
+
+* `details()` — human-readable description for the UI (name, ID, etc.)
+* `getPrimaryId()` — unique identifier for logs
+
+=== CovenantHolderResolver — Linking holder ↔ subjects
+
+`CovenantHolderResolver` defines relationships between a holder and its subjects.
+
+[cols="1,3",options="header"]
+|===
+|Method |Description
+
+|**resolveTargets**
+|`Stream<T> resolveTargets(CovenantSpecification spec)` — find all holder entities to be checked.
+
+|**getCovenantSubjects**
+|`List<SubjectRecord<T>> getCovenantSubjects()` — the list of available subject types with extraction functions.
+
+|**getCovenantSpecifications**
+|`Collection<CovenantSpecification> getCovenantSpecifications(T target)` — which specs apply to the holder.
+|===
+
+== Complete Implementation Example
+
+Below is a complete implementation of the covenant system for a credit product using `ExampleCredit` as the holder.
+
+=== Overview
+
+In this example, we implement borrower income monitoring to verify that income has not dropped by more than 20% from the baseline captured at loan origination.
+
+**Implementation components:**
+
+* **CovenantHolderResolver** — links `ExampleCredit` with `Participant` subjects
+* **MetricMapping** — config for computing income via the Feature Store
+* **CovenantSpecification** — the income verification rule
+* **UI Integration** — tabs to browse results
+
+=== Step 1: CovenantHolderResolver Implementation
+
+Create a resolver that links the credit to the participants being evaluated.
+
+[source,java]
+----
+@Component
+public class CreditCovenantHolderResolver implements CovenantHolderResolver<ExampleCredit> {
+
+    @Autowired
+    private ExampleCreditRepository creditRepository;
+    @Autowired
+    private CovenantSpecificationRepository covenantSpecificationRepository;
+
+    @Override
+    public Stream<ExampleCredit> resolveTargets(CovenantSpecification specification) {
+        // Find all credits to check by product additive
+        return specification.getAdditives().stream()
+            .flatMap(a -> creditRepository.getAllByAdditiveId(a));
+    }
+
+    @Override
+    public List<SubjectRecord<ExampleCredit>> getCovenantSubjects() {
+        return List.of(
+            // BORROWER subject
+            SubjectRecordBuilder.<ExampleCredit>builder()
+                .name(ParticipantRole.BORROWER.name())
+                .subject(new SubjectSupplierRecord<>(
+                    Participant.class,
+                    credit -> List.of(credit.getApplication().getBorrowerParticipant())
+                ))
+                .build(),
+
+            // GUARANTOR subject
+            SubjectRecordBuilder.<ExampleCredit>builder()
+                .name(ParticipantRole.GUARANTOR.name())
+                .subject(new SubjectSupplierRecord<>(
+                    Participant.class,
+                    credit -> credit.getApplication().getParticipants().stream()
+                        .filter(p -> p.getRoles().contains(ParticipantRole.GUARANTOR))
+                        .collect(Collectors.toList())
+                ))
+                .build()
+        );
+    }
+
+    @Override
+    public Collection<CovenantSpecification> getCovenantSpecifications(ExampleCredit target) {
+        // Find all active specs for the product additive of this credit
+        return covenantSpecificationRepository.findAllByAdditiveIdAndActiveTrue(
+            target.getCondition().getSecuredOffer().getOriginalOffer().getProductAdditive().getId()
+        );
+    }
+}
+----
+
+**Key Points:**
+
+* **@Component** — Spring automatically discovers the resolver via its generic type
+* **resolveTargets** — finds credits by the product additive from the specification
+* **getCovenantSubjects** — three subject types: BORROWER, GUARANTOR, COLLATERAL
+* **getCovenantSpecifications** — filters specs by the credit’s product additive
+
+=== Step 2: Entity Integration
+
+Ensure that entities implement the required interfaces.
+
+==== ExampleCredit Entity
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("1")
+public class ExampleCredit extends Credit implements HasCovenant {
+
+    @OneToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(unique = true, nullable = false)
+    private BaseApplication application;
+
+    // ... other fields
+}
+----
+
+==== Participant Entity
+
+[source,java]
+----
+@Entity
+@Table(name = "participant")
+@Audited
+public class Participant extends AbstractAuditable
+    implements HasMetric {
+
+    @Override
+    public String details() {
+        return getFullName();  // "John Smith"
+    }
+
+    @Transient
+    @Override
+    public String getPrimaryId() {
+        IndividualInfo info = getClient() != null
+            ? getClient().getIndividualInfo()
+            : getIndividualInfo();
+        return info.getNationalId();  // "123456789"
+    }
+
+    // ... other fields
+}
+----
+
+**Important:**
+
+* **HasCovenant** — marker for holder entities
+* **HasMetric** — marker for subject entities
+* **details()** — human-readable name for the UI
+* **getPrimaryId()** — unique ID for logs and grouping
+
+=== Step 3: MetricMapping Configuration
+
+Create a `MetricMapping` in the UI to compute a participant’s monthly income.
+
+**Configuration:**
+
+[cols="1,3",options="header"]
+|===
+|Field |Value
+
+|**Name**
+|`participant_monthly_income`
+
+|**Entity Type**
+|`Participant`
+
+|**Expression**
+|JavaScript code that extracts income
+
+|**Engine**
+|`javascript`
+|===
+
+**Expression for computing income:**
+
+[source,javascript]
+----
+// Extract income from the Feature Store
+var incomeData = features.get("tink", "monthly_income");
+
+// If no banking data, fall back to manually provided values
+if (incomeData == null) {
+    var annualIncome = entity.getTotalAnnualIncome();
+    if (annualIncome != null) {
+        return annualIncome.getNumber().doubleValue() / 12;
+    }
+    return null;
+}
+
+// Return monthly income from banking data
+return incomeData;
+----
+
+**What happens:**
+
+* **features.get()** — loads data from the Feature Store (e.g., Tink bank data)
+* **Fallback** — if no external data is available, use `entity.getTotalAnnualIncome()`
+* **Automatic typing** — `MetricService` infers the `FeatureDataType` from the result
+
+=== Step 4: CovenantSpecification Configuration
+
+Create a `CovenantSpecification` in the UI to validate income.
+
+**Core parameters:**
+
+[cols="1,3",options="header"]
+|===
+|Field |Value
+
+|**Name**
+|`Borrower Income Monitoring`
+
+|**Holder Type**
+|`ExampleCredit`
+
+|**Subject Key**
+|`BORROWER`
+
+|**Metric Mapping**
+|`participant_monthly_income` (REGULAR)
+
+|**Anchored Metric Mapping**
+|`participant_monthly_income` (ANCHORED)
+
+|**Execution Type**
+|`SCHEDULED`
+
+|**Periodicity**
+|`MONTHS`
+
+|**Number of Periods**
+|`1` (monthly)
+
+|**Date Time Execution**
+|`2025-01-01T00:00:00` (first run)
+
+|**Additives**
+|Select the product additives to which the rule applies
+|===
+
+**Validation expression:**
+
+[source,javascript]
+----
+// Ensure income has not dropped by more than 20%
+// metric   — current income (REGULAR)
+// anchored — baseline income at origination (ANCHORED)
+
+if (anchored == null) {
+    // If no baseline is set, skip the check
+    return true;
+}
+
+// Income must be >= 80% of the baseline
+return metric >= anchored * 0.8;
+----
+
+**Bindings available in the expression:**
+
+[cols="1,3",options="header"]
+|===
+|Binding |Description
+
+|`covenantHolder`
+|`ExampleCredit` entity
+
+|`subject`
+|`Participant` entity (borrower)
+
+|`metric`
+|`Metric` object containing the current income (REGULAR)
+
+|`participant_monthly_income`
+|Direct access to the metric value (`metric.getContent()`)
+
+|`anchored`
+|Value of the ANCHORED metric or `null`
+|===
+
+=== Step 5: ANCHORED Metric Setup
+
+Set the baseline income value at the time of loan origination.
+
+==== Automatic Setup
+
+When the credit transitions to an active state, invoke:
+
+[source,java]
+----
+@Component
+public class CreditChecker extends EntityChecker<ExampleCredit, UUID> {
+
+    @Autowired
+    private AnchoredMetricService anchoredMetricService;
+
+    @Override
+    protected void registerListeners(CheckerListenerRegistry<ExampleCredit> registry) {
+        registry.entityChange().inserted();
+    }
+
+    @Override
+    protected boolean isAvailable(ExampleCredit credit) {
+        return true;
+    }
+
+    @Override
+    protected void perform(ExampleCredit credit) {
+        TransactionUtils.afterTransaction(() -> {
+            anchoredMetricService.calculateAnchored(credit);
+        });
+    }
+}
+----
+
+**What happens:**
+
+* Finds all `CovenantSpecifications` with `anchoredMetricMapping != null`
+* Resolves subjects via `CovenantHolderResolver`
+* Computes metrics via `MetricService`
+* Persists them as `MetricType.ANCHORED`
+
+==== Manual Setup via UI
+
+A user can update an ANCHORED metric with `UpdateAnchoredMetricAction`:
+
+[source,java]
+----
+@RequestMapping("/update-anchored-metric")
+@Controller
+@Order(10000)
+public class UpdateAnchoredMetricAction extends AbstractUpdateAnchoredMetricAction<ExampleCredit> {
+    // Inherits full functionality
+}
+----
+
+**UI flow:**
+
+* Open the credit → Actions → Update Anchored Metric
+* Select the subject (borrower)
+* Select the metric (`participant_monthly_income`)
+* Enter a new value and data type
+* Save — a new ANCHORED metric is created
+
+=== Step 6: UI Integration
+
+Add tabs to display check results.
+
+==== Tab with the Latest Results
+
+[source,java]
+----
+@RequestMapping("/covenant-result")
+@Controller
+@Order(9500)
+public class CreditCovenantResultTab extends AbstractCovenantResultTab<ExampleCredit> {
+
+    @Autowired
+    private CovenantResultRepository covenantResultRepository;
+
+    @Override
+    protected List<CovenantResult> getCovenantResults(UUID id) {
+        // Shows only the latest result for each subject
+        return covenantResultRepository.findLatestByOwnerGroupedBySubjectId(id);
+    }
+}
+----
+
+==== Tab with Full History
+
+[source,java]
+----
+@RequestMapping("/covenant-result-archive")
+@Controller
+@Order(10500)
+public class CreditCovenantResultArchiveTab extends AbstractCovenantResultTab<ExampleCredit> {
+
+    @Autowired
+    private CovenantResultRepository covenantResultRepository;
+
+    @Override
+    protected List<CovenantResult> getCovenantResults(UUID id) {
+        // Show all check results
+        return covenantResultRepository.findAllByOwnerId(id);
+    }
+}
+----
+
+==== Tab for ANCHORED Metrics
+
+[source,java]
+----
+@RequestMapping("/anchored-metric")
+@Controller
+@Order(10000)
+public class CreditAnchoredMetricTab extends HasCovenantAnchoredMetricTab<ExampleCredit> {
+
+    @Override
+    public boolean isVisible(ExampleCredit entity) {
+        return true;  // Always visible
+    }
+}
+----
+
+**Action to calculate the covenant manually:**
+
+[source,java]
+----
+@RequestMapping("/calculate-covenant")
+@Controller
+@Order(11000)
+public class CalculateCovenantAction extends AbstractCalculateCovenantAction<ExampleCredit> {
+    // Inherits full functionality
+}
+----
+
+=== Localization
+
+Add translations for UI elements in `messages.properties`.
+
+[source,properties]
+#---------------Actions-------------
+credit.action.update-anchored-metric=Update Anchored Metric
+credit.action.calculate-covenant=Calculate Covenant
+#---------------Tabs----------------
+credit.tab.covenant-result=Covenant Results
+credit.tab.covenant-result-archive=Covenant Results Archive
+credit.tab.anchored-metric=Anchored Metrics
+
+=== Step 7: Testing
+
+Validate the implementation via the UI.
+
+==== Test Scenario 1: Creating a Specification
+
+* Go to `/covenant-specification` → Create New
+* Fill in all fields (see Step 4)
+* Use the **Test** button with a real credit
+* Verify the expression returns `true`/`false`
+* Save the specification
+
+==== Test Scenario 2: Setting the ANCHORED Metric
+
+* Open a credit in status **NEW**
+* Activate the credit → `calculateAnchored()` is invoked
+* Navigate to the **Anchored Metrics** tab
+* Verify that income is stored with type **ANCHORED**
+
+==== Test Scenario 3: Manual Execution
+
+* Open the credit → **Actions** → **Calculate Covenant**
+* Select the specification **Borrower Income Monitoring**
+* Execute → a `CovenantExecution` is created
+* Go to the **Covenant Results** tab
+* Verify the state: **CLEAN** or **VIOLATION**
+
+==== Test Scenario 4: Scheduled Execution
+
+* Wait for the configured `dateTimeExecution`
+* The Producer creates `CovenantExecution.NEW`
+* The Consumer processes it and creates `CovenantResults`
+* Check logs to confirm execution
+* Review results in the UI
+
+== Expression Writing Guide
+
+An expression defines the covenant condition. It is JavaScript or Groovy code that must return a boolean result.
+
+=== Expression Basics
+
+**Expression requirements:**
+
+* **Returns boolean** — `true` for `CLEAN`, `false` for `VIOLATION`
+* **Short and readable** — avoid overly complex logic
+* **Null-safe** — always check for `null` before use
+* **Deterministic** — same input → same output
+
+**Supported scripting engines:**
+
+[.unstyled]
+* **JavaScript** — recommended; fast and simple
+* **Groovy** — for advanced logic with Java interop
+
+=== Available Bindings
+
+An expression has access to the following variables:
+
+[cols="1,2,3",options="header"]
+|===
+|Binding |Type |Description
+
+|`covenantHolder`
+|`HasCovenant` (e.g., `ExampleCredit`)
+|The entity that owns the covenant. All fields accessible via getters.
+
+|`subject`
+|`HasMetric` (e.g., `Participant`)
+|The entity being evaluated. Fields accessible via getters.
+
+|`metric`
+|`Metric` object
+|Metric object with methods `getName()`, `getContent()`, and `getDataType()`.
+
+|`<metricName>`
+|Depends on the metric
+|Direct access to the metric value. The name matches `MetricMapping.name`.
+
+|`anchored`
+|Depends on the metric or `null`
+|Value of the ANCHORED metric. `null` if not set.
+|===
+
+=== Expression Examples
+
+==== Example 1: Debt-to-Income Check
+
+**Requirement:** DTI < 40%.
+
+[source,javascript]
+----
+// Get the monthly payment from the credit schedule
+var monthlyPayment = covenantHolder.getSchedule().getPaymentAmount().getNumber().doubleValue();
+
+// Get the current monthly income from the metric
+var monthlyIncome = metric;
+
+if (monthlyIncome == null || monthlyIncome <= 0) {
+    return false;  // No income = VIOLATION
+}
+
+// DTI must be < 40%
+var dti = monthlyPayment / monthlyIncome;
+return dti < 0.4;
+----
+
+==== Example 2: Combined Check
+
+**Requirement:** Income remains stable AND DTI is acceptable.
+
+[source,javascript]
+----
+// Check 1: income has not dropped by more than 20%
+var incomeStable = anchored != null && metric >= anchored * 0.8;
+
+// Check 2: DTI < 40%
+var monthlyPayment = covenantHolder.getSchedule().getPaymentAmount().getNumber().doubleValue();
+var dtiAcceptable = (monthlyPayment / metric) < 0.4;
+
+// Both conditions must pass
+return incomeStable && dtiAcceptable;
+----
+
+=== Null Safety Patterns
+
+Always check for `null` before using any values.
+
+==== Early Return
+
+[source,javascript]
+----
+// Check anchored
+if (anchored == null) {
+    return true;  // Or false, depending on business requirements
+}
+
+// Check metric
+if (metric == null) {
+    return false;  // No data = violation
+}
+
+// Main logic
+return metric >= anchored * 0.8;
+----
+
+=== Testing Expressions
+
+Use the built-in expression tester in the UI for debugging.
+
+==== Test Flow
+
+* **Open CovenantSpecification** → Edit or Create
+* **Write the expression** in the code editor
+* **Select a test entity** from the dropdown (holder)
+* **Click Evaluate** → result appears in the console
+
+==== Test Output Format
+----
+<subject.primaryId> : <result>
+----
+**Examples:**
+----
+123456789 : true
+987654321 : false
+111222333 : Exception: Cannot read property 'doubleValue' of null
+----
+
+=== Performance Considerations
+
+Each expression is executed for every subject during every evaluation.
+
+==== Best Practices
+
+* **Avoid loops** — prefer simple comparisons
+* **Minimize method calls** — cache results in local variables
+* **Do not perform DB queries** — use only available bindings
+* **Keep it simple** — move complex logic to `MetricMapping`
+
+==== Good Example
+
+[source,javascript]
+----
+// Fast and efficient
+return metric >= anchored * 0.8;
+----
+
+==== Bad Example
+
+[source,javascript]
+----
+// Slow — multiple method calls
+for (var i = 0; i < subject.getApplication().getParticipants().size(); i++) {
+    var p = subject.getApplication().getParticipants().get(i);
+    if (p.getStatus().equals(ParticipantStatus.ACTIVE)) {
+        // Complex logic inside loop
+    }
+}
+----
+
+=== Best Practices
+
+==== Expression Design
+
+* **Return boolean explicitly** — `return true` or `return false`
+* **Use meaningful variable names** — `income`, `baseline`, not `x`, `y`
+* **Test with real data** — use the UI tester before saving
+
+=== Anti-Patterns
+
+[.unstyled]
+* {bad} **Not checking null** — causes `EXCEPTION` instead of `VIOLATION`
+* {bad} **Overly nested logic** — makes expressions unreadable
+* {bad} **Iterating over collections** — poor performance impact
+* {bad} **DB queries inside expression** — use only `MetricMapping` + `Feature Store`
+* {bad} **Mutation inside expression** — expressions must only evaluate, not modify state
+* {bad} **Using console.log** — not available in production, only for debugging
+* {bad} **Hardcoded entity IDs** — expressions must work for any entity
+* {bad} **Ignoring currency** — always validate the currency for `MonetaryAmount`
+
+=== Expression Checklist
+
+Before saving a `CovenantSpecification`, verify the following:
+
+[.unstyled]
+* {todo} Expression returns a boolean
+* {todo} All null cases are handled
+* {todo} Tested with real data via UI
+* {todo} Works for all subject types (BORROWER, GUARANTOR, etc.)
+* {todo} Handles the case when `anchored = null`
+* {todo} No magic numbers — use clear constants
+* {todo} Comments added for non-trivial logic
+* {todo} Under 20 lines of code
+
+== Lifecycle & Scheduling
+
+The Covenant Monitoring System uses a **producer–consumer** pattern to automatically execute checks on a schedule.
+
+=== Overview
+
+**Execution Flow:**
+
+[source]
+----
+CovenantSpecification (active=true)
+    ↓
+Producer Task (scheduled) → creates CovenantExecution.NEW
+    ↓
+Consumer Task (scheduled) → processes NEW → saves Results
+    ↓
+CovenantResult (CLEAN / VIOLATION / EXCEPTION)
+----
+
+**Key Components:**
+
+* **CovenantExecutionProducerTask** — scheduled task that creates executions
+* **CovenantExecutionProducer** — business logic responsible for creation
+* **CovenantExecutionConsumer** — scheduled task that processes executions
+* **CovenantExecutionService** — performs checks and persists results
+
+=== Producer Task
+
+The Producer creates `CovenantExecution` records with status `NEW` for further processing.
+
+==== Configuration
+
+[source,properties]
+----
+# application.properties
+covenant.execution.producer.initialDelay=PT1M
+covenant.execution.producer.fixedDelay=PT5M
+----
+
+**Properties:**
+
+[cols="1,3",options="header"]
+|===
+|Property |Description
+
+|`initialDelay`
+|Delay before the first execution after application startup. Format: ISO-8601 Duration (`PT1M` = 1 minute).
+
+|`fixedDelay`
+|Interval between the completion of the previous run and the start of the next one. Recommended: `PT5M` (5 minutes).
+|===
+
+**Key Points:**
+
+* **Idempotent** — repeated runs do not create duplicates (checked via `exists`)
+* **Period-based** — only one execution per period
+* **REQUIRES_NEW** — independent transaction for each specification
+* **Synchronous load** — `getSync()` ensures consistency
+
+=== Consumer Task
+
+The Consumer processes executions with status `NEW` and saves the results.
+
+==== Configuration
+
+[source,properties]
+----
+# application.properties
+covenant.execution.consumer.initialDelay=PT2M
+covenant.execution.consumer.fixedDelay=PT1M
+----
+
+**Properties:**
+
+[cols="1,3",options="header"]
+|===
+|Property |Description
+
+|`initialDelay`
+|Delay before the first run. Should be greater than the Producer’s delay to allow time for execution creation.
+
+|`fixedDelay`
+|Interval between runs. Recommended: `PT1M` (1 minute) for fast processing.
+|===
+
+**Processing Strategy:**
+
+* **One at a time** — processes one execution at a time
+* **FIFO order** — `ORDER BY id DESC LIMIT 1` (can be changed to ASC)
+* **Separate transaction** — each execution runs in its own transaction
+* **Fail-safe** — failure in one execution does not block others
+
+== Best Practices
+
+Guidelines for designing, implementing, and operating the Covenant Monitoring System.
+
+=== CovenantSpecification Design
+
+==== Naming Conventions
+
+* **Descriptive names** — use “Borrower Income Stability > 80%” instead of “Income Check”
+* **Include thresholds** — explicitly state numeric thresholds in names
+* **Subject prefix** — start with “Borrower”, “Guarantor”, or “Collateral”
+* **Version suffix** — add “v2”, “Q1 2025”, etc., for multiple versions
+
+**Examples:**
+
+**Good examples:**
+
+* Borrower Monthly Income > 80% of Baseline
+* Guarantor Active Status Check
+* Collateral LTV < 80%
+* Borrower DTI < 40% (Revised Q1 2025)
+
+**Bad examples:**
+
+[.unstyled]
+* {bad} Inc Check
+* {bad} GUAR_STS
+* {bad} LTV
+
+==== Expression Design
+
+* **Keep it simple** — under 20 lines, one main logical condition
+* **Null-safe first** — check for null at the beginning
+* **Use constants** — avoid magic numbers
+* **Comment thresholds** — explain where threshold values come from
+* **Return explicit boolean** — always use `return true/false`
+* **Handle missing anchored** — define behavior when the baseline is null
+* **Test all edge cases** — null, zero, and negative values
+
+**Good example:**
+
+[source,javascript]
+----
+// Borrower monthly income must not drop below 80% of baseline
+// Threshold agreed with Risk Management on 2025-01-15
+
+if (anchored == null) {
+    return true;  // Skip check if baseline not set
+}
+
+if (metric == null || metric <= 0) {
+    return false;  // No income data = violation
+}
+
+var THRESHOLD = 0.8;  // 20% drop allowed
+return metric >= anchored * THRESHOLD;
+----
+
+**Bad example:**
+
+[source,javascript]
+----
+// Don’t do this
+return metric >= anchored * 0.8;  // What if anchored is null?
+----
+
+=== CovenantHolderResolver Implementation
+
+==== Resolver Design
+
+* **Single responsibility** — one resolver per holder type
+* **Immutable subjects list** — use `List.of()` for `getCovenantSubjects()`
+* **Efficient resolveTargets** — use indexed queries
+* **Filter inactive** — exclude cancelled or closed entities
+* **Handle lazy loading** — use `JOIN FETCH` when needed
+
+**Good example:**
+
+[source,java]
+----
+@Override
+public Stream<ExampleCredit> resolveTargets(CovenantSpecification specification) {
+    // Efficient query with filtering
+    return specification.getAdditives().stream()
+        .flatMap(additiveId -> creditRepository
+            .findByAdditiveIdAndStatusIn(
+                additiveId,
+                List.of(CreditStatus.ACTIVE, CreditStatus.GRACE_PERIOD)
+            )
+            .stream()
+        );
+}
+----
+
+**Bad example:**
+
+[source,java]
+----
+@Override
+public Stream<ExampleCredit> resolveTargets(CovenantSpecification specification) {
+    // Inefficient — loads all credits
+    return creditRepository.findAll().stream()
+        .filter(c -> specification.getAdditives().contains(c.getAdditive().getId()));
+}
+----
+
+==== Subject Extraction
+
+* **Return empty list** — never return null when no subjects exist
+* **Filter active only** — exclude deleted or inactive entities
+* **Handle relationships** — use proper JPA fetching
+* **Cache if possible** — subjects rarely change
+* **Log unexpected states** — when subjects are missing but expected
+
+== Anti-Patterns
+
+Common mistakes when working with the Covenant Monitoring System and how to avoid them.
+
+=== Expression Anti-Patterns
+
+==== Not Checking Null Values
+
+**Problem:** The expression throws a `NullPointerException` instead of returning `VIOLATION`.
+
+**Bad example:**
+
+[source,javascript]
+----
+// Dangerous — if anchored == null, this will throw an exception
+return metric >= anchored * 0.8;
+----
+
+**Why it's bad:**
+
+[.unstyled]
+* {bad} Creates a `CovenantResult` with `state = EXCEPTION`
+* {bad} Masks the real violation
+* {bad} Makes problem analysis harder
+* {bad} Requires manual intervention
+
+**Good example:**
+
+[source,javascript]
+----
+// Safe — explicit null check
+if (anchored == null) {
+    return true;  // Or false, depending on business logic
+}
+
+if (metric == null) {
+    return false;  // No data = violation
+}
+
+return metric >= anchored * 0.8;
+----
+
+=== CovenantHolderResolver Anti-Patterns
+
+==== Loading All Entities
+
+**Problem:** The resolver loads all entities without any filtering.
+
+**Bad example:**
+
+[source,java]
+----
+@Override
+public Stream<ExampleCredit> resolveTargets(CovenantSpecification specification) {
+    // Loads ALL credits from the database
+    return creditRepository.findAll().stream()
+        .filter(c -> c.getStatus() == CreditStatus.ACTIVE);
+}
+----
+
+**Why it's bad:**
+
+[.unstyled]
+* {bad} Huge memory footprint
+* {bad} Very slow on large datasets
+* {bad} Execution timeouts
+* {bad} Risk of OutOfMemoryError when scaling
+
+**Good example:**
+
+[source,java]
+----
+@Override
+public Stream<ExampleCredit> resolveTargets(CovenantSpecification specification) {
+    // Efficient query with filtering at the DB level
+    return specification.getAdditives().stream()
+        .flatMap(additiveId -> creditRepository
+            .findByAdditiveIdAndStatus(additiveId, CreditStatus.ACTIVE)
+            .stream()
+        );
+}
+----
+
+==== Using REGULAR Instead of ANCHORED
+
+**Problem:** Attempting to compare two REGULAR metrics instead of REGULAR vs ANCHORED.
+
+**Bad example:**
+----
+CovenantSpecification:
+Metric Mapping: participant_monthly_income (REGULAR)
+Anchored Metric Mapping: null
+Expression:
+// Tries to compare with a previous value
+// But there is no anchored metric!
+return metric >= previousValue * 0.8;  // previousValue is unknown
+----
+
+**Why it's bad:**
+
+[.unstyled]
+* {bad} No baseline for comparison
+* {bad} Expression has no access to history
+* {bad} `anchored = null` → check is skipped
+
+**Good example:**
+----
+CovenantSpecification:
+Metric Mapping: participant_monthly_income (REGULAR)
+Anchored Metric Mapping: participant_monthly_income (ANCHORED)
+Expression:
+if (anchored == null) {
+    return true;
+}
+return metric >= anchored * 0.8;
+----
+
+== Production Checklist
+
+Final checklist before launching the Covenant Monitoring System in production.
+
+=== CovenantSpecification Configuration
+
+[.unstyled]
+* {todo} Specification has a clear, descriptive name
+* {todo} Subject key matches the keys defined in the resolver
+* {todo} Metric mapping exists and is active
+* {todo} Expression tested with real data via the UI tester
+* {todo} Expression handles all null cases
+* {todo} Periodicity matches the frequency of data updates
+* {todo} DateTimeExecution is set correctly
+* {todo} Product additives selected properly
+* {todo} Only one active version (unless A/B testing)
+* {todo} Expression < 20 lines of code
+* {todo} Threshold values documented (e.g., source of 0.8, 0.4, etc.)
+
+=== CovenantHolderResolver Implementation
+
+[.unstyled]
+* {todo} Resolver is registered as a Spring @Component
+* {todo} resolveTargets() uses indexed queries
+* {todo} resolveTargets() filters only active/relevant entities
+* {todo} getCovenantSubjects() returns an immutable List
+* {todo} Subject suppliers return List (not null) for empty collections
+* {todo} Subject suppliers use eager fetch or JOIN FETCH
+* {todo} getCovenantSpecifications() filters by active=true
+* {todo} No N+1 query problems during subject extraction
+* {todo} Resolver covered by unit tests
+
+=== MetricMapping Configuration
+
+[.unstyled]
+* {todo} MetricMapping has a clear, descriptive name
+* {todo} Entity type matches the subject class
+* {todo} Expression returns a consistent type
+* {todo} Expression handles DataUnavailableException
+* {todo} Fallback chain defined (external → manual → null)
+* {todo} Expression tested through the UI
+* {todo} Feature Store integration configured
+* {todo} DataSource timeout properly set
+* {todo} MetricMapping versioned if modified
+* {todo} Active = true for all used mappings
+
+=== Expression Validation
+
+[.unstyled]
+* {todo} Checks for null before using anchored
+* {todo} Checks for null before using metric
+* {todo} Returns explicit boolean (true/false)
+* {todo} No magic numbers present
+* {todo} Uses constants with meaningful names
+* {todo} Comments explain threshold values
+* {todo} Tested for edge cases (null, zero, negative)
+* {todo} Works for all subject types
+
+=== ANCHORED Metrics Setup
+
+[.unstyled]
+* {todo} ANCHORED metrics set during disbursement/activation
+* {todo} calculateAnchored() called at the correct lifecycle event
+* {todo} Manual update via UI works correctly
+* {todo} Update requires approval (role-based access)
+* {todo} No automated scheduled updates
+* {todo} ANCHORED MetricMapping exists for all related specifications
+
+=== Scheduled Tasks Configuration
+
+[.unstyled]
+* {todo} Producer initialDelay and fixedDelay configured
+* {todo} Consumer initialDelay and fixedDelay configured
+* {todo} Consumer initialDelay > Producer initialDelay
+* {todo} SchedulerLock lockAtMostFor and lockAtLeastFor correctly configured
+
+=== UI Integration
+
+[.unstyled]
+* {todo} Covenant result tabs added to holder entities
+* {todo} ANCHORED metric tab added to holder entities
+* {todo} Calculate Covenant action available
+* {todo} Update ANCHORED metric action available
+* {todo} Resolve action works for VIOLATION states

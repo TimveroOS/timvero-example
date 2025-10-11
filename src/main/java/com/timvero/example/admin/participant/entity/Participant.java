@@ -15,6 +15,7 @@ import com.timvero.flowable.internal.execution.ProcessEntity;
 import com.timvero.ground.document.HasDocuments;
 import com.timvero.ground.entity.NamedEntity;
 import com.timvero.integration.docusign.DocusignSigner;
+import com.timvero.loan.metric.entity.HasMetric;
 import com.timvero.loan.pending_decision.HasPendingDecisions;
 import com.timvero.loan.pending_decision.PendingDecisionHolder;
 import jakarta.persistence.CascadeType;
@@ -43,8 +44,7 @@ import org.hibernate.envers.NotAudited;
 @Table
 @Audited
 public class Participant extends AbstractAuditable implements NamedEntity, GithubDataSourceSubject, HasDocuments,
-    ProcessEntity, DocusignSigner,
-    HasPendingDecisions {
+    ProcessEntity, DocusignSigner, HasPendingDecisions, HasMetric {
 
     public static final String DECISION_OWNER_TYPE = "PARTICIPANT";
 

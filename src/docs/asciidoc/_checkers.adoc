@@ -11,25 +11,22 @@ The platform uses Entity Checkers to implement event-driven business logic that 
 
 === What are Entity Checkers?
 
-[.unstyled]
-* {ok} **Monitor Entity Changes** — detect create/update/delete of entities
-* {ok} **Apply Business Rules** — execute predefined logic on matched conditions
-* {ok} **Maintain Data Consistency** — keep related entities in sync
-* {ok} **Automate Workflows** — trigger next steps without manual actions
+* **Monitor Entity Changes** — detect create/update/delete of entities
+* **Apply Business Rules** — execute predefined logic on matched conditions
+* **Maintain Data Consistency** — keep related entities in sync
+* **Automate Workflows** — trigger next steps without manual actions
 
 === Checker Class Hierarchy
 
-[.unstyled]
-* {ok} **Base Checker Classes** — framework abstract classes (e.g. `EntityChecker`) provide infrastructure
-* {ok} **Custom Entity Checkers** — app-specific implementations
+* **Base Checker Classes** — framework abstract classes (e.g. `EntityChecker`) provide infrastructure
+* **Custom Entity Checkers** — app-specific implementations
 e.g. `BorrowerStartTreeChecker` — manages borrower workflow start
 
 Each checker has three core parts:
 
-[.unstyled]
-* {ok} **<<listener-registration,Listener Registration>>** (`registerListeners`) — what changes to monitor
-* {ok} **Availability Check** (`isAvailable`) — when the checker should run
-* {ok} **Business Logic** (`perform`) — what to do if available
+* **<<listener-registration,Listener Registration>>** (`registerListeners`) — what changes to monitor
+* **Availability Check** (`isAvailable`) — when the checker should run
+* **Business Logic** (`perform`) — what to do if available
 
 == Listener Registration
 
@@ -78,10 +75,9 @@ registry.entityChange().updated("status");
 ----
 
 .When to use
-[.unstyled]
-* {ok} Trigger entity == target entity
-* {ok} Direct field monitoring
-* {ok} Simple relationship context
+* Trigger entity == target entity
+* Direct field monitoring
+* Simple relationship context
 
 ===== Related Entity Monitoring
 
@@ -93,10 +89,9 @@ registry.entityChange(Participant.class, Participant::getApplication)
         .updated("status");
 ----
 
-[.unstyled]
-* {ok} Direct JPA relationships (1:1, N:1)
-* {ok} Same transaction context
-* {ok} Clear getter mapping
+* Direct JPA relationships (1:1, N:1)
+* Same transaction context
+* Clear getter mapping
 
 ===== Complex Repository-Based Mapping
 
@@ -160,11 +155,10 @@ include::{sourcedir}/participant/checker/BorrowerStartTreeChecker.java[tags=avai
 ----
 
 .Availability conditions
-[.unstyled]
-* {ok} Participant is a `BORROWER`
-* {ok} Status is `NEW`
-* {ok} Application form is signed
-* {ok} All required documents uploaded
+* Participant is a `BORROWER`
+* Status is `NEW`
+* Application form is signed
+* All required documents uploaded
 
 ==== Business Logic
 
@@ -174,31 +168,27 @@ include::{sourcedir}/participant/checker/BorrowerStartTreeChecker.java[tags=perf
 ----
 
 .Business operations
-[.unstyled]
-* {ok} **Status Update** — `NEW` → `IN_PROCESS`
-* {ok} **Process Initiation** — start automated decision tree
-* {ok} **Transaction Safety** — single transaction
+* **Status Update** — `NEW` → `IN_PROCESS`
+* **Process Initiation** — start automated decision tree
+* **Transaction Safety** — single transaction
 
 == Best Practices
 
 === Design & Registration
-[.unstyled]
-* {ok} **Listen narrowly** — subscribe only to fields/states that matter
-* {ok} **Prefer direct mapping** — use entity associations before repo lookups
-* {ok} **Add predicates** — guard with `and(...)` to avoid noisy triggers
-* {ok} **Idempotent perform()** — safe on duplicate events/retries
+* **Listen narrowly** — subscribe only to fields/states that matter
+* **Prefer direct mapping** — use entity associations before repo lookups
+* **Add predicates** — guard with `and(...)` to avoid noisy triggers
+* **Idempotent perform()** — safe on duplicate events/retries
 
 === Availability & Logic
-[.unstyled]
-* {ok} **Cheap `isAvailable()`** — avoid heavy queries here
-* {ok} **Fail fast** — validate required state early
-* {ok} **Keep `perform()` focused** — one responsibility; delegate services
+* **Cheap `isAvailable()`** — avoid heavy queries here
+* **Fail fast** — validate required state early
+* **Keep `perform()` focused** — one responsibility; delegate services
 
 === Observability
-[.unstyled]
-* {ok} **Structured logs** — entity id, event type, fields, decision
-* {ok} **Metrics** — activations, successes, skips, failures
-* {ok} **Tracing** — link to transaction / workflow ids
+* **Structured logs** — entity id, event type, fields, decision
+* **Metrics** — activations, successes, skips, failures
+* **Tracing** — link to transaction / workflow ids
 
 == Anti-Patterns
 
