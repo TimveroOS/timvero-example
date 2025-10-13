@@ -141,6 +141,13 @@
           <scope>test</scope>
         </dependency>
 
+        <!-- JPA Metamodel Generator -->
+        <dependency>
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-jpamodelgen</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
     </dependencies>
 
     <build>

@@ -5,7 +5,6 @@ import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_PRECIS
 import static com.timvero.ground.hibernate.type.MonetaryAmountType.AMOUNT_SCALE;
 
 import com.timvero.example.admin.offer.entity.ExampleProductOffer;
-import com.timvero.loan.product.entity.CreditProduct;
 import com.timvero.loan.product.entity.CreditProductAdditive;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -33,12 +32,8 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
     @Column(nullable = false, columnDefinition = NUMERIC)
     private BigDecimal interestRate;
 
-    protected ExampleCreditProductAdditive() {
+    public ExampleCreditProductAdditive() {
         super();
-    }
-
-    public ExampleCreditProductAdditive(CreditProduct product) {
-        super(product);
     }
 
     public String getName() {

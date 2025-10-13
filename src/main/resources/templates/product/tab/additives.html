@@ -98,6 +98,10 @@
             </li>
         </th:block>
     </ul>
-
+    <div class="entity__actions">
+        <th:block
+            th:with="actions = ${@entityActionMapping.getAvailableActions(additive)}"
+            th:insert="~{/common/action/bar :: buttons(${actions})}"/>
+    </div>
 </div>
 </html>

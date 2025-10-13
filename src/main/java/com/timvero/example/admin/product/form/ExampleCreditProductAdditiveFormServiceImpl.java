@@ -3,12 +3,11 @@ package com.timvero.example.admin.product.form;
 import com.timvero.application.procuring.ProcuringType;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
 import com.timvero.example.admin.product.entity.ExampleCreditProductAdditive;
-import com.timvero.example.admin.product.repository.ExampleCreditProductAdditiveRepository;
 import com.timvero.loan.execution_result.ExecutionResultType;
 import com.timvero.loan.offer.entity.OfferEngineDescriptor;
 import com.timvero.loan.offer.entity.OfferEngineDescriptorRepository;
-import com.timvero.loan.product.entity.CreditProductAdditive;
-import com.timvero.loan.product.entity.CreditProductAdditiveRepository;
+import com.timvero.loan.product.entity.CreditProduct;
+import com.timvero.loan.product.form.CreditProductAdditiveFormService;
 import com.timvero.structure.additional.history.HistoryEntity;
 import java.util.Collection;
 import java.util.HashMap;
@@ -16,69 +15,46 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import org.jetbrains.annotations.Nullable;
 import org.springframework.data.util.Lazy;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.ui.Model;
 
 @Service
-public class ExampleCreditProductAdditiveFormServiceImpl implements ExampleCreditProductAdditiveFormService {
+public class ExampleCreditProductAdditiveFormServiceImpl extends
+    CreditProductAdditiveFormService<ExampleCreditProductAdditive, ExampleCreditProductAdditiveForm>{
 
-    private final ExampleCreditProductAdditiveFormMapper formMapper;
-    private final CreditProductAdditiveRepository additiveRepository;
-    private final ExampleCreditProductAdditiveRepository exampleCreditProductAdditiveRepository;
-    private final OfferEngineDescriptorRepository engineDescriptorRepository;
+     private final OfferEngineDescriptorRepository offerEngineDescriptorRepository;
 
-    public ExampleCreditProductAdditiveFormServiceImpl(ExampleCreditProductAdditiveFormMapper formMapper,
-        CreditProductAdditiveRepository additiveRepository,
-        ExampleCreditProductAdditiveRepository exampleCreditProductAdditiveRepository,
-        OfferEngineDescriptorRepository engineDescriptorRepository) {
-        this.formMapper = formMapper;
-        this.additiveRepository = additiveRepository;
-        this.exampleCreditProductAdditiveRepository = exampleCreditProductAdditiveRepository;
-        this.engineDescriptorRepository = engineDescriptorRepository;
+    public ExampleCreditProductAdditiveFormServiceImpl(
+        OfferEngineDescriptorRepository offerEngineDescriptorRepository) {
+        this.offerEngineDescriptorRepository = offerEngineDescriptorRepository;
     }
 
     @Override
-    @Transactional
-    public void saveAdditive(ExampleCreditProductAdditiveForm form) {
-        CreditProductAdditive additive = formMapper.createEntity(form);
-        additiveRepository.save(additive);
-        if (form.getAdditiveId() != null) {
-            additiveRepository.removeAdditive(additive.getProduct().getId(), form.getAdditiveId());
-        }
+    public Collection<?> findAdditiveModelsByProduct(CreditProduct product) {
+        return product.getAdditives();
     }
 
     @Override
-    @Transactional
-    public void assembleEditModel(ExampleCreditProduct product, ExampleCreditProductAdditive additive, Model model) {
-        Set<ExecutionResultType> requiredEngineTypes = product.getOfferEngineTypes();
+    protected void assembleEditModel(@Nullable ExampleCreditProductAdditive entity,
+        ExampleCreditProductAdditiveForm form, Map<String, Object> model) {
+        model.put("procuringTypes", ProcuringType.values());
+    }
+
+    @Override
+    public void assembleProductData(Model model, CreditProduct product) {
+        ExampleCreditProduct exampleCreditProduct = (ExampleCreditProduct) product;
+        Set<ExecutionResultType> requiredEngineTypes = exampleCreditProduct.getOfferEngineTypes();
 
         model.addAttribute("productId", product.getId());
-        model.addAttribute("form",
-            additive != null ? formMapper.toForm(additive) : newForm(product));
         model.addAttribute("offerEngineTypes", requiredEngineTypes);
         model.addAttribute("offerEngineDescriptors", Lazy.of(() -> getEngineDescriptorMap(requiredEngineTypes)));
-        model.addAttribute("procuringTypes", ProcuringType.values());
-    }
-
-    private ExampleCreditProductAdditiveForm newForm(ExampleCreditProduct product) {
-        ExampleCreditProductAdditiveForm form = new ExampleCreditProductAdditiveForm();
-        form.setMaxAmount(product.getMaxAmount());
-        form.setMinAmount(product.getMinAmount());
-        form.setMaxTerm(product.getMaxTerm());
-        form.setMinTerm(product.getMinTerm());
-        return form;
-    }
-
-    @Override
-    public Collection<ExampleCreditProductAdditive> findAllByProduct(ExampleCreditProduct entity) {
-        return exampleCreditProductAdditiveRepository.findAllByProduct(entity);
     }
 
     private Map<ExecutionResultType, Map<UUID, String>> getEngineDescriptorMap(
         Set<ExecutionResultType> executionResultTypes) {
-        return engineDescriptorRepository.findByExecutionResultType(executionResultTypes).stream()
+        return offerEngineDescriptorRepository.findByExecutionResultType(executionResultTypes).stream()
             .collect(Collectors.groupingBy(OfferEngineDescriptor::getExecutionResultType, HashMap::new,
                 Collectors.toMap(HistoryEntity::getLineageId, OfferEngineDescriptor::getName)));
     }
