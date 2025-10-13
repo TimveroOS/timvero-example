@@ -1,0 +1,121 @@
+=== Form Templates
+
+==== Form Template Structure
+
+The form template begins with a `<form>` tag. The following required blocks are expected within the form:
+
+===== form__action Block
+
+The `form__action` block contains form control elements:
+
+* **Form title** (`<h4>`) - displayed only when the form is opened as a separate page. When the form is displayed in a modal window, the title is automatically hidden
+* **Button block** - contains form action buttons (save, cancel, etc.) with `ml-auto` class for alignment
+
+NOTE: The location of the `form__action` block is not important - it can be placed either at the beginning or at the end of the `<form>` element.
+
+[source,html]
+----
+<div class="form__action">
+    <h4>Form Title</h4>
+    <div class="ml-auto">
+        <!-- Form buttons -->
+    </div>
+</div>
+----
+
+===== form-body Block
+
+The `form-body` block is the main container for form fields and is responsible for the grid layout. The following elements are placed inside this block:
+
+* `form-group` - form field groups
+* `app-toggled` - togglable blocks
+* `<h4>` - section subheadings
+
+[source,html]
+----
+<div class="form-body">
+    <h4>Form Section</h4>
+    <div class="form-group">
+        <!-- Form fields -->
+    </div>
+    <div class="app-toggled">
+        <!-- Togglable content -->
+    </div>
+</div>
+----
+
+==== Additional Elements
+
+===== Headings
+
+The `<h4>` tag is used for all headings within the form.
+
+===== Tables and Other Blocks
+
+All additional blocks (tables, information blocks) are inserted directly into the `<form>` element, outside the `form-body` block.
+
+IMPORTANT: Tables must be wrapped in a `<div>`:
+
+[source,html]
+----
+<form>
+    <div class="form__action">
+        <!-- ... -->
+    </div>
+    
+    <div class="form-body">
+        <!-- ... -->
+    </div>
+    
+    <div>
+        <table>
+            <!-- Table content -->
+        </table>
+    </div>
+</form>
+----
+
+==== Complete Structure Example
+
+[source,html]
+----
+<form>
+    <!-- Action block (can be at the beginning or end) -->
+    <div class="form__action">
+        <h4>Form Name</h4>
+        <div class="ml-auto">
+            <button type="submit">Save</button>
+            <button type="button">Cancel</button>
+        </div>
+    </div>
+    
+    <!-- Main form body -->
+    <div class="form-body">
+        <h4>Basic Information</h4>
+        <div class="form-group">
+            <label>Field 1</label>
+            <input type="text" />
+        </div>
+        
+        <div class="app-toggled">
+            <h4>Additional Settings</h4>
+            <!-- Togglable content -->
+        </div>
+    </div>
+    
+    <!-- Additional elements -->
+    <div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Column 1</th>
+                    <th>Column 2</th>
+                </tr>
+            </thead>
+            <tbody>
+                <!-- Table data -->
+            </tbody>
+        </table>
+    </div>
+</form>
+----
