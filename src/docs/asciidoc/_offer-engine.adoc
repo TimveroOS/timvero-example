@@ -62,6 +62,7 @@ public class ExampleCreditProduct extends CreditProduct {
 ----
 
 **Key Features:**
+
 * **Amount Ranges**: Min/max loan amounts with currency
 * **Term Ranges**: Min/max loan terms in months
 * **Fee Structure**: Late fee rates and other charges
@@ -90,11 +91,13 @@ public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondi
 ----
 
 **Engine Purpose:**
+
 * **Payment Breakdown**: Calculates how much of each payment goes to principal vs interest
 * **Schedule Generation**: Creates complete payment timeline with remaining balances
 * **Algorithm Flexibility**: Different engines can implement various payment calculation methods (annuity, differentiated, interest-only, etc.)
 
 **Integration:**
+
 * **Product Configuration**: Credit product's `engineName` field matches Spring service name
 * **Automatic Discovery**: Platform automatically finds and manages all ScheduledEngine beans
 * **Validation**: System ensures payment calculations are mathematically correct (remaining debt = 0)
@@ -124,6 +127,7 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
 ----
 
 **Additive Purpose:**
+
 * **Interest Rates**: Specific rates for different risk segments
 * **Procuring Types**: Collateral or guarantee requirements  
 * **Offer Engines**: Scripts that generate personalized offers
@@ -154,6 +158,7 @@ public class ExampleProductOffer extends ProductOffer {
 ----
 
 **Offer Characteristics:**
+
 * **Personalized Terms**: Adjusted amounts and terms based on risk assessment
 * **Participant Link**: Connected to specific application participant
 * **Product Reference**: Links back to originating additive and product
@@ -166,6 +171,7 @@ public class ExampleProductOffer extends ProductOffer {
 The `OfferEngine` orchestrates the generation process by combining product configurations with participant data.
 
 **Generation Flow:**
+
 1. **Product Selection**: Find products matching participant's execution result type
 2. **Data Processing**: Extract participant data using configured processor
 3. **Script Execution**: Run offer generation scripts for each additive
@@ -182,6 +188,7 @@ include::{sourcedir}/com/timvero/example/admin/offer/ExampleDataProcessor.java[t
 ----
 
 **Data Sources:**
+
 * **Workflow Results**: Decision process outcomes and scoring
 * **Pending Decisions**: Incomplete workflow data
 * **Participant Profile**: Personal and financial information
@@ -197,6 +204,7 @@ include::{sourcedir}/com/timvero/example/admin/offer/ProductOfferService.java[ta
 ----
 
 **Service Responsibilities:**
+
 * **Transaction Management**: Ensures atomic offer generation
 * **Error Handling**: Captures and stores generation exceptions
 * **Product Loading**: Retrieves active products for generation
@@ -228,6 +236,7 @@ public class PenaltyProcuringEngine implements ProcuringEngine {
 ----
 
 **Engine Responsibilities:**
+
 * **Procuring Type**: Defines what type of collateral/guarantee required
 * **Offer Generation**: Creates secured variants from basic offers
 * **Business Logic**: Implements specific procuring strategies
@@ -251,6 +260,7 @@ public class ExampleProcuringType {
 ----
 
 **Common Procuring Types:**
+
 * **NO_PROCURING**: Unsecured loans based on creditworthiness
 * **PENALTY**: Higher rates with penalty clauses for default
 * **VEHICLE_COLLATERAL**: Car loans with vehicle as collateral
@@ -308,6 +318,7 @@ public abstract class ExampleSecuredOffer extends SecuredOffer {
 ----
 
 **Secured Offer Features:**
+
 * **Original Offer Reference**: Links to base product offer terms
 * **Procuring Type**: Specifies collateral/guarantee requirements
 * **Inheritance Strategy**: Supports multiple secured offer types
@@ -319,6 +330,7 @@ public abstract class ExampleSecuredOffer extends SecuredOffer {
 Procuring engines integrate with the main offer generation flow:
 
 **Generation Process:**
+
 1. **Basic Offers**: OfferEngine generates standard ProductOffers
 2. **Procuring Analysis**: System identifies applicable procuring types
 3. **Secured Generation**: Each ProcuringEngine creates secured variants
@@ -326,6 +338,7 @@ Procuring engines integrate with the main offer generation flow:
 5. **Selection**: Participant chooses preferred offer type
 
 **Business Benefits:**
+
 * **Risk Mitigation**: Collateral reduces lender risk
 * **Rate Optimization**: Secured offers can have lower interest rates
 * **Market Expansion**: Serve customers who need collateral-based options
@@ -496,6 +509,7 @@ public class ContractSignChecker extends EntityChecker<Application, UUID> {
 6. **Servicing**: Credit becomes active and ready for operations
 
 **Key Components:**
+
 * **ConditionForm**: Captures participant's chosen amount, term, and start date
 * **CreditCondition**: Immutable terms including payment calculation and secured offer reference
 * **PaymentSchedule**: Pre-calculated payment schedule based on selected terms
@@ -512,6 +526,7 @@ include::{sourcedir}/com/timvero/example/admin/participant/action/GenerateOffers
 ----
 
 **Integration Points:**
+
 * **Status Checking**: Only approved participants get offers
 * **Error Recovery**: Regenerate offers if previous attempt failed  
 * **Timing Control**: Manual or automated generation triggers
@@ -527,6 +542,7 @@ include::{sourcedir}/com/timvero/example/admin/application/ExampleProductOfferVi
 ----
 
 **Display Features:**
+
 * **Localization**: Multi-language offer descriptions
 * **Formatting**: Monetary amounts and interest rates
 * **Details**: Product names and procuring type descriptions
