@@ -1,7 +1,7 @@
 = Timvero SDK reference guide
 :revnumber: {project-version}
-:toc: 
-:toclevels: 3 
+:toc:
+:toclevels: 3
 
 :idprefix:
 :idseparator: -
@@ -48,26 +48,25 @@ This guide is organized into logical parts that build on each other:
 . **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
-=== PART II: USER INTERFACE  
+=== PART II: USER INTERFACE
 [start=4]
 . **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
+. **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
 . **<<fast-search-system>>** - Unified search across all entities with Hibernate Search and Lucene
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
-
 === PART III: BUSINESS LOGIC
-[start=10]
+[start=11]
 . **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
 . **<<offer-engine-credit-products>>** - Generate personalized loan offers from credit products and participant data
 . **<<api-integration>>** - REST API setup and external system integration
 . **<<docusign-integration>>** - Document signing integration with DocuSign
-
 === PART IV: FINANCIAL OPERATIONS
-[start=16]
+[start=17]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
@@ -83,6 +82,8 @@ include::_data-model.adoc[leveloffset=+1]
 
 // PART II: USER INTERFACE
 include::_forms.adoc[leveloffset=+1]
+
+include::_form-templates.adoc[leveloffset=+1]
 
 include::_templates.adoc[leveloffset=+1]
 
