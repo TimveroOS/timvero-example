@@ -1,7 +1,7 @@
 package com.timvero.example.admin.credit.action;
 
 import com.timvero.example.admin.credit.entity.ExampleCredit;
-import com.timvero.example.admin.operation.voidCredit.VoidOperationService;
+import com.timvero.example.admin.operation.void_credit.VoidOperationService;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.web.common.action.SimpleActionController;
 import java.time.LocalDate;
