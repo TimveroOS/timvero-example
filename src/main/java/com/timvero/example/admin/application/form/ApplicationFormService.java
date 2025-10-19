@@ -16,5 +16,4 @@ public class ApplicationFormService extends EntityFormService<Application, Appli
         model.put("employmentTypes", Employment.values());
         model.put("periodicities", Periodicity.values());
     }
-
 }
