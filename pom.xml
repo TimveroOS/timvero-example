@@ -6,7 +6,7 @@
     <parent>
         <groupId>com.timvero.pumpkin</groupId>
         <artifactId>pumpkin</artifactId>
-        <version>8.0.8</version>
+        <version>8.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>example</artifactId>
@@ -28,7 +28,7 @@
         <repository>
             <id>maven.timvero.xyz</id>
             <name>Timvero Repository</name>
-            <url>https://maven.timvero.xyz/releases</url>
+            <url>https://maven.timvero.xyz/private</url>
         </repository>
     </repositories>
 
@@ -147,21 +147,11 @@
         <defaultGoal>process-resources</defaultGoal>
         <plugins>
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-war-plugin</artifactId>
-                <configuration>
-                    <archive>
-                        <manifest>
-                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
-                            <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
-                        </manifest>
-                        <manifestEntries>
-                            <Implementation-Version>${build.version}</Implementation-Version>
-                        </manifestEntries>
-                    </archive>
-                    <warName>${project.artifactId}</warName>
-                </configuration>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <!-- configuration is inherited from parent -->
             </plugin>
+            
             <plugin>
                 <groupId>org.asciidoctor</groupId>
                 <artifactId>asciidoctor-maven-plugin</artifactId>

@@ -5,9 +5,9 @@ import com.timvero.example.admin.operation.accrual.InterestAccrualEngine;
 import com.timvero.example.admin.operation.accrual.LateFeeAccrualEngine;
 import com.timvero.example.admin.operation.charge.ChargeOperationService;
 import com.timvero.example.admin.operation.pastdue.PastDueOperationService;
-import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.servicing.credit.CreditViewOptions;
 import com.timvero.servicing.credit.entity.CreditStatus;
+import com.timvero.servicing.credit.entity.operation.CreditPaymentType;
 import com.timvero.servicing.engine.CreditPaymentService;
 import com.timvero.servicing.engine.general.BasicLoanEngine;
 import com.timvero.servicing.engine.general.LoanEngine;
@@ -19,6 +19,8 @@ import org.springframework.context.annotation.Configuration;
 
 @Configuration
 public class CreditCalculationConfiguration {
+
+    public static final CreditPaymentType GENERAL = new CreditPaymentType("GENERAL");
 
     public static final CreditStatus PENDING = new CreditStatus("PENDING", 1000, false);
     public static final CreditStatus ACTIVE = new CreditStatus("ACTIVE", 1100, false);
@@ -64,8 +66,8 @@ public class CreditCalculationConfiguration {
 
     // tag::payment-distribution[]
     @Bean
-    CreditPaymentOperationHandler<ExampleCreditPayment> creditPaymentOperationHandler() {
-        return new CreditPaymentOperationHandler<>(OVERPAYMENT, List.of(PAST_DUE_PRINCIPAL, PAST_DUE_INTEREST,
+    CreditPaymentOperationHandler creditPaymentOperationHandler() {
+        return new CreditPaymentOperationHandler(OVERPAYMENT, List.of(PAST_DUE_PRINCIPAL, PAST_DUE_INTEREST,
             LATE_FEE, INTEREST, PRINCIPAL)) {};
     }
     // end::payment-distribution[]

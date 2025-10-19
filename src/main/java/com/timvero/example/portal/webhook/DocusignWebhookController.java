@@ -6,6 +6,7 @@ import com.timvero.integration.docusign.DocusignWebhookResponse;
 import java.io.IOException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -14,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping(value = DocusignWebhookController.PATH, produces = MediaType.APPLICATION_JSON_VALUE)
+@ConditionalOnBean(DocusignSignatureService.class)
 public class DocusignWebhookController {
 
     protected static final String PATH = "/callback/docusign";

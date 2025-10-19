@@ -38,7 +38,7 @@ public class ExampleCreditProductAdditive extends CreditProductAdditive {
     }
 
     public ExampleCreditProductAdditive(CreditProduct product) {
-        super(product);
+        setProduct(product);
     }
 
     public String getName() {

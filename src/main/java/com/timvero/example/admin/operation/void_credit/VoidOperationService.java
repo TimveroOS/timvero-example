@@ -1,4 +1,4 @@
-package com.timvero.example.admin.operation.voidCredit;
+package com.timvero.example.admin.operation.void_credit;
 
 import com.timvero.example.admin.credit.CreditCalculationConfiguration;
 import com.timvero.servicing.credit.entity.operation.AbstractOperationService;

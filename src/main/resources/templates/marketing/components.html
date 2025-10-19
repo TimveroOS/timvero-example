@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
+
+<th:block th:fragment="datetimeLocal(name, fieldname, inputclass)">
+  <div th:data-id="${fieldname}" class="form-group">
+    <label class="form-label" th:for="${fieldname}" th:text="${name}"></label>
+    <th:block th:insert="~{ :: inputElement}"/>
+  </div>
+</th:block>
+
+<th:block th:fragment="inputElement">
+  <div class="field-wrapper">
+    <input
+        autocomplete="off"
+        class="form-control"
+        th:classappend="${inputclass}"
+        th:field="*{__${fieldname}__}"
+        th:maxlength="${maxlength} ?: '256'"
+        th:readonly="${readonly}"
+        th:placeholder="${placeholder}"
+        type="datetime-local"
+        th:tabindex="${readonly} ? -1"
+    />
+    <div class="error-wrapper"></div>
+  </div>
+</th:block>
+
+</html>

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org"
+>
+<div class="rui-page">
+    <div class="rui-page-content">
+        <div class="counters-wrapper">
+            <div
+                class="counter__item"
+                th:each="entity,iterStat : ${counterList}"
+                th:object="${entity}"
+            >
+                <th:block th:insert="~{:: counterCard(${entity})}"/>
+                <section
+                    th:data-for-counter="${entity}"
+                    th:data-counter-url="'/counter/' + ${entity} + '?count=10'"
+                    class="mt-5"></section>
+                <button
+                    class="counter__item-btn js-show-full-counter-list"
+                    th:text="#{common.viewAll}"
+                ></button>
+            </div>
+        </div>
+        <script defer th:inline="javascript">
+          if (typeof (window.pumpkin || {}).dashboardInit !== 'undefined') {
+            window.pumpkin.dashboardInit();
+          }
+        </script>
+        <script th:data-src="@{/assets/static/js/dashboard.js}"></script>
+    </div>
+</div>
+
+<th:block th:fragment="counterCard(counterName)">
+    <div class="counterCard">
+        <div class="counterCard-title">
+            <h4 th:text="#{'counter.' + ${counterName}}"></h4>
+            <div class="d-flex flex-column align-items-end" style="width: 70px;">
+                <span class="d-flex counter">
+                    <span
+                        th:data-name="${counterName}"
+                        th:data-title="#{'counter.' + ${counterName}}"
+                    ></span>
+                </span>
+            </div>
+        </div>
+    </div>
+</th:block>
+</html>

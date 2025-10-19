@@ -25,6 +25,7 @@ include::{sourcedir}/participant/document/ApplicationContractDocumentCategory.ja
 ----
 
 Key components:
+
 * **`DocumentType`** - Unique identifier for the document type
 * **`getModel()`** - Provides data structure for template processing
 * **`isSuitableTestEntity()`** - Determines when document generation is available
@@ -39,6 +40,7 @@ include::{sourcedir}/participant/document/ApplicationContractDocumentCategory.ja
 ----
 
 Model features:
+
 * **Public getters** - Expose data to template engine
 * **Computed properties** - Derive values from entity data (e.g., `getFirstPayment()`)
 * **Nested objects** - Include related entities for complex templates
@@ -90,6 +92,7 @@ Templates use Pebble template engine for dynamic content processing. Pebble prov
 === Available Variables
 
 Templates have access to:
+
 * **Model properties** - All public getters from your DocumentModel
 * **Built-in filters** - Date formatting, number formatting, string manipulation
 * **Global variables** - Current date/time, system settings
@@ -148,6 +151,7 @@ Templates have access to:
 === Template Storage
 
 Templates are stored in the `document_template` table:
+
 * **Content** - Template markup
 * **Type** - HTML or TXT
 * **Document Type** - Links to DocumentCategory
@@ -166,6 +170,7 @@ The system has two types of documents:
 * **`SignableDocumentType`** - Generated documents that require signatures
 
 Methods work with different types:
+
 * Document existence: `EntityDocumentType`
 * Signature operations: `SignableDocumentType` only
 
@@ -242,15 +247,18 @@ Use in templates:
 ==== Available Query Methods
 
 **Document Existence (EntityDocumentType):**
+
 * `isPresent(owner, EntityDocumentType)` - Check if document exists
 * `isMissing(owner, EntityDocumentType)` - Check if document is missing
 
 **Document Retrieval:**
+
 * `getDocuments(owner)` - Get all active documents
 * `latest(owner, EntityDocumentType)` - Get most recent document of type
 * `latest(owner, SignableDocumentType)` - Get most recent signable document
 
 **Signature Status (SignableDocumentType only):**
+
 * `isLatestSigned(owner, SignableDocumentType)` - Check if latest document is signed
 * `signatureOfLatest(owner, SignableDocumentType)` - Get signature details
 
@@ -405,6 +413,7 @@ SignableDocument securedDocument = documentService.generate(
 ----
 
 This approach allows:
+
 * **Single DocumentCategory** - One category handles all contract variations
 * **Multiple templates** - Different layouts and content for same data
 * **Template selection** - Choose appropriate template based on business logic

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<th:block th:fragment="details" th:object="${entityDto.targetEntity}">
+    <th:block th:insert="~{/launchpad/fragment/pending-decisions :: body(${entityDto})}"/>
+
+    <div class="mt-20 border-top">
+        <h4 class="mb-5 mt-5" th:text="#{participant.tab.details}"></h4>
+        <article
+            class="article  pl-10 pr-10"
+            th:data-url="@{${@pathRegistry.getPath(entityDto.targetEntity) + '/tab/details'}}"
+        ></article>
+    </div>
+
+    <div class="mt-20 border-top">
+        <h4 class="mb-5 mt-5" th:text="#{participant.tab.profile}"></h4>
+        <article
+            class="article"
+            th:data-url="@{${@pathRegistry.getPath(entityDto.targetEntity) + '/tab/profile'}}"
+        ></article>
+    </div>
+
+    <div class="mt-20 border-top">
+        <h4 class="mb-5 mt-5" th:text="#{participant.tab.documents}"></h4>
+        <article
+            class="article"
+            th:data-url="@{${@pathRegistry.getPath(entityDto.targetEntity) + '/tab/documents'}}"
+        ></article>
+    </div>
+</th:block>
+</html>

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<th:block th:fragment="entity(entities)">
+    <ul class="counter-list">
+        <li
+            class="counter-list__item"
+            th:each="entity,iterStat : ${entities}"
+        >
+            <button class="clickable counter-list__btn" th:href="@{${url} + '/' + ${entity.id}}" th:object="${entity}">
+                <p class="d-flex justify-content-between w-100">
+                    <span class="text-left text-prompt w-75" th:text="*{displayedName}"></span>
+                    <span th:text="*{#ldates.format(createdAt, 'MM/dd/yyyy')}"></span>
+                </p>
+            </button>
+        </li>
+    </ul>
+</th:block>
+</html>
