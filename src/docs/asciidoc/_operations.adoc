@@ -210,12 +210,6 @@ Key characteristics:
 === Payment Operations
 
 Payment operations process borrower payments and distribute them across debt accounts according to business rules.
-
-[source,java]
-----
-include::{sourcedir}/operation/payment/ExampleCreditPayment.java[tag=entity]
-----
-
 The payment distribution order is configured in `CreditCalculationConfiguration`:
 
 [source,java]

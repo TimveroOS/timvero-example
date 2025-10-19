@@ -89,6 +89,10 @@ include::_templates.adoc[leveloffset=+1]
 
 include::_fast-search.adoc[leveloffset=+1]
 
+include::_counters.adoc[leveloffset=+1]
+
+include::_launchpad.adoc[leveloffset=+1]
+
 include::_documents.adoc[leveloffset=+1]
 
 include::_document-templates.adoc[leveloffset=+1]
