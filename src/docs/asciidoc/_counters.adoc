@@ -1,0 +1,386 @@
+= Entity Counters and Launchpad Integration
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:templatedir: ../../main/resources/templates
+
+Create dashboard counters that display pending decisions and workflow statistics, providing seamless integration with the Launchpad decision management system.
+
+== What You'll Learn
+
+After reading this chapter, you'll know how to:
+
+* Create entity counters that integrate with Launchpad pending decisions
+* Track workflow states and decision progress through counters
+* Implement counters for entities with pending decision workflows
+* Navigate from dashboard counters directly to Launchpad decision interfaces
+* Configure counter-to-Launchpad routing for efficient workflow management
+* Test and troubleshoot counter-Launchpad integrations
+
+== The Big Picture
+
+Entity counters serve as **workflow command centers** that bridge dashboard visibility with Launchpad decision-making:
+
+* **Decision Visibility**: Show counts of entities with pending decisions
+* **Workflow Progress**: Track entities at different workflow stages
+* **Quick Access**: Click counters to navigate directly to Launchpad decision interfaces
+* **Priority Management**: Surface entities requiring immediate attention
+* **Business Intelligence**: Monitor decision throughput and bottlenecks
+
+Think of counters as **workflow entry points** - they identify entities needing decisions and provide direct access to the Launchpad where those decisions are made.
+
+=== Counters + Launchpad Workflow
+
+The integration works as follows:
+
+1. **Counter Detection**: Counter identifies entities with pending decisions or specific workflow states
+2. **Dashboard Display**: Shows count and entity summary information
+3. **Launchpad Navigation**: Clicking entities opens them in Launchpad for decision-making
+4. **Decision Processing**: Users make decisions through Launchpad interface
+5. **Counter Updates**: Counters automatically reflect workflow progress
+
+== Core Concepts
+
+=== EntityCounter Interface
+
+The `EntityCounter` interface defines how to identify and count entities:
+
+[source,java]
+----
+public interface EntityCounter<T> {
+    boolean isEntityMarked(T entity);
+    String getName();
+}
+----
+
+**Key Methods:**
+
+* **`isEntityMarked(T entity)`**: Returns `true` if entity should be counted
+* **`getName()`**: Returns counter identifier used for templates and internationalization
+
+=== Counter Architecture
+
+Counters work by:
+1. **Entity Evaluation**: Check each entity against counter criteria
+2. **Count Aggregation**: Platform counts entities where `isEntityMarked()` returns `true`
+3. **Dashboard Display**: Show count and provide link to filtered entity list
+4. **Navigation**: Users click to see entities that match the counter
+
+== Implementation Examples
+
+=== Simple Status-Based Counter
+
+The `ApplicationManualReviewCounter` counts applications requiring manual review:
+
+[source,java]
+----
+include::{sourcedir}/application/counter/ApplicationManualReviewCounter.java[]
+----
+
+**Key Implementation Details:**
+
+1. **@Component**: Registers counter with Spring container
+2. **@Order(2000)**: Controls display order on dashboard (lower numbers appear first)
+3. **Status Check**: Simple enum comparison for entity filtering
+4. **Counter Name**: `"applicationManualReview"` used for templates and i18n
+
+=== Label-Based Counter
+
+The `CreditActiveAndPaidCounter` leverages entity labels for complex business logic:
+
+[source,java]
+----
+include::{sourcedir}/credit/counter/CreditActiveAndPaidCounter.java[]
+----
+
+**This pattern demonstrates:**
+
+1. **Label Reuse**: Leverages existing `CreditPaidLabel` logic
+2. **Dependency Injection**: Uses `@Autowired` to access label logic
+3. **Business Logic Delegation**: Keeps counter simple by delegating to specialized label
+
+=== The Supporting Label
+
+The `CreditPaidLabel` contains the actual business logic:
+
+[source,java]
+----
+include::{sourcedir}/credit/label/CreditPaidLabel.java[]
+----
+
+**Complex Business Logic:**
+
+1. **Null Safety**: Checks for `actualSnapshot` existence
+2. **Status Validation**: Verifies credit is in `ACTIVE` status
+3. **Debt Calculation**: Confirms total debt is empty (paid off)
+4. **Monetary Handling**: Works with `MonetaryAmount` for financial calculations
+
+== Configuration and Setup
+
+=== Counter Registration
+
+Counters are automatically discovered by Spring component scanning:
+
+[source,java]
+----
+@Component
+@Order(1000)  // Lower numbers = higher priority (appear first)
+public class MyEntityCounter implements EntityCounter<MyEntity> {
+
+    @Override
+    public boolean isEntityMarked(MyEntity entity) {
+        // Your counting logic here
+        return entity.getStatus() == MyEntityStatus.NEEDS_ATTENTION;
+    }
+
+    @Override
+    public String getName() {
+        return "myEntityCounter";  // Used for templates and i18n
+    }
+}
+----
+
+=== Internationalization Setup
+
+Add counter labels to your messages file:
+
+**File**: `src/main/resources/messages_en.properties`
+```properties
+counter.applicationManualReview=Applications for Manual Review
+counter.creditActiveAndPaid=Active and Paid Loans
+counter.myEntityCounter=My Custom Counter
+```
+
+**Pattern**: `counter.{counterName}={Display Label}`
+
+=== Display Order Configuration
+
+Use `@Order` annotation to control counter sequence on dashboard:
+
+```java
+@Order(1000)  // Appears first
+public class HighPriorityCounter implements EntityCounter<Entity> { ... }
+
+@Order(2000)  // Appears second
+public class MediumPriorityCounter implements EntityCounter<Entity> { ... }
+
+@Order(3000)  // Appears third
+public class LowPriorityCounter implements EntityCounter<Entity> { ... }
+```
+
+**Best Practice**: Use increments of 1000 to allow for future insertions.
+
+== Dashboard Integration
+
+=== Counter Templates
+
+Entity counters use shared templates for consistent display:
+
+**Dashboard Counter Template** (`templates/dashboard/counter/application.html`):
+[source,html]
+----
+include::{templatedir}/dashboard/counter/application.html[]
+----
+
+**Template Features:**
+
+1. **Entity List**: Displays entities matching the counter criteria
+2. **Clickable Items**: Each entity links to detailed view
+3. **Date Display**: Shows creation date for context
+4. **Consistent Styling**: Uses platform CSS classes for unified appearance
+
+=== Dashboard Layout Integration
+
+The main dashboard template integrates all counters:
+
+**Dashboard View** (`templates/dashboard/view.html`):
+[source,html]
+----
+<div class="counters-wrapper">
+    <div class="counter__item" th:each="entity,iterStat : ${counterList}" th:object="${entity}">
+        <th:block th:insert="~{:: counterCard(${entity})}"/>
+        <section
+            th:data-for-counter="${entity}"
+            th:data-counter-url="'/counter/' + ${entity} + '?count=10'"
+            class="mt-5">
+        </section>
+        <button class="counter__item-btn js-show-full-counter-list" th:text="#{common.viewAll}"></button>
+    </div>
+</div>
+
+<th:block th:fragment="counterCard(counterName)">
+    <div class="counterCard">
+        <div class="counterCard-title">
+            <h4 th:text="#{'counter.' + ${counterName}}"></h4>
+            <div class="d-flex flex-column align-items-end">
+                <span class="d-flex counter">
+                    <span
+                        th:data-name="${counterName}"
+                        th:data-title="#{'counter.' + ${counterName}}">
+                    </span>
+                </span>
+            </div>
+        </div>
+    </div>
+</th:block>
+----
+
+**Dashboard Integration Points:**
+
+1. **Counter Loop**: Iterates through all registered counters
+2. **Dynamic URLs**: Builds counter-specific endpoints
+3. **Internationalization**: Uses counter names for i18n lookup
+4. **JavaScript Integration**: Provides hooks for dynamic counter updates
+
+== Performance Considerations
+
+=== Efficient Counting Logic
+
+**Avoid Heavy Operations**: Keep `isEntityMarked()` logic lightweight
+```java
+// Good: Simple property checks
+public boolean isEntityMarked(Application app) {
+    return app.getStatus() == ApplicationStatus.MANUAL_REVIEW;
+}
+
+// Avoid: Complex database queries in counter logic
+public boolean isEntityMarked(Application app) {
+    // Don't do this - too expensive for counting
+    List<Document> docs = documentRepository.findByApplicationId(app.getId());
+    return docs.stream().anyMatch(doc -> doc.getStatus() == DocumentStatus.MISSING);
+}
+```
+
+**Use Entity Labels**: Delegate complex logic to specialized label classes
+```java
+@Component
+public class MyCounter implements EntityCounter<MyEntity> {
+
+    @Autowired
+    private MyComplexLabel complexLabel;  // Reuse existing logic
+
+    @Override
+    public boolean isEntityMarked(MyEntity entity) {
+        return complexLabel.isEntityMarked(entity);  // Delegate
+    }
+}
+```
+
+=== Database Query Optimization
+
+**Entity Fetching**: Ensure counter queries are optimized
+```java
+// If your counter needs related entities, optimize the query
+@Query("SELECT e FROM MyEntity e " +
+       "JOIN FETCH e.relatedEntity " +
+       "WHERE e.status = :status")
+List<MyEntity> findEntitiesForCounter(@Param("status") EntityStatus status);
+```
+
+**Pagination**: Platform handles pagination automatically for counter views
+
+== Best Practices
+
+=== Counter Design Guidelines
+
+**Single Responsibility**: Each counter should track one specific business condition
+```java
+// Good: Focused on one criteria
+public class ApplicationManualReviewCounter implements EntityCounter<Application> {
+    public boolean isEntityMarked(Application app) {
+        return app.getStatus() == ApplicationStatus.MANUAL_REVIEW;
+    }
+}
+
+// Avoid: Multiple unrelated criteria
+public class MixedCriteriaCounter implements EntityCounter<Application> {
+    public boolean isEntityMarked(Application app) {
+        return app.getStatus() == ApplicationStatus.MANUAL_REVIEW ||
+               app.getAmount().isGreaterThan(THRESHOLD) ||
+               app.getCreatedAt().isBefore(CUTOFF_DATE);  // Too many different concerns
+    }
+}
+```
+
+**Meaningful Names**: Use descriptive counter names for templates and i18n
+```java
+// Good: Clear business meaning
+public String getName() {
+    return "applicationManualReview";  // Clear what this counts
+}
+
+// Avoid: Generic or unclear names
+public String getName() {
+    return "counter1";  // What does this count?
+}
+```
+
+**Consistent Ordering**: Group related counters with logical order values
+```java
+// Applications
+@Order(1000) public class ApplicationSubmittedCounter { ... }
+@Order(1100) public class ApplicationManualReviewCounter { ... }
+@Order(1200) public class ApplicationApprovedCounter { ... }
+
+// Credits
+@Order(2000) public class CreditActiveCounter { ... }
+@Order(2100) public class CreditOverdueCounter { ... }
+@Order(2200) public class CreditPaidCounter { ... }
+```
+
+=== Internationalization Best Practices
+
+**Descriptive Labels**: Make counter purposes clear to users
+```properties
+# Good: Clear business context
+counter.applicationManualReview=Applications Requiring Review
+counter.overduePayments=Overdue Payments
+counter.incompleteDocumentation=Missing Documentation
+
+# Avoid: Technical or vague labels
+counter.status1=Status 1 Items
+counter.items=Items
+counter.counter=Counter
+```
+
+== Troubleshooting
+
+=== Common Issues
+
+**Counter Not Appearing on Dashboard**: Counter component not registered
+```
+Solution: Ensure counter class is annotated with @Component and is in a
+package scanned by Spring component scanning.
+```
+
+**Counter Shows Zero Count**: Logic never returns true
+```
+Solution: Debug the isEntityMarked() method with test data. Check that your
+criteria match actual entity states in the database.
+```
+
+**Counter Display Label Missing**: No internationalization entry
+```
+Solution: Add counter.{counterName}=Display Label to messages_en.properties
+file. Ensure the counter name matches exactly.
+```
+
+**Counter Order Wrong**: @Order values not set correctly
+```
+Solution: Use @Order annotation with appropriate numeric values. Lower
+numbers appear first on the dashboard.
+```
+
+**Performance Issues**: Counter logic too expensive
+```
+Solution: Profile the isEntityMarked() method. Move complex logic to
+entity labels or optimize database queries used by the counter.
+```
+
+**Counter Updates Delayed**: Changes don't reflect immediately
+```
+Solution: Ensure workflow completion events properly trigger entity
+updates. Consider adding @Transactional annotations with proper
+propagation to avoid race conditions.
+```
+
+Entity counters provide powerful workflow command centers that seamlessly integrate dashboard visibility with Launchpad decision-making. They enable efficient workflow management by surfacing entities requiring attention and providing direct access to decision processing interfaces.

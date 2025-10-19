@@ -35,7 +35,7 @@ public class ApplicationPortalService {
     private CreateApplicationMapper createApplicationMapper;
     @Autowired
     private ApplicationService applicationService;
-    @Autowired
+    @Autowired(required = false)
     private DocusignSignatureService docusignSignatureService;
     @Autowired
     private SignableDocumentService signableDocumentService;
@@ -57,6 +57,10 @@ public class ApplicationPortalService {
 
     @Transactional
     public String getSignatureUrl(UUID applicationId, String returnUrl) throws IOException, SignatureException {
+        if (docusignSignatureService == null) {
+            throw new SignatureException("DocuSign is not enabled");
+        }
+
         Application application = applicationRepository.findById(applicationId)
             .orElseThrow(() -> new NotFoundException("Application not found with ID: " + applicationId));
 
