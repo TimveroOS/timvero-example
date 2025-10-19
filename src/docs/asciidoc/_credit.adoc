@@ -120,34 +120,6 @@ CREATE TABLE credit (
 
 The loan module provides standard operation types that work with any credit implementation:
 
-==== Payment Operations
-
-[source,java]
-----
-include::{sourcedir}/operation/payment/ExampleCreditPayment.java[lines=15..35]
-----
-
-Custom payment types can be created by extending `CreditPayment`:
-
-[source,java]
-----
-@Entity
-@DiscriminatorValue("201")
-public class MortgagePayment extends CreditPayment {
-    
-    public static Integer TYPE = 201;
-    
-    public MortgagePayment(LocalDate date, MonetaryAmount amount) {
-        super(TYPE, date, OperationStatus.APPROVED, amount);
-    }
-    
-    @Override
-    public Integer getType() {
-        return TYPE;
-    }
-}
-----
-
 ==== Charge Operations
 
 Implement fees and charges specific to your credit type:
