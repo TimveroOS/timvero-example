@@ -11,8 +11,6 @@ import org.mapstruct.ReportingPolicy;
 @Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
 public interface ExampleCreditProductFormMapper extends EntityToFormMapper<ExampleCreditProduct, CreditProductForm> {
 
-    //ExampleCreditProduct copy(ExampleCreditProduct creditProduct);
-
     @Override
     void toEntity(CreditProductForm form, @MappingTarget ExampleCreditProduct entity);
 
@@ -23,6 +21,4 @@ public interface ExampleCreditProductFormMapper extends EntityToFormMapper<Examp
     @Override
     @InheritConfiguration
     ExampleCreditProduct createEntity(CreditProductForm form);
-
-
 }
