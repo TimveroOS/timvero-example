@@ -157,6 +157,7 @@ public abstract class CreditOperation extends AbstractAuditable<UUID> {
 ----
 
 Key features:
+
 * **Single Table Inheritance**: All operations stored in one table with discriminator
 * **Type Identification**: Each operation type has a unique integer identifier
 * **Date-based Processing**: Operations are tied to specific business dates
@@ -201,6 +202,7 @@ include::{sourcedir}/operation/charge/ChargeOperation.java[tag=entity]
 ----
 
 Key characteristics:
+
 * **Type Code**: `901` - Unique identifier for database discrimination
 * **Order**: `101` - Early processing order to apply charges before other operations
 * **Monetary Amount**: Embedded amount to be added to the debt
@@ -591,6 +593,7 @@ This scenario shows how borrower payments are processed and distributed across d
 ==== Payment Waterfall Logic
 
 The example project uses this payment priority:
+
 1. `PAST_DUE_PRINCIPAL` - Overdue principal first
 2. `PAST_DUE_INTEREST` - Overdue interest second  
 3. `LATE_FEE` - Late fees third
@@ -627,6 +630,7 @@ This scenario illustrates the complex process of handling missed payments and ca
 ==== Account Movement Logic
 
 When past due occurs:
+
 * `INTEREST` balance → `PAST_DUE_INTEREST` account
 * `PRINCIPAL` balance → `PAST_DUE_PRINCIPAL` account
 
@@ -639,6 +643,7 @@ Charge Principal → Insufficient Payment → Calculate Past Due Date → Verify
 ```
 
 The test shows how the system:
+
 - Moves unpaid amounts to past due accounts
 - Calculates late fees on the past due balances
 - Maintains accurate balance tracking across account types
@@ -689,6 +694,7 @@ Accrual operations must exist for every date when:
 ==== Result
 
 The system ensures accurate interest calculations even when:
+
 - Payments are made on irregular dates
 - Past due events change the debt structure
 - Operations are added or modified after the fact
@@ -698,6 +704,7 @@ The system ensures accurate interest calculations even when:
 ==== 1. Event-Driven Architecture
 
 Operations trigger other operations automatically:
+
 - Payments trigger accrual calculations
 - Past due events trigger late fee calculations
 - Each operation maintains referential integrity
@@ -705,6 +712,7 @@ Operations trigger other operations automatically:
 ==== 2. Chronological Processing
 
 The calculation engine processes operations in strict date order:
+
 - Earlier operations affect later operations
 - Processing order within a date matters (`getOrder()` values)
 - State changes are cumulative and consistent
@@ -712,6 +720,7 @@ The calculation engine processes operations in strict date order:
 ==== 3. Business Rule Flexibility
 
 The framework accommodates complex business rules:
+
 - Different payment priorities for different products
 - Time-sensitive processing (end-of-day vs intraday)
 - Automatic synchronization of dependent operations
@@ -719,6 +728,7 @@ The framework accommodates complex business rules:
 ==== 4. Audit and Traceability
 
 Every operation maintains complete audit trails:
+
 - Who created the operation and when
 - What the operation changed (debt account effects)
 - Why the operation was created (business event triggers)
@@ -785,6 +795,7 @@ The test uses a comprehensive Spring configuration that mirrors the production s
 ----
 
 Key testing components:
+
 * **Embedded Database**: Uses Zonky for isolated database testing
 * **Transaction Management**: `TransactionTemplateBuilder` for proper transaction handling
 * **Real Services**: Uses actual `CreditCalculationService` and `AccrualService` instances

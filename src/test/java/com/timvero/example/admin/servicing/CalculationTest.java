@@ -9,7 +9,6 @@ import com.timvero.example.admin.credit.ExampleCreditType;
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.offer.entity.ExampleSecuredOffer;
 import com.timvero.example.admin.operation.charge.ChargeOperationService;
-import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.example.admin.procuring.ExampleProcuringType;
 import com.timvero.example.admin.product.engine.SimpleScheduledEngine;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
@@ -25,6 +24,7 @@ import com.timvero.scheduled.ScheduledConfiguration;
 import com.timvero.scheduled.day_count.Method_30_360_BB;
 import com.timvero.servicing.ServicingConfiguration;
 import com.timvero.servicing.credit.entity.debt.Debt;
+import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.credit.entity.operation.OperationStatus;
 import com.timvero.servicing.engine.AccrualService;
 import com.timvero.servicing.engine.CreditCalculationService;
@@ -207,7 +207,7 @@ public class CalculationTest {
         Assertions.assertEquals(TODAY, credit.getCalculationDate());
         Assertions.assertEquals(principal, credit.getActualSnapshot().getDebt().getAccount(CreditCalculationConfiguration.PRINCIPAL).get());
 
-        ExampleCreditPayment creditPayment = credit.getOperations(ExampleCreditPayment.class, OperationStatus.APPROVED).findAny().get();
+        CreditPayment creditPayment = credit.getOperations(CreditPayment.class, OperationStatus.APPROVED).findAny().get();
         Assertions.assertEquals(paymentAmount.negate(), creditPayment.getFinalDebt().get().getAccount(CreditCalculationConfiguration.INTEREST).get());
         Assertions.assertEquals(unpaidInterest, credit.getActualSnapshot().getDebt().getAccount(CreditCalculationConfiguration.INTEREST).get());
 
@@ -242,7 +242,7 @@ public class CalculationTest {
         Assertions.assertEquals(TODAY, credit.getCalculationDate());
         Assertions.assertEquals(principal.subtract(paymentPrincipal), credit.getActualSnapshot().getDebt().getAccount(CreditCalculationConfiguration.PRINCIPAL).get());
 
-        ExampleCreditPayment creditPayment = credit.getOperations(ExampleCreditPayment.class, OperationStatus.APPROVED).findAny().get();
+        CreditPayment creditPayment = credit.getOperations(CreditPayment.class, OperationStatus.APPROVED).findAny().get();
         Assertions.assertEquals(paymentInterest.negate(), creditPayment.getFinalDebt().get().getAccount(CreditCalculationConfiguration.INTEREST).get());
         Assertions.assertEquals(paymentPrincipal.negate(), creditPayment.getFinalDebt().get().getAccount(CreditCalculationConfiguration.PRINCIPAL).get());
 
@@ -336,7 +336,7 @@ public class CalculationTest {
 
     public void registerPayment(UUID creditId, LocalDate paymentDate, MonetaryAmount amount) {
         transactionTemplateBuilder.requiresNew().executeWithoutResult(status -> {
-            entityManager.find(ExampleCredit.class, creditId).getOperations().add(new ExampleCreditPayment(paymentDate, amount));
+            entityManager.find(ExampleCredit.class, creditId).getOperations().add(new CreditPayment(paymentDate, OperationStatus.APPROVED, amount, CreditCalculationConfiguration.GENERAL));
         });
     }
 

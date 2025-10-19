@@ -10,12 +10,12 @@ import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.operation.charge.ChargeOperation;
 import com.timvero.example.admin.operation.pastdue.PastDueOperation;
 import com.timvero.example.admin.operation.pastdue.PastDueOperationService;
-import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.example.admin.transaction.entity.BorrowerTransaction;
 import com.timvero.example.admin.transaction.entity.BorrowerTransactionRepository;
 import com.timvero.ground.util.MonetaryUtil;
 import com.timvero.servicing.credit.CreditViewOptions;
 import com.timvero.servicing.credit.entity.debt.Debt;
+import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.engine.AccrualService;
 import com.timvero.servicing.engine.CreditCalculationService;
 import com.timvero.servicing.engine.distribution.OperationRecord;
@@ -138,10 +138,10 @@ public class CreditDataTab extends EntityTabController<UUID, ExampleCredit> {
                 MonetaryAmount bankAmount = MonetaryUtil.zero(currency);
 
                 for (OperationRecord o : operations.stream()
-                    .filter(o -> ExampleCreditPayment.class.isAssignableFrom(o.operation().getClass()))
+                    .filter(o -> CreditPayment.class.isAssignableFrom(o.operation().getClass()))
                     .sorted(Comparator.comparing(o -> o.operation().getId()))
                     .toList()) {
-                    ExampleCreditPayment payment = (ExampleCreditPayment) o.operation();
+                    CreditPayment payment = (CreditPayment) o.operation();
                     Collection<BorrowerTransaction> transactions = transactionRepository.findAllByOperation(
                         payment);
                     Optional<Debt> debtOpt = o.finalDebt();
