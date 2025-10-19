@@ -11,8 +11,4 @@ import org.springframework.web.bind.annotation.RequestMapping;
 @Order(2000)
 public class ParticipantExecutionTab extends AbstractPendingDecisionTab<Participant> {
 
-    @Override
-    public boolean isVisible(Participant entity) {
-        return !entity.getPendingDecisions().isEmpty();
-    }
 }
