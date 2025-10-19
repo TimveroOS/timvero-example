@@ -33,7 +33,8 @@ public class BorrowerTransaction extends PaymentTransaction {
 
     public BorrowerTransaction(TransactionType type, MonetaryAmount amount, PaymentMethod paymentMethod,
         ExampleCredit credit) {
-        super(type, amount);
+        setType(type);
+        setAmount(amount);
         this.credit = credit;
         setPaymentMethod(paymentMethod);
     }

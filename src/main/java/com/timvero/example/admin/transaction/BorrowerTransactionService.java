@@ -1,12 +1,12 @@
 package com.timvero.example.admin.transaction;
 
+import static com.timvero.example.admin.credit.CreditCalculationConfiguration.GENERAL;
 import static com.timvero.transfer.transaction.entity.TransactionType.INCOMING;
 import static com.timvero.transfer.transaction.entity.TransactionType.OUTGOING;
 
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.operation.charge.ChargeOperation;
 import com.timvero.example.admin.operation.charge.ChargeOperationService;
-import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.example.admin.transaction.entity.BorrowerTransaction;
 import com.timvero.example.admin.transaction.entity.BorrowerTransactionRepository;
 import com.timvero.example.admin.transaction.entity.LiquidityClientPaymentMethod;
@@ -131,7 +131,7 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
     private CreditPayment handleIncoming(ExampleCredit credit, BorrowerTransaction transaction, LocalDate date) {
         if (transaction.getPaymentMethod().getType().equals(LiquidityClientPaymentMethod.TYPE)) {
             LiquidityClientPaymentMethod paymentMethod = (LiquidityClientPaymentMethod) transaction.getPaymentMethod();
-            CreditPayment payment = new ExampleCreditPayment(date, paymentMethod.getAmount());
+            CreditPayment payment = new CreditPayment(date, OperationStatus.APPROVED, paymentMethod.getAmount(), GENERAL);
             return paymentService.registerPayment(credit, payment);
         }
         throw new IllegalArgumentException("Unknown payment method type: " + transaction.getPaymentMethod().getType());

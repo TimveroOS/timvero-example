@@ -3,10 +3,10 @@ package com.timvero.example.admin.operation.accrual;
 import static com.timvero.servicing.credit.entity.operation.OperationStatus.APPROVED;
 
 import com.timvero.example.admin.operation.pastdue.PastDueOperation;
-import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.servicing.PreCalculateSynchronizer;
 import com.timvero.servicing.credit.entity.Credit;
 import com.timvero.servicing.credit.entity.operation.CreditOperation;
+import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.credit.entity.operation.OperationStatus;
 import com.timvero.servicing.engine.general.CreditOperationHandler;
 import com.timvero.servicing.engine.general.Snapshot;
@@ -21,7 +21,7 @@ import org.springframework.core.Ordered;
 public class AccrualOperationService implements CreditOperationHandler<AccrualOperation>, PreCalculateSynchronizer, Ordered {
 
     private static final Set<Integer> CAUSE_OPERATIONS =
-        Set.of(ExampleCreditPayment.TYPE, PastDueOperation.TYPE);
+        Set.of(CreditPayment.TYPE, PastDueOperation.TYPE);
 
     public AccrualOperationService() {
         super();
