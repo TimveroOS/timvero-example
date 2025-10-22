@@ -3,7 +3,6 @@
 <form
     th:action="@{${actionPath}}"
     method="post"
-    class="modal-form"
     th:data-title="#{creditPayment.dialog.move-payment-date}"
     id="move-payment-date"
     th:object="${form}"
@@ -14,7 +13,7 @@
             th:insert="~{/form/components :: date(#{creditPayment.date}, 'date', 'v-required')}"/>
     </div>
 
-    <div class="modal-footer">
+    <div class="form__actions">
         <button
             type="button"
             class="btn btn-secondary"

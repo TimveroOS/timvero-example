@@ -3,7 +3,6 @@
 <form
     th:action="@{${actionPath}}"
     method="post"
-    class="modal-form"
     th:data-title="#{__${title}__}"
     id="paper-check"
     th:object="${form}"
@@ -20,7 +19,7 @@
     <th:block
         th:insert="~{/form/components :: textarea(#{credit.payment.description}, 'description', '')}"/>
   </div>
-  <div class="modal-footer">
+  <div class="form__actions">
     <button
         type="button"
         class="btn btn-secondary"
