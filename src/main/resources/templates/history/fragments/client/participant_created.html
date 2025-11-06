@@ -1,0 +1,10 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<th:block th:fragment="history">
+    <div>
+        <span th:text="#{history.participant.created}">Participant created:</span>
+        <a th:href="@{/participant/{id}(id=${event.relatedEntity.id})}"
+           th:text="${event.relatedEntity.displayedName}"></a>
+    </div>
+</th:block>
+</html>

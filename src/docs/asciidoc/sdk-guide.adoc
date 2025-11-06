@@ -57,8 +57,9 @@ This guide is organized into logical parts that build on each other:
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
+. **<<entity-history>>** - Track and display entity changes with timeline views
 === PART III: BUSINESS LOGIC
-[start=11]
+[start=12]
 . **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
@@ -99,6 +100,8 @@ include::_documents.adoc[leveloffset=+1]
 include::_document-templates.adoc[leveloffset=+1]
 
 include::_notifications.adoc[leveloffset=+1]
+
+include::_history.adoc[leveloffset=+1]
 
 // PART III: BUSINESS LOGIC
 include::_checkers.adoc[leveloffset=+1]

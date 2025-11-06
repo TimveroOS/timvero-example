@@ -16,14 +16,18 @@ import jakarta.validation.constraints.NotNull;
 import java.time.LocalDate;
 import org.hibernate.annotations.Fetch;
 import org.hibernate.annotations.FetchMode;
+import org.hibernate.envers.Audited;
+import org.hibernate.envers.RelationTargetAuditMode;
 
 @Entity
+@Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
 @DiscriminatorValue("1")
 public class ExampleCredit extends Credit implements NamedEntity, HasCovenant {
 
     @NotNull
     @OneToOne(fetch = FetchType.EAGER)
     @JoinColumn(nullable = false)
+    @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
     private Application application;
 
     @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
