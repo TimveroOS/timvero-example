@@ -5,53 +5,52 @@
     <div class="rui-page">
         <div class="rui-page-content">
             <div class="pumpkin-container d-flex">
-                <div class="d-flex participants flex-column">
-                    <header class="participants__header bottom-shadow">
-                        <th:block th:replace="~{/application/header}"></th:block>
-                    </header>
+                <div class="pumpkin-container d-flex" th:data-notes-enabled="${notesEnabled}">
+                    <div class="d-flex composite-entity-page flex-column">
+                        <header
+                            class="entity__header entity__header-sticky bottom-shadow"
+                            th:if="${headerPage}"
+                            th:with="header=~{${headerPage}}"
+                        >
+                            <th:block th:replace="${header}"></th:block>
+                        </header>
 
-                    <article class="article default-show-tabs"
-                        th:if="${tabs.primary.size() > 0}">
-                        <div
-                            class="article__header collapse-tabs d-flex justify-content-between align-items-center">
-                            <div
-                                class="header-left d-flex align-items-center">
-                                <p class="header__title">
-                                    <span th:text="#{application.deal}"></span>
-                                </p>
-                                <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
+                        <article class="article default-show-tabs"
+                            th:if="${tabs.primary.size() > 0}">
+                            <div class="article__header collapse-tabs d-flex justify-content-between align-items-center">
+                                <div class="header-left d-flex align-items-center">
+                                    <p class="header__title">
+                                        <span th:text="#{application.deal}"></span>
+                                    </p>
+                                    <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
+                                </div>
+                                <div class="header-right d-flex align-items-center">
+                                    <div class="entity__actions">
+                                    </div>
+                                </div>
                             </div>
-                            <div
-                                class="header-right d-flex align-items-center">
-                                <div class="entity__actions"></div>
-                            </div>
-                        </div>
-                        <th:block
-                            th:insert="~{/common/view-main :: tabs(${tabs})}"
-                            th:with="defaultNotActive = true" />
-                    </article>
+                            <th:block
+                                th:insert="~{/common/view-main :: tabs(${tabs})}"
+                                th:with="defaultNotActive = true" />
+                        </article>
 
-                    <article class="article"
-                        th:classAppend="${tabs.primary.size() > 0 ? '' : 'default-show-tabs'}"
-                        th:object="${entity.borrowerParticipant}"
-                        th:data-url="*{'/participant/' + id}"></article>
-                    <article
-                        th:each="participant : ${entity.participants}"
-                        th:if="${participant.id != entity.borrowerParticipant.id}"
-                        th:object="${participant}" class="article"
-                        th:data-url="*{'/participant/' + id}"></article>
-                    <!-- /* <article
-                    th:each="collateral : ${collaterals}"
-                    th:object="${collateral}"
-                    class="article"
-                    th:data-url="*{'/collateral/' + id}"
-                ></article> */ -->
+                        <article class="article"
+                            th:classAppend="${tabs.primary.size() > 0 ? '' : 'default-show-tabs'}"
+                            th:object="${entity.borrowerParticipant}"
+                            th:data-url="*{'/participant/' + id}"></article>
+                        <article
+                            th:each="participant : ${entity.participants}"
+                            th:if="${participant.id != entity.borrowerParticipant.id}"
+                            th:object="${participant}" class="article"
+                            th:data-url="*{'/participant/' + id}"></article>
+                        <!-- /* <article
+                        th:each="collateral : ${collaterals}"
+                        th:object="${collateral}"
+                        class="article"
+                        th:data-url="*{'/collateral/' + id}"
+                    ></article> */ -->
+                    </div>
                 </div>
-                <!-- /* <div
-                id="view-notes-tab"
-                class="notes-wrapper tab-pane active"
-                th:data-url="@{${rootPath} + '/' + ${entity.id} + '/tab/notes'}"
-            ></div> */ -->
             </div>
         </div>
     </div>
