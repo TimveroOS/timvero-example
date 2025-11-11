@@ -105,6 +105,9 @@ The framework provides several types of history suppliers for different tracking
 |<<tracking-related-entities,AbstractRelatedEntityAddedHistorySupplier>>
 |Tracks related entity additions
 
+|<<tracking-related-entity-changes,AbstractRelatedEntityModifiedHistorySupplier>>
+|Tracks field changes in a related entity
+
 |<<document-history,DocumentHistorySupplier>>
 |Automatically tracks document uploads
 
@@ -515,6 +518,131 @@ When a Participant is added to a Client (excluding borrowers), the Client's hist
 * Date: When the participant was created
 * User: Who created it
 * Custom content: Link to the participant with their name
+
+[[tracking-related-entity-changes]]
+== Tracking Related Entity Field Changes
+
+Use `AbstractRelatedEntityModifiedHistorySupplier` when you want to track changes to fields in a related entity and display them in the parent entity's history.
+
+=== What You Need
+
+1. Parent entity annotated with `@Audited`
+2. Related entity annotated with `@Audited`
+3. History supplier class extending `AbstractRelatedEntityModifiedHistorySupplier`
+4. i18n message for the event type
+5. i18n messages for field labels
+
+=== When to Use
+
+This supplier is useful when:
+
+* You want to show changes to a related entity in the parent's history timeline
+* The parent has a ManyToOne or OneToOne relationship with the related entity
+* You want to track specific fields in the related entity (e.g., status changes)
+
+*Example:* Show Application status changes in the Participant's history timeline.
+
+=== Step-by-Step Guide
+
+==== 1. Ensure Entities are Audited
+
+Both parent and related entities must be annotated with `@Audited`:
+
+[source,java]
+----
+@Entity
+@Table(name = "participant")
+@Audited
+public class Participant extends AbstractAuditable {
+    @ManyToOne(fetch = EAGER)
+    @JoinColumn(nullable = false, updatable = false)
+    private Application application;
+    // ...
+}
+
+@Entity
+@Table(name = "application")
+@Audited
+public class Application extends AbstractAuditable {
+    @Column(nullable = false)
+    @Enumerated(STRING)
+    private ApplicationStatus status = ApplicationStatus.NEW;
+    // ...
+}
+----
+
+==== 2. Create the History Supplier
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/history/ParticipantApplicationStatusChangedHistorySupplier.java[tags=!*]
+----
+
+Key components:
+
+* **Parent entity type parameters** - `<UUID, Participant, ...>` - the root entity whose history you're tracking
+* **Related entity type parameters** - `<..., UUID, Application>` - the related entity whose fields are being tracked
+* **Constructor parameters** - Parent class, related class, and i18n event key
+* **`getTrackedFields()`** - Returns fields to monitor in the related entity
+* **`getRelatedEntity()`** - Returns the related entity from the parent entity
+
+TIP: Use JPA metamodel constants (e.g., `Application_.STATUS`) for type-safe field references.
+
+==== 3. Add i18n Messages
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+# Event type
+history.type.APPLICATION_STATUS_CHANGED=Application status changed
+
+# Field labels - used in the change table
+application.status=Application Status
+----
+
+The field labels follow the pattern: `{table_name}.{field_name}` where table_name comes from `@Table(name = "application")`.
+
+==== 4. Create History Tab Controller (if not already present)
+
+If you haven't created a History tab for Participant yet:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/tab/ParticipantHistoryTab.java[tags=!*]
+----
+
+Add tab label to i18n:
+
+[source,properties]
+----
+participant.tab.history=History
+----
+
+=== What You Get
+
+When the Application status changes, the Participant's history timeline will show:
+
+* **Icon** - Edit symbol (MODIFY)
+* **Event type** - "Application status changed" (from i18n)
+* **Date** - When the status was changed
+* **User** - Who changed the status
+* **Table** - Showing the field name, old value, and new value
+
+The event appears in the Participant's history even though the change was made to the Application entity.
+
+=== How It Works Internally
+
+The supplier:
+
+1. Queries the audit history of the *related entity* (Application)
+2. Filters for changes to the tracked fields only (status)
+3. Returns events that are displayed in the *parent entity's* (Participant) timeline
+4. Uses the standard `/history/fragments/modified` template
+
+This is different from `AbstractModifiedHistorySupplier` which tracks changes to the root entity itself.
+
+TIP: You can track multiple fields by adding more field names to `getTrackedFields()`. Each change creates a separate event showing all modified fields in that revision.
 
 [[document-history]]
 == Automatic Document History
