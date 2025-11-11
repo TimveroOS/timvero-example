@@ -14,16 +14,11 @@
                         th:if="${tabs.primary.size() > 0}">
                         <div
                             class="article__header collapse-tabs d-flex justify-content-between align-items-center">
-                            <div
-                                class="header-left d-flex align-items-center">
+                            <div class="header-left">
                                 <p class="header__title">
                                     <span th:text="#{application.deal}"></span>
                                 </p>
                                 <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
-                            </div>
-                            <div
-                                class="header-right d-flex align-items-center">
-                                <div class="entity__actions"></div>
                             </div>
                         </div>
                         <th:block
