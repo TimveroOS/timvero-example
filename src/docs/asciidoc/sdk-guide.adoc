@@ -45,7 +45,7 @@ This guide is organized into logical parts that build on each other:
 
 === PART I: FOUNDATION
 . **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
-. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
+. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE
@@ -85,6 +85,8 @@ include::_data-model.adoc[leveloffset=+1]
 include::_forms.adoc[leveloffset=+1]
 
 include::_form-templates.adoc[leveloffset=+1]
+
+include::_single-entity-layout.adoc[leveloffset=+1]
 
 include::_templates.adoc[leveloffset=+1]
 
