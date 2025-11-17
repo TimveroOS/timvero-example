@@ -2,7 +2,6 @@ package com.timvero.example.admin.operation.pastdue;
 
 
 import com.timvero.example.admin.credit.entity.ExampleCredit;
-import com.timvero.example.admin.operation.payment.ExampleCreditPayment;
 import com.timvero.example.admin.product.engine.SimpleScheduledEngine;
 import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.ground.util.EntityUtils;
@@ -13,6 +12,7 @@ import com.timvero.servicing.credit.entity.Credit;
 import com.timvero.servicing.credit.entity.CreditSnapshot;
 import com.timvero.servicing.credit.entity.debt.Debt;
 import com.timvero.servicing.credit.entity.operation.CreditOperation;
+import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.credit.entity.operation.OperationStatus;
 import com.timvero.servicing.engine.distribution.OperationRecord;
 import com.timvero.servicing.engine.distribution.SnapshotRecord;
@@ -141,7 +141,7 @@ public class PastDueOperationService implements CreditOperationHandler<PastDueOp
     }
 
     private boolean isOperationPayment(OperationRecord o) {
-        return ExampleCreditPayment.class.isAssignableFrom(o.operation().getClass());
+        return CreditPayment.class.isAssignableFrom(o.operation().getClass());
     }
 
     public MonetaryAmount unpaid(PastDueOperation operation, NavigableMap<LocalDate, SnapshotRecord> records) {

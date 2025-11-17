@@ -3,7 +3,6 @@ package com.timvero.example.admin.product.form;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
 import com.timvero.example.admin.product.repository.ExampleCreditProductRepository;
 import java.math.BigDecimal;
-import org.jetbrains.annotations.NotNull;
 import org.springframework.stereotype.Component;
 import org.springframework.validation.Errors;
 import org.springframework.validation.Validator;
@@ -23,7 +22,7 @@ public class AdditiveFormValidator implements Validator {
     }
 
     @Override
-    public void validate(@NotNull Object target, @NotNull Errors errors) {
+    public void validate(Object target, Errors errors) {
         ExampleCreditProductAdditiveForm form = (ExampleCreditProductAdditiveForm) target;
 
         ExampleCreditProduct product = creditProductRepository.getReferenceById(form.getProduct());

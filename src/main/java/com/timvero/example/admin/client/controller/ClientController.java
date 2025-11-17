@@ -13,4 +13,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 @MenuItem(order = 5_500, name = "client")
 public class ClientController extends ViewableFilterController<UUID, Client, ClientFilter>{
 
+    @Override
+    protected String getHeaderPage() {
+        return "/client/header";
+    }
 }

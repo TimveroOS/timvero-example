@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<th:block th:object="${entity}">
+    <div class="card-info-wrapper d-flex">
+        <div class="card-info d-flex">
+            <ul class="card-info__body d-flex">
+                <li class="card-info__item d-flex">
+                    <span class="card-info__property"
+                          th:text="#{client.individualInfo.fullName}"
+                          th:title="#{client.individualInfo.fullName}"
+                    >Credit Product</span>
+                    <span class="card-info__value"
+                          th:text="*{individualInfo.fullName}">OVERDRAFT</span>
+                </li>
+                <li class="card-info__item d-flex" th:if="*{individualInfo?.dateOfBirth}">
+                    <span class="card-info__property"
+                          th:text="#{client.individualInfo.birthDate}"
+                          th:title="#{client.individualInfo.birthDate}"
+                    >Interest rate</span>
+                    <span class="card-info__value"
+                          th:text="*{#ldates.format(individualInfo?.dateOfBirth, 'dd/MM/yyyy')}">3.99 %</span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span class="card-info__property"
+                          th:text="#{client.individualInfo.nationalId}"
+                          th:title="#{client.individualInfo.nationalId}"
+                    >Loan Amount</span>
+                    <span class="card-info__value"
+                          th:text="*{individualInfo.nationalId}"></span>
+                </li>
+            </ul>
+        </div>
+        <div class="card-info d-flex">
+            <ul class="card-info__body d-flex">
+                <li class="card-info__item d-flex">
+                    <span class="card-info__property"
+                          th:text="#{client.contactInfo.email}"
+                          th:title="#{client.contactInfo.email}"
+                    ></span>
+                    <span class="card-info__value">
+                        <a type="email" th:href="'mailto:' + *{contactInfo.email}"
+                           th:text="*{contactInfo.email}"></a>
+                    </span>
+                </li>
+                <li class="card-info__item d-flex">
+                    <span class="card-info__property"
+                          th:text="#{client.contactInfo.phone}"
+                          th:title="#{client.contactInfo.phone}"
+                    ></span>
+                    <span class="card-info__value">
+                        <a class="no-ajax" th:href="'tel:' + *{contactInfo.phone}"
+                           th:text="*{#phones.format(contactInfo.phone)}"></a>
+                    </span>
+                </li>
+            </ul>
+        </div>
+    </div>
+</th:block>
+</html>

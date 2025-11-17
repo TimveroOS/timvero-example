@@ -1,0 +1,213 @@
+=== Form Templates
+==== Form Template Structure
+The form template begins with a <form> tag. The following required blocks are expected within the form:
+
+===== form__actions Block
+The form__actions block contains form control elements:
+
+Form title (<h4>) - displayed only when the form is opened as a separate page. When the form is displayed in a modal window, the title is automatically hidden
+Button block - contains form action buttons (save, cancel, etc.) with ml-auto class for alignment
+
+NOTE: The location of the form__actions block is not important - it can be placed either at the beginning or at the end of the <form> element.
+[source,html]
+----
+<div class="form__actions">
+    <h4>Form Title</h4>
+    <div class="ml-auto">
+        <!-- Form buttons -->
+    </div>
+</div>
+----
+===== form-body Block
+The form-body block is the main container for form fields and is responsible for the grid layout. The following elements are placed inside this block:
+
+form-group - form field groups
+
+app_toggled - togglable blocks
+
+<h4> - section subheadings
+
+[source,html]
+----
+<div class="form-body">
+    <h4>Form Section</h4>
+    <div class="form-group">
+        <!-- Form fields -->
+    </div>
+    <div class="app_toggled">
+        <!-- Togglable content -->
+    </div>
+</div>
+----
+==== Additional Elements
+===== Headings
+The <h4> tag is used for all headings within the form.
+
+===== Tables and Other Blocks
+All additional blocks (tables, information blocks) are inserted directly into the <form> element, outside the form-body block.
+IMPORTANT: Tables must be wrapped in a <div>:
+[source,html]
+----
+<form>
+    <div class="form__actions">
+        <!-- ... -->
+    </div>
+    <div class="form-body">
+        <!-- ... -->
+    </div>
+
+    <div>
+        <table>
+        <!-- Table content -->
+        </table>
+    </div>
+</form>
+----
+==== Two-Column Layout for Modal Forms
+The form-2-column class is used to add a two-column layout to forms in modal windows. This class is added to the form-body block.
+
+===== Layout Structure
+The two-column layout uses CSS Grid with the following characteristics:
+
+Grid columns: Two equal columns (1fr 1fr)
+Column gap: 60px spacing between columns
+Width: Full width of the container (100%)
+
+===== Element Placement Rules
+
+form-group elements: Automatically placed in columns (alternating left/right)
+app_toggled elements: Also placed in columns like form-group elements
+All other elements: Span both columns (full width) using grid-column: 1 / -1
+
+===== Special Container: form__container
+The form__container class can be used within form-2-column to create a nested two-column grid:
+
+Spans both columns of the parent grid
+Creates its own two-column grid with the same 60px gap
+Useful for grouping related fields that need their own column layout
+
+[source,html]
+----
+<div class="form-body form-2-column">
+    <h4>Section Title</h4> <!-- Spans both columns -->
+    <div class="form-group">
+        <!-- Placed in left column -->
+    </div>
+
+    <div class="form-group">
+        <!-- Placed in right column -->
+    </div>
+
+    <div class="app_toggled">
+        <!-- Placed in next available column (not spanning full width) -->
+    </div>
+
+    <div class="form__container">
+        <!-- Nested two-column grid -->
+        <div class="form-group"><!-- Left column --></div>
+        <div class="form-group"><!-- Right column --></div>
+    </div>
+</div>
+----
+===== CSS Implementation
+[source,scss]
+----
+.form-2-column {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-column-gap: 60px;
+    width: 100%;
+    *:not(.form-group):not(.app-toggled) {
+        grid-column: 1 / -1;
+    }
+
+    .form__container {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        grid-column-gap: 60px;
+    }
+}
+----
+NOTE: Both form-group and app_toggled elements are automatically distributed across columns. All other elements (headings, tables, containers) will span the full width of both columns.
+
+==== Complete Structure Example
+[source,html]
+----
+<form>
+    <!-- Action block (can be at the beginning or end) -->
+    <div class="form__actions">
+        <h4>Form Name</h4>
+        <div class="ml-auto">
+            <button type="submit">Save</button>
+            <button type="button">Cancel</button>
+        </div>
+    </div>
+    <!-- Main form body (standard layout) -->
+    <div class="form-body">
+        <h4>Basic Information</h4>
+        <div class="form-group">
+            <label>Field 1</label>
+            <input type="text" />
+        </div>
+
+        <div class="app_toggled">
+            <div class="form-group">
+                <label>Field 2</label>
+                <input type="text" />
+            </div>
+        </div>
+    </div>
+
+    <!-- Main form body (two-column layout for modals) -->
+    <div class="form-body form-2-column">
+    <h4>Modal Form Section</h4> <!-- Spans both columns -->
+
+        <div class="form-group">
+            <label>Field 1</label>
+            <input type="text" />
+            <!-- Left column -->
+        </div>
+
+        <div class="form-group">
+            <label>Field 2</label>
+            <input type="text" />
+            <!-- Right column -->
+        </div>
+
+        <div class="app_toggled">
+            <div class="form-group">
+                <label>Field 3</label>
+                <input type="text" />
+            </div>
+        </div>
+
+        <div class="form__container">
+            <!-- Nested two-column grid spanning full width -->
+            <div class="form-group">
+                <label>Nested Field 1</label>
+                <input type="text" />
+            </div>
+            <div class="form-group">
+                <label>Nested Field 2</label>
+                <input type="text" />
+            </div>
+        </div>
+    </div>
+
+    <!-- Additional elements -->
+    <div>
+        <table>
+            <thead>
+                <tr>
+                <th>Column 1</th>
+                <th>Column 2</th>
+                </tr>
+            </thead>
+            <tbody>
+            <!-- Table data -->
+            </tbody>
+        </table>
+    </div>
+</form>
+----

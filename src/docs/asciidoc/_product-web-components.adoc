@@ -1,0 +1,659 @@
+= Product Web Components Configuration
+:sourcedir: ../../main/java
+
+**Purpose**: Automate the setup of web layer components (controllers, actions, tabs) for credit products and additives through declarative configuration.
+
+The `ProductWebConfigurationSupport` class provides a declarative approach to registering all necessary Spring beans for credit product management, eliminating boilerplate code and ensuring consistent product UI implementation across your application.
+
+== Problem Statement
+
+Building a complete product management UI typically requires:
+
+* **Controllers** for listing and viewing products
+* **Actions** for CRUD operations (create, edit, copy, activate, deactivate)
+* **Additive actions** for managing product variations
+* **Tabs** for product details and additives list
+* **Proper generic type resolution** for Spring dependency injection
+
+== What You'll Build
+
+To create a complete product management system, you need to implement:
+
+**Required Components** (you implement these):
+
+* **Product Entity**: Your `CreditProduct` subclass with business-specific fields
+* **Additive Entity**: Your `CreditProductAdditive` subclass for product variations
+* **Form Classes**: DTOs for product and additive creation/editing
+* **Form Services**: Services implementing `EntityFormService` and `CreditProductAdditiveFormService`
+* **MapStruct Mappers**: Bidirectional mapping between entities and forms
+* **Thymeleaf Templates**: UI templates for forms, lists, and tabs
+* **Filter Class**: `BaseCreditProductFilter` subclass for list filtering
+* **Configuration Class**: Single class extending `ProductWebConfigurationSupport`
+
+**Auto-Generated Components** (framework provides these):
+
+* **Controller**: `CreditProductController` for list and details pages
+* **12+ Action Beans**: CRUD operations (create, edit, copy, activate, deactivate, additive management)
+* **Tab Components**: Product details and additives tabs
+* **Type-Safe Wiring**: Proper generic type resolution for dependency injection
+
+== Core Concepts
+
+=== ProductWebConfigurationSupport
+
+Abstract base class that implements `BeanDefinitionRegistryPostProcessor` to programmatically register Spring beans for credit product web layer.
+
+**Key Features:**
+
+* **Automatic Bean Registration**: Creates all necessary controllers, actions, and tabs
+* **Generic Type Resolution**: Ensures proper dependency injection with generic parameters
+* **Template Customization**: Override methods to specify custom Thymeleaf template paths
+* **Extensible Design**: Add custom components by overriding `initDefinitions()`
+
+=== Product Lifecycle States
+
+Credit products follow a three-state lifecycle:
+
+**DRAFT:**
+
+* Product is being configured and not yet ready for use
+* Full edit access - all product fields and properties can be modified
+* Additives can be created, edited, activated, and deactivated
+* Not available for offer generation
+* Can be activated when at least one active additive exists
+* Can be copied to create a new DRAFT product
+
+**ACTIVE:**
+
+* Product is live and available for offer generation
+* Product configuration is locked - no editing of existing fields
+* Additives cannot be created, edited, or modified
+* Can be deactivated (moved to INACTIVE state)
+* Can be copied to create a new DRAFT product with all active additives
+
+**INACTIVE:**
+
+* Product has been deactivated (soft delete)
+* Not available for offer generation
+* Product remains in database for historical reference
+* Cannot be edited or reactivated through standard actions
+* Can be copied to create a new DRAFT product
+
+=== Standard Components Registered
+
+When you extend `ProductWebConfigurationSupport`, the following beans are automatically registered:
+
+[cols="2,3,2", options="header"]
+|===
+|Component Type |Bean Class |Purpose
+
+|**Controller**
+|`CreditProductController`
+|List view and product details display
+
+|**Product Actions**
+|`CreateProductAction`
+|Create new credit product
+
+|
+|`EditProductAction`
+|Edit existing product
+
+|
+|`CopyProductAction`
+|Copy product with all additives
+
+|
+|`DeactivateCreditProductAction`
+|Deactivate product (soft delete)
+
+|
+|`EnableCreditProductAction`
+|Activate/enable product
+
+|
+|`AddCreditProductAdditiveAction`
+|Add new additive to product
+
+|**Additive Actions**
+|`EditAdditiveAction`
+|Edit product additive
+
+|
+|`ActivateAdditiveAction`
+|Activate additive
+
+|
+|`DeactivateAdditiveAction`
+|Deactivate additive
+
+|**Tabs**
+|`CreditProductDetailsTab`
+|Product details tab view
+
+|
+|`CreditProductAdditivesTab`
+|Product additives tab view
+|===
+
+== Complete Implementation Checklist
+
+Follow these steps to implement all required components for your product management system.
+
+=== ✓ Step 1: Product Entity
+
+**Create your** `CreditProduct` **subclass with business-specific fields**
+
+[source,java]
+----
+@Entity
+public class ExampleCreditProduct extends CreditProduct {
+    private CurrencyUnit currency;
+    private BigDecimal minAmount;
+    private BigDecimal maxAmount;
+    private Integer minTerm;
+    // ... other fields (maxTerm, lateFeeRate, etc.)
+}
+----
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/entity/ExampleCreditProduct.java[ExampleCreditProduct.java]
+
+=== ✓ Step 2: Additive Entity
+
+**Create your** `CreditProductAdditive` **subclass for product variations**
+
+[source,java]
+----
+@Entity
+public class ExampleCreditProductAdditive extends CreditProductAdditive {
+    private String name;
+    private BigDecimal interestRate;
+    private BigDecimal minAmount;
+    // ... other fields (maxAmount, minTerm, maxTerm, etc.)
+
+    @Override
+    public ExampleProductOffer createOffer() {
+        return new ExampleProductOffer();
+    }
+}
+----
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/entity/ExampleCreditProductAdditive.java[ExampleCreditProductAdditive.java]
+
+=== ✓ Step 3: Product Form Class
+
+**Create form DTO for product creation/editing**
+
+[source,java]
+----
+public class CreditProductForm extends BaseCreditProductForm {
+    private CurrencyUnit currency;
+    private BigDecimal minAmount;
+    private BigDecimal maxAmount;
+    // ... validation annotations and other fields
+}
+----
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/form/CreditProductForm.java[CreditProductForm.java]
+
+=== ✓ Step 4: Additive Form Class
+
+**Create form DTO for additive creation/editing**
+
+[source,java]
+----
+public class ExampleCreditProductAdditiveForm {
+    private String name;
+    private BigDecimal interestRate;
+    private BigDecimal minAmount;
+    // ... validation annotations and other fields
+}
+----
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/form/ExampleCreditProductAdditiveForm.java[ExampleCreditProductAdditiveForm.java]
+
+=== ✓ Step 5: Filter Class
+
+**Create filter class for product list filtering**
+
+[source,java]
+----
+public class ExampleCreditProductFilter extends BaseCreditProductFilter {
+}
+----
+
+**Default Filters (from** `BaseCreditProductFilter` **):**
+
+* **state**: Filter products by state (`CreditProductState[]`) - supports multiple states (IN restriction)
+
+You can extend with custom filters using annotations:
+
+* `@Field` / `@Fields` - specify which entity fields to search
+* `@Restriction` - define filter type (EQ, IN, LIKE, GT, LT, etc.)
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/filter/ExampleCreditProductFilter.java[ExampleCreditProductFilter.java]
+
+=== ✓ Step 6: MapStruct Mappers
+
+**Create MapStruct mappers for entity ↔ form conversion**
+
+**Product Mapper:**
+[source,java]
+----
+@Mapper(unmappedTargetPolicy = ReportingPolicy.IGNORE)
+public interface ExampleCreditProductFormMapper
+        extends EntityToFormMapper<ExampleCreditProduct, CreditProductForm> {
+
+    @Override
+    void toEntity(CreditProductForm form, @MappingTarget ExampleCreditProduct entity);
+
+    @Override
+    @InheritInverseConfiguration(name = "toEntity")
+    CreditProductForm toForm(ExampleCreditProduct entity);
+
+    @Override
+    @InheritConfiguration
+    ExampleCreditProduct createEntity(CreditProductForm form);
+}
+----
+
+**Additive Mapper:**
+[source,java]
+----
+@Mapper(uses = ReferenceMapper.class)
+public interface ExampleCreditProductAdditiveFormMapper
+        extends EntityToFormMapper<ExampleCreditProductAdditive, ExampleCreditProductAdditiveForm> {
+
+    @Override
+    void toEntity(ExampleCreditProductAdditiveForm form,
+                  @MappingTarget ExampleCreditProductAdditive entity);
+
+    @Override
+    @InheritInverseConfiguration(name = "toEntity")
+    ExampleCreditProductAdditiveForm toForm(ExampleCreditProductAdditive entity);
+
+    // Optional: custom mapping logic
+    @AfterMapping
+    default void afterToForm(@MappingTarget ExampleCreditProductAdditiveForm form,
+                            ExampleCreditProductAdditive additive) {
+        form.setAdditiveId(additive.getId());
+    }
+}
+----
+
+TIP: See complete examples: link:{sourcedir}/com/timvero/example/admin/product/form/ExampleCreditProductFormMapper.java[ExampleCreditProductFormMapper.java], link:{sourcedir}/com/timvero/example/admin/product/form/ExampleCreditProductAdditiveFormMapper.java[ExampleCreditProductAdditiveFormMapper.java]
+
+=== ✓ Step 7: Product Form Service
+
+**Implement form service for product operations**
+
+[source,java]
+----
+@Service
+public class ExampleCreditProductFormService
+        extends EntityFormService<ExampleCreditProduct, CreditProductForm, UUID> {
+
+    @Autowired
+    private DocumentTemplateFormService documentTemplateService;
+
+    @Override
+    protected void assembleEditModel(ExampleCreditProduct entity,
+                                     CreditProductForm form,
+                                     Map<String, Object> model) {
+        // Add data needed for form rendering (dropdowns, selects, etc.)
+        model.put("productEngines", SimpleScheduledEngine.NAME);
+        model.put("offerEngineTypes", new ExecutionResultType[]{ExampleDataProcessor.TYPE});
+        model.put("creditTypes", CreditType.values(CreditType.class));
+        model.put("templates", documentTemplateService.getTemplatesMap(
+            ApplicationContractDocumentCategory.TYPE));
+    }
+}
+----
+
+**Key Method**: `assembleEditModel()`
+
+This method populates the model with data needed for form rendering:
+
+* **Dropdown Options**: Available engines, credit types, templates
+* **Reference Data**: Any lookup data that forms need (enums, lists, maps)
+* **UI Data**: Additional information for conditional rendering
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/form/ExampleCreditProductFormService.java[ExampleCreditProductFormService.java]
+
+=== ✓ Step 8: Additive Form Service
+
+**Implement form service for additive operations**
+
+[source,java]
+----
+@Service
+public class ExampleCreditProductAdditiveFormServiceImpl
+        extends CreditProductAdditiveFormService<
+            ExampleCreditProductAdditive,
+            ExampleCreditProductAdditiveForm> {
+
+    private final OfferEngineDescriptorRepository offerEngineDescriptorRepository;
+
+    @Override
+    public Collection<?> findAdditiveModelsByProduct(CreditProduct product) {
+        return product.getAdditives();
+    }
+
+    @Override
+    protected void assembleEditModel(@Nullable ExampleCreditProductAdditive entity,
+                                     ExampleCreditProductAdditiveForm form,
+                                     Map<String, Object> model) {
+        // Add data for additive form rendering
+        model.put("procuringTypes", ProcuringType.values());
+    }
+
+    @Override
+    public void assembleProductData(Model model, CreditProduct product) {
+        // Prepare data for additives tab
+        ExampleCreditProduct exampleProduct = (ExampleCreditProduct) product;
+        Set<ExecutionResultType> requiredEngineTypes = exampleProduct.getOfferEngineTypes();
+
+        model.addAttribute("productId", product.getId());
+        model.addAttribute("offerEngineTypes", requiredEngineTypes);
+        model.addAttribute("offerEngineDescriptors",
+            Lazy.of(() -> getEngineDescriptorMap(requiredEngineTypes)));
+    }
+}
+----
+
+**Key Methods**:
+
+* **assembleEditModel()**: Populates model with data for additive edit form (procuring types dropdown)
+* **assembleProductData()**: Provides product-specific data for additives tab (engines, descriptors)
+* **findAdditiveModelsByProduct()**: Retrieves all additives for a product
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/form/ExampleCreditProductAdditiveFormServiceImpl.java[ExampleCreditProductAdditiveFormServiceImpl.java]
+
+=== ✓ Step 9: Configuration Class
+
+**Create configuration class - this triggers automatic bean registration**
+
+[source,java]
+----
+@Configuration
+@ConditionalOnWebApplication
+public class ProductWebConfiguration extends ProductWebConfigurationSupport {
+
+    public ProductWebConfiguration() {
+        super(ExampleCreditProduct.class,
+              CreditProductForm.class,
+              CreditProductFilter.class,
+              ExampleCreditProductAdditive.class,
+              ExampleCreditProductAdditiveForm.class);
+    }
+}
+----
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/ProductWebConfiguration.java[ProductWebConfiguration.java]
+
+=== ✓ Step 10: Thymeleaf Templates
+
+**Create UI templates for forms, lists, and tabs**
+
+You need to create templates at these paths (or override the paths in your configuration):
+
+[cols="2,3,2", options="header"]
+|===
+|Template Path |Purpose |Example
+
+|`/product/list.html`
+|Product list page with filters and actions
+|link:../../main/resources/templates/product/list.html[list.html]
+
+|`/product/edit.html`
+|Product create/edit form
+|link:../../main/resources/templates/product/edit.html[edit.html]
+
+|`/product/copy.html`
+|Product copy form
+|_Standard implementation provided_
+
+|`/product/tab/details.html`
+|Product details tab
+|link:../../main/resources/templates/product/tab/details.html[details.html]
+
+|`/product/tab/additives.html`
+|Product additives tab
+|link:../../main/resources/templates/product/tab/additives.html[additives.html]
+
+|`/product/action/add-product-additive.html`
+|Add/edit additive form
+|link:../../main/resources/templates/product/action/add-product-additive.html[add-product-additive.html]
+|===
+
+**Template Structure Example**:
+```
+src/main/resources/templates/
+  product/
+    list.html
+    edit.html
+    copy.html                    # Standard implementation provided
+    tab/
+      details.html
+      additives.html
+    action/
+      add-product-additive.html
+```
+
+NOTE: The `copy.html` template has a standard implementation provided by the framework. You don't need to create your own unless you require custom copy functionality beyond the default behavior.
+
+TIP: Review the example templates to understand the standard structure, form bindings, and integration with the framework's UI components.
+
+=== ✓ Step 11: Product State Label (Optional)
+
+**Create a label component to display product states in the UI**
+
+To show product states as visual labels in list views and detail pages, create a state label class:
+
+[source,java]
+----
+@Component
+@Order(1000)
+public class CreditProductStateLabel extends EntityStatusLabel<ExampleCreditProduct> {
+
+    public CreditProductStateLabel() {
+        super(ExampleCreditProduct::getState);
+    }
+
+    @Override
+    public boolean isEntityMarked(ExampleCreditProduct entity) {
+        return entity.getState() != null;
+    }
+
+    @Override
+    public String getGroup() {
+        return "state";
+    }
+}
+----
+
+**Key Points:**
+
+* Extends `EntityStatusLabel` to automatically render state as a label
+* Define translations in your message files: `productStateLabel.DRAFT`, `productStateLabel.ACTIVE`, `productStateLabel.INACTIVE`
+
+TIP: See complete example: link:{sourcedir}/com/timvero/example/admin/product/label/CreditProductStateLabel.java[CreditProductStateLabel.java]
+
+== Template Customization
+
+`ProductWebConfigurationSupport` provides default template paths, but you can customize them by overriding template path methods:
+
+=== Available Template Path Methods
+
+[cols="2,3,2", options="header"]
+|===
+|Method |Default Path |Purpose
+
+|`getListTemplatePath()`
+|`/product/list`
+|Product list view
+
+|`getDetailsTemplatePath()`
+|`/product/tab/details`
+|Product details tab
+
+|`getEditTemplatePath()`
+|`/product/edit`
+|Product edit form
+
+|`getCreateTemplatePath()`
+|`/product/edit`
+|Product creation form
+
+|`getCopyTemplatePath()`
+|`/product/copy`
+|Product copy form
+
+|`getAddAdditiveTemplatePath()`
+|`/product/action/add-product-additive`
+|Add additive form
+
+|`getEditAdditiveTemplatePath()`
+|`/product/action/add-product-additive`
+|Edit additive form
+
+|`getAdditivesTabTemplatePath()`
+|`/product/tab/additives`
+|Additives tab view
+|===
+
+=== Customizing Templates
+
+Override template path methods to use custom layouts:
+
+[source,java]
+----
+@Configuration
+@ConditionalOnWebApplication
+public class CustomProductWebConfiguration extends ProductWebConfigurationSupport {
+
+    public CustomProductWebConfiguration() {
+        super(MyProduct.class, MyProductForm.class, MyProductFilter.class,
+            MyProductAdditive.class, MyAdditiveForm.class);
+    }
+
+    @Override
+    protected String getListTemplatePath() {
+        return "/custom/product/list-view";
+    }
+
+    @Override
+    protected String getEditTemplatePath() {
+        return "/custom/product/edit-form";
+    }
+
+    @Override
+    protected String getAdditivesTabTemplatePath() {
+        return "/custom/product/additives-panel";
+    }
+
+    // Override other template paths as needed
+}
+----
+
+== Standard Component Details
+
+=== Product Actions
+
+==== CreateProductAction
+
+**Purpose**: Create new credit product
+
+==== EditProductAction
+
+**Purpose**: Edit existing product
+
+**Availability**: Only for products in `DRAFT` state
+
+Once a product is activated, it cannot be edited through this action.
+
+==== CopyProductAction
+
+**Purpose**: Duplicate product with all active additives
+
+**Availability**: Always available for any product
+
+**Behavior**:
+* Copies product properties (code and title can be modified during copy)
+* Duplicates only **active** additives
+* New product starts in `DRAFT` state
+
+==== EnableCreditProductAction
+
+**Purpose**: Activate product for use in offer generation
+
+**Availability**: Product must meet both conditions:
+* State is `DRAFT`
+* Product has at least one additive
+
+**Behavior**: Changes product state from `DRAFT` to `ACTIVE`, making it available for offer generation.
+
+==== DeactivateCreditProductAction
+
+**Purpose**: Deactivate active product
+
+**Availability**: Only for active products
+
+**Behavior**: Marks product as inactive; product remains in database but is hidden from offer generation.
+
+==== AddCreditProductAdditiveAction
+
+**Purpose**: Add new additive to product
+
+**Availability**: Only for products in `DRAFT` state
+
+=== Additive Actions
+
+==== EditAdditiveAction
+
+**Purpose**: Edit product additive
+
+**Availability**: Only when product is in `DRAFT` state
+
+Additives can only be edited while their parent product is in draft mode.
+
+==== ActivateAdditiveAction
+
+**Purpose**: Activate additive for offer generation
+
+**Availability**: Additive must in conditions:
+* Additive is currently inactive
+* Parent product is in `DRAFT` state
+
+**Behavior**: Sets additive's `active` flag to `true`.
+
+==== DeactivateAdditiveAction
+
+**Purpose**: Deactivate additive
+
+**Availability**: Additive must meet both conditions:
+* Additive is currently active
+* Parent product is in `DRAFT` state
+
+**Behavior**: Sets additive's `active` flag to `false`.
+
+=== Tabs
+
+==== CreditProductDetailsTab
+
+**Purpose**: Display product details in read-only tab format
+
+Renders all product configuration fields including amounts, terms, rates, engine settings, and other product-specific properties.
+
+==== CreditProductAdditivesTab
+
+**Purpose**: Display and manage product additives
+
+Shows the list of all additives associated with the product. Provides action buttons for editing, activating, and deactivating additives based on product state and additive status.
+
+== Next Steps
+
+* **<<offer-engine>>**: Use products to generate personalized offers
+* **<<credit-management>>**: Convert offers to active credits
+* **<<form-classes>>**: Advanced form handling and validation
+* **<<entity-checkers>>**: Automate product lifecycle events
