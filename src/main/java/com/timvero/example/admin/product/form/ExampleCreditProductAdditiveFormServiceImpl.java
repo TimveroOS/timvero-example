@@ -15,7 +15,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
-import org.jetbrains.annotations.Nullable;
 import org.springframework.data.util.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.ui.Model;
@@ -37,7 +36,7 @@ public class ExampleCreditProductAdditiveFormServiceImpl extends
     }
 
     @Override
-    protected void assembleEditModel(@Nullable ExampleCreditProductAdditive entity,
+    protected void assembleEditModel(ExampleCreditProductAdditive entity,
         ExampleCreditProductAdditiveForm form, Map<String, Object> model) {
         model.put("procuringTypes", ProcuringType.values());
     }
