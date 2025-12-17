@@ -59,6 +59,7 @@ This guide is organized into logical parts that build on each other:
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
 === PART III: BUSINESS LOGIC
 [start=11]
+. **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
@@ -103,6 +104,8 @@ include::_document-templates.adoc[leveloffset=+1]
 include::_notifications.adoc[leveloffset=+1]
 
 // PART III: BUSINESS LOGIC
+include::_entity-actions.adoc[leveloffset=+1]
+
 include::_checkers.adoc[leveloffset=+1]
 
 include::_datasource.adoc[leveloffset=+1]
