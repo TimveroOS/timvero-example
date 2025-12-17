@@ -4,6 +4,7 @@ import static com.timvero.example.admin.credit.CreditCalculationConfiguration.GE
 import static com.timvero.transfer.transaction.entity.TransactionType.INCOMING;
 import static com.timvero.transfer.transaction.entity.TransactionType.OUTGOING;
 
+import com.timvero.example.admin.credit.CreditPaymentService;
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.credit.entity.ExampleCreditRepository;
 import com.timvero.example.admin.operation.charge.ChargeOperation;
