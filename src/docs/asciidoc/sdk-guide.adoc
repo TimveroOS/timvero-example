@@ -35,6 +35,7 @@ This SDK empowers developers to create financial applications through:
 * **Comprehensive Form System** - Handle complex forms with validation, nested components, and MapStruct mapping
 * **Credit Operations Framework** - Manage loan lifecycle with automated calculations, accruals, and payments
 * **Payment Transaction System** - Process real-world payments through multiple gateways with complete audit trails
+* **Entity Actions** - Add custom business actions as buttons: approve, close, register payment
 * **Entity Checkers** - Implement event-driven business rules that respond to data changes automatically
 
 For a complete working example, see the https://github.com/TimveroOS/timvero-example[timvero-example project^].
