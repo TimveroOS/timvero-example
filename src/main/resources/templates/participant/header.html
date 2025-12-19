@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
 <div class="article__header d-flex justify-content-between align-items-center collapse-tabs">
-    <div class="header-left d-flex align-items-center">
+    <div class="header-left">
         <p class="header__title">
             <span th:unless="${#lists.isEmpty(roles)}" th:text="${#enums.join(roles, ' & ')}"></span>
             <span th:unless="${entity.client}" th:text="${entity.displayedName}"></span>
@@ -11,7 +11,7 @@
         </p>
         <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
     </div>
-    <div class="header-right d-flex align-items-center">
+    <div class="header-right">
         <div class="entity__actions">
             <th:block th:insert="~{/common/action/bar :: buttons(${actions})}"/>
         </div>
