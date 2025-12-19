@@ -20,7 +20,7 @@ public class ExampleApplication {
 	    .properties("server.port=8081")
 	    .run(args);
 	    parentBuilder.child(PortalWebConfiguration.class)
-	    .properties("server.port=8082")
+	    .properties("portal.server.port=8082")
 	    .run(args);
 
         parentBuilder.child(ExternalProcessWebMvcConfig.class)
