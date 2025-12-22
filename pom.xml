@@ -6,7 +6,7 @@
     <parent>
         <groupId>com.timvero.pumpkin</groupId>
         <artifactId>pumpkin</artifactId>
-        <version>8.0.11</version>
+        <version>8.1-SNAPSHOT</version>
     </parent>
 
     <artifactId>example</artifactId>
@@ -28,7 +28,7 @@
         <repository>
             <id>maven.timvero.xyz</id>
             <name>Timvero Repository</name>
-            <url>https://maven.timvero.xyz/releases</url>
+            <url>https://maven.timvero.xyz/private</url>
         </repository>
     </repositories>
 
