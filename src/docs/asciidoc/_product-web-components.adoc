@@ -1,5 +1,5 @@
 = Product Web Components Configuration
-:sourcedir: ../../main/java
+:sourcedir: https://github.com/TimveroOS/timvero-example/tree/main/src/main/java
 
 **Purpose**: Automate the setup of web layer components (controllers, actions, tabs) for credit products and additives through declarative configuration.
 

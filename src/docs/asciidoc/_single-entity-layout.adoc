@@ -1,0 +1,130 @@
+= Single Entity Layout Documentation
+:toc:
+:toc-placement: left
+:toclevels: 3
+== Overview
+The single entity layout provides a consistent structure for displaying individual entity pages. It consists of three main blocks that create a unified viewing experience.
+== Layout Structure
+The layout is composed of three primary blocks:
+
+Header - Contains title and actions
+
+Content - Optional details section
+
+Tabs - Navigation tabs for entity sections
+
+== Component Blocks
+=== Header Block
+The header block uses the .entity__header class and contains two main sections:
+
+==== Template Structure
+[source,html]
+<div class="entity__header">
+    <div class="header-left">
+        <h2 class="header__title">Eugen Nikanovich</h2>
+        <button class="btn copy-action p-0 copy-action-ready"
+                type="button"
+                title="Copy ID">
+        </button>
+    </div>
+    <div class="header-right">
+        <div class="entity__actions">
+            <!-- Action buttons placed here -->
+        </div>
+    </div>
+</div>
+
+==== Header Components
+[cols="1,3"]
+|===
+|Component |Description
+|.header-left
+|Contains the entity title and ID copy button
+|.header__title
+|Displays the main entity name or title
+|.copy-action
+|Button for copying entity ID to clipboard
+|.header-right
+|Container for entity action buttons
+|.entity__actions
+|Wrapper for action buttons (edit, delete, etc.)
+|===
+=== Content Block (Optional)
+The content block displays additional entity details and is optional based on requirements.
+
+==== Implementation
+
+Content is placed within .entity__details container.
+Content is loaded from header.html file in the specific entity folder.
+This block is optional and can be omitted if not needed
+
+==== Template Example
+[source,html]
+<div class="entity__details">
+    <div class="card-info-wrapper d-flex">
+        <div class="card-info d-flex">
+            <ul class="card-info__body d-flex">
+                <li class="card-info__item d-flex">
+                    <span class="card-info__property" title="Date of birth">
+                        Date of birth
+                    </span>
+                    <span class="card-info__value">03/10/1998</span>
+                </li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+=== Tabs Block
+The tabs component provides navigation between different entity sections.
+
+==== Implementation
+Tabs are included using the standard fragment reference:
+[source,html]
+<div th:replace="~{/common/view-main :: tabs()}"></div>
+
+
+== Complete Layout Example
+[source,html]
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+    <!-- Entity Header -->
+    <div class="entity__header">
+        <div class="header-left">
+            <h2 class="header__title" th:text="${entity.name}">Entity Name</h2>
+            <button class="btn copy-action p-0 copy-action-ready"
+                    type="button"
+                    title="Copy ID"
+                    th:data-copy-value="${entity.id}">
+            </button>
+        </div>
+        <div class="header-right">
+            <div class="entity__actions">
+                <!-- Action buttons -->
+            </div>
+        </div>
+    </div>
+<!-- Optional Content Block -->
+<div th:if="${headerPage}" class="entity__details" th:with="header=~{${headerPage}}">
+    <th:block th:insert="${header}"></th:block>
+</div>
+<!-- Tabs Navigation -->
+<div th:replace="~{/common/view-main :: tabs()}"></div>
+</body>
+</html>
+
+== Usage Guidelines
+=== When to Include Content Block
+Include the .entity__details block when:
+
+Entity has important metadata to display
+Quick reference information is needed
+Summary data enhances user experience
+
+=== Header Best Practices
+
+Keep entity title concise and clear
+Always include copy ID functionality for entities with IDs
+Group related actions in .entity__actions
+Use consistent button styling across entities

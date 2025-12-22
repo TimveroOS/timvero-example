@@ -1,18 +1,19 @@
-<th:block
-    xmlns="http://www.w3.org/1999/xhtml"
-    xmlns:th="http://www.thymeleaf.org"
->
-    <div class="d-flex align-items-center justify-content-between">
-        <div class="d-flex align-items-center gap-20">
-            <h2 class="header__title" th:text="${entity.displayedName}"></h2>
-            <th:block th:insert="~{/templates/copyButton :: copyButton('Copy ID', ${entity.id})}" />
+<th:block xmlns="http://www.w3.org/1999/xhtml"
+    xmlns:th="http://www.thymeleaf.org">
+    <div class="header-left">
+        <h2 class="header__title" th:text="${entity.displayedName}"></h2>
+        <th:block
+            th:insert="~{/templates/copyButton :: copyButton('Copy ID', ${entity.id})}" />
+    </div>
+    <div class="header-right">
+        <p class="entity__date"
+           th:text="${#ldates.format(entity.createdAt, 'dd MMM yyyy')}"></p>
+        <div class="entity__actions">
+            <th:block
+                th:insert="~{/common/action/bar :: buttons(${actions})}" />
         </div>
-        <div class="header-right d-flex align-items-center">
-            <p class="entity__date" th:text="${#ldates.format(entity.createdAt, 'dd MMM yyyy')}">Jan 9, 2024 12:23</p>
-            <div class="entity__actions">
-                <th:block th:insert="~{/common/action/bar :: buttons(${actions})}"/>
-            </div>
-            <script th:data-src="@{/assets/static/js/actions-handler.js}"></script>
-        </div>
+        <script
+            th:data-src="@{/assets/static/js/actions-handler.js}"></script>
     </div>
 </th:block>
+

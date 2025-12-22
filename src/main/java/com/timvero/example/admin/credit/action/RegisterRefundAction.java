@@ -1,10 +1,10 @@
 package com.timvero.example.admin.credit.action;
 
+import com.timvero.example.admin.credit.CreditPaymentService;
 import com.timvero.example.admin.transaction.BorrowerTransactionService;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.credit.entity.operation.OperationStatus;
-import com.timvero.servicing.engine.CreditPaymentService;
 import com.timvero.web.common.action.SimpleActionController;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Autowired;
