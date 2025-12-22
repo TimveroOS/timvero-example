@@ -13,6 +13,7 @@ import com.timvero.example.admin.participant.entity.ParticipantRole;
 import com.timvero.example.admin.participant.entity.Participant_;
 import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.ground.entity.NamedEntity;
+import com.timvero.ground.note.HasNotes;
 import com.timvero.ground.util.Lang;
 import com.timvero.scheduled.entity.PaymentSchedule;
 import jakarta.persistence.CascadeType;
@@ -31,7 +32,7 @@ import org.hibernate.envers.Audited;
 @Entity
 @Table
 @Audited
-public class Application extends AbstractAuditable implements NamedEntity {
+public class Application extends AbstractAuditable implements NamedEntity, HasNotes {
 
     @Column(nullable = false)
     @Enumerated(STRING)

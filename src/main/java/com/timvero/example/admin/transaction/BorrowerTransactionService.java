@@ -4,7 +4,9 @@ import static com.timvero.example.admin.credit.CreditCalculationConfiguration.GE
 import static com.timvero.transfer.transaction.entity.TransactionType.INCOMING;
 import static com.timvero.transfer.transaction.entity.TransactionType.OUTGOING;
 
+import com.timvero.example.admin.credit.CreditPaymentService;
 import com.timvero.example.admin.credit.entity.ExampleCredit;
+import com.timvero.example.admin.credit.entity.ExampleCreditRepository;
 import com.timvero.example.admin.operation.charge.ChargeOperation;
 import com.timvero.example.admin.operation.charge.ChargeOperationService;
 import com.timvero.example.admin.transaction.entity.BorrowerTransaction;
@@ -12,11 +14,9 @@ import com.timvero.example.admin.transaction.entity.BorrowerTransactionRepositor
 import com.timvero.example.admin.transaction.entity.LiquidityClientPaymentMethod;
 import com.timvero.ground.util.EntityUtils;
 import com.timvero.ground.util.TransactionUtils;
-import com.timvero.servicing.credit.entity.CoreCreditRepository;
 import com.timvero.servicing.credit.entity.operation.CreditOperation;
 import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.credit.entity.operation.OperationStatus;
-import com.timvero.servicing.engine.CreditPaymentService;
 import com.timvero.transfer.method.entity.PaymentMethod;
 import com.timvero.transfer.transaction.entity.PaymentTransaction;
 import com.timvero.transfer.transaction.entity.PaymentTransactionRepository;
@@ -45,7 +45,7 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
     @Autowired
     private PaymentTransactionService transactionService;
     @Autowired
-    private CoreCreditRepository creditRepository;
+    private ExampleCreditRepository creditRepository;
     @Autowired
     private PaymentTransactionRepository transactionRepository;
     @Autowired
@@ -178,7 +178,7 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
             "Not enough money: " + amount + "; payment " + payment.getId());
 
         BorrowerTransaction transaction = new BorrowerTransaction(OUTGOING, amount, null,
-            (ExampleCredit) creditRepository.findByOperationsIn(payment));
+            creditRepository.findByOperationsIn(payment));
         transaction.setService(BANK_TRANSACTION_SERVICE);
         transaction.setDescription(description);
         transaction.setStatus(TransactionStatus.SUCCEED);

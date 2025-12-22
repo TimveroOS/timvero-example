@@ -1,0 +1,742 @@
+= Entity Actions
+
+Add custom business actions to your entities as buttons that appear on entity pages.
+
+== What You Need to Know
+
+Entity Actions are controller-based buttons that perform business operations on entities. Each action:
+
+- Appears as a button on the entity's view page
+- Can show a modal form or execute immediately
+- Validates availability before execution (button visibility + runtime check)
+- Runs in a transaction with pessimistic locking
+- Automatically handles security, validation, and user feedback
+
+Common examples: Approve, Decline, Close, Register Payment, Generate Document, Change Status.
+
+== Quick Setup
+
+Create an action that approves a participant with a confirmation dialog.
+
+=== 1. Create Action Controller
+
+[source,java]
+----
+@Controller
+@RequestMapping("/approve")
+@Order(2000)
+public class ApproveParticipantAction extends EntityActionController<UUID, Participant, Object> {
+
+    private final ParticipantService participantService;
+
+    public ApproveParticipantAction(ParticipantService participantService) {
+        this.participantService = participantService;
+    }
+
+    @Override
+    protected EntityAction<? super Participant, Object> action() {
+        return when(p -> p.getStatus() == ParticipantStatus.MANUAL_APPROVAL)
+            .then((participant, form, user) -> {
+                participantService.approve(participant.getId());
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(UUID id, Model model, String actionPath) {
+        return "/participant/action/approve";
+    }
+
+    @Override
+    public String getHighlighted() {
+        return BTN_SUCCESS;
+    }
+}
+----
+
+**Key elements:**
+
+- `@RequestMapping("/approve")` - Action URL path
+- `@Order(2000)` - Button display order (lower = left)
+- `when()` - Availability condition (when button is visible)
+- `then()` - Business logic to execute
+- `getActionTemplate()` - Returns template path for the modal form
+- `getHighlighted()` - Button color (BTN_SUCCESS, BTN_DANGER, BTN_PRIMARY, etc.)
+
+=== 2. Create Template
+
+Create `/participant/action/approve.html`:
+
+[source,html]
+----
+<html xmlns:th="http://www.thymeleaf.org">
+<form
+    th:action="@{${actionPath}}"
+    method="post"
+    class="modal-form"
+    th:data-title="#{participant.action.approve}"
+>
+  <div class="form-body">
+    <p th:text="#{participant.action.approve.confirm}">
+      Are you sure you want to approve this participant?
+    </p>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="btn btn-secondary" data-dismiss="modal" 
+            th:text="#{button.close}">Cancel</button>
+    <button type="submit" class="btn btn-success" 
+            th:text="#{button.approve}">Approve</button>
+  </div>
+</form>
+</html>
+----
+
+=== 3. Add i18n Messages
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+participant.action.approve=Approve Participant
+participant.action.approve.confirm=Are you sure you want to approve this participant?
+----
+
+That's it! The button appears automatically on the Participant view page.
+
+== Action Types
+
+=== Action with Form
+
+For actions that need user input, add form class and template preparation:
+
+[source,java]
+----
+public class CloseAction extends EntityActionController<UUID, ExampleCredit, CloseForm> {
+
+    @Override
+    protected String getActionTemplate(UUID id, Model model, String actionPath) {
+        ExampleCredit credit = loadEntity(id);
+        CloseForm form = new CloseForm();
+        form.setCloseDate(LocalDate.now());
+        model.addAttribute("form", form);
+        model.addAttribute("minDate", credit.getActualSnapshot().getDate());
+        return "/credit/action/close";
+    }
+
+    public static class CloseForm {
+        @NotNull
+        @DateTimeFormat(pattern = ValidationUtils.PATTERN_DATEPICKER_FORMAT)
+        private LocalDate closeDate;
+        // getters/setters
+    }
+}
+----
+
+=== POST-Only Action
+
+For actions that execute immediately without showing a form, use `SimpleActionController`:
+
+[source,java]
+----
+public class RecalculateAction extends SimpleActionController<UUID, ExampleCredit> {
+
+    @Override
+    protected EntityAction<ExampleCredit, Object> action() {
+        return when(c -> c.getActualSnapshot() != null)
+            .then((credit, form, user) -> {
+                calculationService.recalculate(credit.getId());
+            });
+    }
+}
+----
+
+No `getActionTemplate()` needed - action executes immediately on POST.
+
+=== Edit Action
+
+For standard entity editing, use `EditEntityActionController`:
+
+[source,java]
+----
+public class EditApplicationAction 
+    extends EditEntityActionController<UUID, Application, ApplicationForm> {
+
+    @Override
+    public boolean isEditable(Application entity) {
+        return entity.getBorrowerParticipant().getStatus() == ParticipantStatus.NEW;
+    }
+}
+----
+
+Uses `EntityFormService` automatically - no need to implement `action()` or `getActionTemplate()`.
+
+== when().then() Pattern
+
+The `when().then()` pattern separates availability checking from execution.
+
+=== Basic Condition
+
+[source,java]
+----
+when(entity -> entity.getStatus() == Status.ACTIVE)
+    .then((entity, form, user) -> {
+        // execute action
+    })
+----
+
+=== Complex Condition
+
+[source,java]
+----
+when(credit -> 
+    credit.getActualSnapshot() != null && 
+    credit.getActualSnapshot().getStatus().equals(ACTIVE) &&
+    credit.getOutstandingBalance().isPositive()
+)
+----
+
+=== User-Based Condition
+
+[source,java]
+----
+when((entity, user) -> {
+    return entity.getAssignedTo() != null && 
+           entity.getAssignedTo().equals(user);
+})
+----
+
+=== Multiple Checks
+
+[source,java]
+----
+when(p -> 
+    p.getStatus().in(ParticipantStatus.MANUAL_APPROVAL) &&
+    p.getPendingDecisions().isEmpty()
+)
+----
+
+**Why separate when() and then()?**
+
+- `when()` controls button visibility in UI
+- `when()` is checked again at runtime for security
+- Clear separation of concerns
+- Framework can optimize UI rendering
+
+== Forms
+
+=== Form Class
+
+Define form as static inner class:
+
+[source,java]
+----
+public static class RegisterPaymentForm {
+    
+    @NotNull
+    @Positive
+    private MonetaryAmount amount;
+    
+    @NotNull
+    @DateTimeFormat(pattern = PATTERN_DATEPICKER_FORMAT)
+    private LocalDate processedDate;
+    
+    private String description;
+    
+    // getters/setters
+}
+----
+
+**Validation annotations:**
+
+- `@NotNull`, `@NotBlank` - Required fields
+- `@Positive`, `@PositiveOrZero` - Numeric constraints
+- `@Size`, `@Min`, `@Max` - Size constraints
+- `@DateTimeFormat` - Date parsing
+- Custom validators
+
+=== Preparing Form Data
+
+Use `getActionTemplate()` to prepare model:
+
+[source,java]
+----
+@Override
+protected String getActionTemplate(UUID id, Model model, String actionPath) {
+    ExampleCredit credit = loadEntity(id);
+    
+    // Create and pre-fill form
+    ManualTransferForm form = new ManualTransferForm();
+    form.setProcessedDate(LocalDate.now());
+    model.addAttribute("form", form);
+    
+    // Add supporting data for template
+    model.addAttribute("minDate", credit.getStartDate());
+    model.addAttribute("currencies", List.of(credit.getCurrency()));
+    model.addAttribute("title", "credit.dialog.register-payment");
+    
+    return "/credit/action/register-payment";
+}
+----
+
+=== Form Template
+
+[source,html]
+----
+<html xmlns:th="http://www.thymeleaf.org">
+<form
+    th:action="@{${actionPath}}"
+    method="post"
+    class="modal-form"
+    th:data-title="#{credit.action.register-payment}"
+    th:object="${form}"
+>
+  <div class="form-body">
+  
+    <th:block th:insert="~{/form/components :: money (
+        #{credit.amount}, 
+        'amount', 
+        'v-required v-positive',
+        ${currencies}
+    )}"/>
+    
+    <th:block th:insert="~{/form/components :: date (
+        #{credit.processedDate}, 
+        'processedDate', 
+        'v-required'
+    )}"
+        th:with="minDate = ${minDate}, maxDate = ${maxDate}"
+    />
+    
+    <th:block th:insert="~{/form/components :: textarea (
+        #{credit.description}, 
+        'description'
+    )}"/>
+
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="btn btn-secondary" data-dismiss="modal" 
+            th:text="#{button.close}">Close</button>
+    <button type="submit" class="btn btn-success" 
+            th:text="#{button.save}">Save</button>
+  </div>
+</form>
+</html>
+----
+
+**Key elements:**
+
+- `th:action="@{${actionPath}}"` - Submit URL
+- `class="modal-form"` - Triggers modal behavior
+- `th:data-title` - Modal header
+- `th:object="${form}"` - Form binding
+- Form components from `/form/components`
+
+== UI Integration
+
+=== Button Colors
+
+[source,java]
+----
+@Override
+public String getHighlighted() {
+    return BTN_SUCCESS;  // Green button
+}
+----
+
+**Available colors:**
+
+- `BTN_PRIMARY` - Blue (default actions)
+- `BTN_SUCCESS` - Green (approve, confirm)
+- `BTN_DANGER` - Red (delete, cancel, void)
+- `BTN_SECONDARY` - Gray (neutral actions)
+- `BTN_LIGHT` - Light gray (less important)
+
+=== Button Order
+
+Use `@Order` to control button position:
+
+[source,java]
+----
+@Order(1000)  // Leftmost
+public class EditAction extends EditEntityActionController<...> { }
+
+@Order(2000)  // Middle
+public class ApproveAction extends EntityActionController<...> { }
+
+@Order(3000)  // Rightmost
+public class DeleteAction extends SimpleActionController<...> { }
+----
+
+Lower numbers appear first (left to right).
+
+=== Button Label
+
+Automatic i18n key: `{entity}.{type}.{action}`
+
+For `ApproveParticipantAction` on `Participant` entity:
+
+[source,properties]
+----
+participant.button.approve=Approve
+----
+
+Override with:
+
+[source,java]
+----
+@Override
+public String getElementName() {
+    return "custom.button.label";
+}
+----
+
+== Advanced Features
+
+=== Redirects
+
+Redirect after action execution:
+
+[source,java]
+----
+@Override
+protected EntityAction<Client, ApplicationForm> action() {
+    return when(c -> true)
+        .then((client, form, user) -> {
+            UUID applicationId = applicationService.create(client, form);
+            
+            // Redirect to created application
+            setRedirectToPath(ApplicationController.PATH + "/" + applicationId);
+        });
+}
+----
+
+**Redirect methods:**
+
+- `setRedirectToEntity(id)` - Redirect to entity view page
+- `setRedirectToPath(path)` - Redirect to custom path
+- No redirect = stay on current page (default)
+
+=== Custom Alerts
+
+Override alert messages:
+
+[source,java]
+----
+@Override
+public String[] getAlertMessages() {
+    return new String[] {
+        "credit.close.success",      // Specific message
+        "credit.operation.success",  // Fallback
+        "entity.save"                // Generic fallback
+    };
+}
+----
+
+Framework tries messages in order until one is found.
+
+=== Complex Availability
+
+Inject services for complex checks:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/register-payment")
+public class RegisterPaymentAction extends EntityActionController<...> {
+
+    @Autowired
+    private CreditPaidLabel creditPaidLabel;
+
+    @Override
+    protected EntityAction<ExampleCredit, PaymentForm> action() {
+        return when((credit, user) -> {
+            // Check credit state
+            if (credit.getActualSnapshot() == null) return false;
+            if (!credit.getActualSnapshot().getStatus().equals(ACTIVE)) return false;
+            
+            // Check label
+            if (creditPaidLabel.isEntityMarked(credit)) return false;
+            
+            // Check user permission
+            return user.hasAuthority("PAYMENT_REGISTRATION");
+        })
+        .then((credit, form, user) -> {
+            // execute
+        });
+    }
+}
+----
+
+=== Loading Entity Data
+
+Use `loadEntity(id)` in `getActionTemplate()`:
+
+[source,java]
+----
+@Override
+protected String getActionTemplate(UUID id, Model model, String actionPath) {
+    ExampleCredit credit = loadEntity(id);
+    
+    // Use entity data
+    model.addAttribute("creditNumber", credit.getNumber());
+    model.addAttribute("balance", credit.getOutstandingBalance());
+    
+    return "/credit/action/template";
+}
+----
+
+`loadEntity()` returns JPA reference (lazy loading).
+
+=== Security
+
+Security is automatic:
+
+[source,java]
+----
+@PreAuthorize("hasRole(this.role)")  // Added automatically
+public Redirect submit(@PathVariable ID id, @Valid @ModelAttribute F form, ...) {
+    // ...
+}
+----
+
+**Role format:** `{ENTITY}_{TYPE}_{ACTION}`
+
+Example: `PARTICIPANT_BUTTON_APPROVE`
+
+Configure in security setup:
+
+[source,java]
+----
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(auth -> auth
+        .requestMatchers("/participant/*/approve").hasRole("PARTICIPANT_BUTTON_APPROVE")
+        // ...
+    );
+}
+----
+
+=== Transaction and Locking
+
+Actions run in transaction with pessimistic write lock:
+
+[source,java]
+----
+@Transactional(rollbackFor = ValidationException.class)
+public <ID, E extends Persistable<ID>, F> boolean performAction(...) {
+    E entity = LockUtils.lock(entityId, entityClass, 
+                              LockModeType.PESSIMISTIC_WRITE, 
+                              entityManager);
+    // ...
+}
+----
+
+This prevents concurrent modifications automatically.
+
+== Real Examples
+
+=== Create Related Entity
+
+Create application from client page:
+
+[source,java]
+----
+public class CreateApplicationAction 
+    extends EntityActionController<UUID, Client, ApplicationForm> {
+
+    @Override
+    protected EntityAction<Client, ApplicationForm> action() {
+        return when(c -> true)
+            .then((client, form, user) -> {
+                Application application = mapper.createEntity(form);
+                UUID applicationId = applicationService.createApplication(client, application);
+                setRedirectToPath(ApplicationController.PATH + "/" + applicationId);
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(UUID id, Model model, String actionPath) {
+        model.addAttribute("form", new ApplicationForm());
+        model.addAttribute("employmentTypes", Employment.values());
+        return "/application/edit";
+    }
+}
+----
+
+Key: redirect to created entity with `setRedirectToPath()`.
+
+=== Register Payment
+
+Complex form with multiple fields:
+
+[source,java]
+----
+public class RegisterPaymentAction 
+    extends EntityActionController<UUID, ExampleCredit, ManualTransferForm> {
+
+    @Override
+    protected EntityAction<ExampleCredit, ManualTransferForm> action() {
+        return when(c -> c.getActualSnapshot().getStatus().equals(ACTIVE))
+            .then((credit, form, user) -> {
+                LiquidityClientPaymentMethod paymentMethod = 
+                    new LiquidityClientPaymentMethod(
+                        form.getProcessedDate(), 
+                        form.getAmount(), 
+                        TransactionType.INCOMING,
+                        credit.getClient().getFullName()
+                    );
+                transactionService.proceedCustom(credit, paymentMethod, form.getDescription());
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(UUID id, Model model, String actionPath) {
+        ExampleCredit credit = loadEntity(id);
+        ManualTransferForm form = new ManualTransferForm();
+        form.setProcessedDate(LocalDate.now());
+        model.addAttribute("form", form);
+        model.addAttribute("minDate", credit.getStartDate());
+        model.addAttribute("currencies", List.of(credit.getCurrency()));
+        return "/credit/action/register-payment";
+    }
+
+    public static class ManualTransferForm {
+        @NotNull @Positive
+        private MonetaryAmount amount;
+
+        @NotNull @DateTimeFormat(pattern = PATTERN_DATEPICKER_FORMAT)
+        private LocalDate processedDate;
+
+        private String description;
+        // getters/setters
+    }
+}
+----
+
+Key: pre-fill form with defaults, pass supporting data to template.
+
+=== Change Payment Date
+
+Action on related entity (payment, not credit):
+
+[source,java]
+----
+public class ChangePaymentDateAction 
+    extends EntityActionController<UUID, CreditPayment, ChangePaymentDateForm> {
+
+    @Override
+    protected EntityAction<CreditPayment, ChangePaymentDateForm> action() {
+        return when(p -> !p.isPaid())
+            .then((payment, form, user) -> {
+                paymentService.changeDate(payment, form.getNewDate());
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(UUID id, Model model, String actionPath) {
+        CreditPayment payment = loadEntity(id);
+        ChangePaymentDateForm form = new ChangePaymentDateForm();
+        form.setNewDate(payment.getDate());  // Pre-fill with current value
+        model.addAttribute("form", form);
+        model.addAttribute("minDate", payment.getCredit().getStartDate());
+        return "/credit/action/change-payment-date";
+    }
+
+    public static class ChangePaymentDateForm {
+        @NotNull @DateTimeFormat(pattern = PATTERN_DATEPICKER_FORMAT)
+        private LocalDate newDate;
+        // getters/setters
+    }
+}
+----
+
+Key: works on any entity type, pre-fill form with current values.
+
+== Common Patterns
+
+=== Confirmation Dialog
+
+Simple yes/no confirmation:
+
+[source,html]
+----
+<form th:action="@{${actionPath}}" method="post" class="modal-form"
+      th:data-title="#{action.confirm}">
+  <div class="form-body">
+    <p th:text="#{action.confirm.message}">Are you sure?</p>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+    <button type="submit" class="btn btn-danger">Confirm</button>
+  </div>
+</form>
+----
+
+=== Date Selection
+
+[source,html]
+----
+<th:block th:insert="~{/form/components :: date (
+    #{label.date}, 
+    'date', 
+    'v-required'
+)}" th:with="minDate = ${minDate}, maxDate = ${maxDate}"/>
+----
+
+=== Amount Input
+
+[source,html]
+----
+<th:block th:insert="~{/form/components :: money (
+    #{label.amount}, 
+    'amount', 
+    'v-required v-positive',
+    ${currencies}
+)}"/>
+----
+
+=== Dropdown Selection
+
+[source,html]
+----
+<th:block th:insert="~{/form/components :: select (
+    #{label.type}, 
+    'type', 
+    'v-required',
+    ${types}
+)}"/>
+----
+
+== Troubleshooting
+
+**Button doesn't appear?**
+
+1. Check `when()` condition returns `true`
+2. Verify `@RequestMapping` path is unique
+3. Check entity controller path is registered
+4. Verify security role is granted
+
+**Form validation fails?**
+
+1. Check form field names match template
+2. Verify `@DateTimeFormat` pattern matches
+3. Check `@Valid` annotation on controller method
+4. Review validation error messages in UI
+
+**Action doesn't execute?**
+
+1. Check `when()` condition at runtime
+2. Verify no `ValidationException` thrown
+3. Check transaction rollback in logs
+4. Verify pessimistic lock isn't timing out
+
+**Wrong redirect?**
+
+1. Check `setRedirectToPath()` is called in `then()`
+2. Verify path is correct
+3. Check `redirectLocation()` override
+
+---
+
+**Related:** <<getting-started>>, <<form-classes-setup-and-usage>>, <<entity-checkers-setup-and-usage>>
+
+**Next:** <<workflow-integration>>, <<credit-operations-framework>>

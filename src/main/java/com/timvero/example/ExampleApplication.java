@@ -17,10 +17,10 @@ public class ExampleApplication {
                 .web(WebApplicationType.NONE);
         parentBuilder.run(args);
         parentBuilder.child(WebMvcConfig.class, CustomWebConfiguration.class)
-            .properties("server.port=8081")
+        .properties("spring.config.name=main")    .properties("spring.config.name=main")
             .run(args);
         parentBuilder.child(PortalWebConfiguration.class)
-            .properties("server.port=8082")
+        .properties("spring.config.name=portal")
             .run(args);
 
         parentBuilder.child(ExternalProcessWebMvcConfig.class)
