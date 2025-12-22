@@ -5,98 +5,34 @@ The `HasNotes` interface allows any entity to have associated notes and comments
 
 == How It Works
 
+If your entity already has a dedicated view page with `ViewableFilterController`, you can add Notes functionality by simply implementing the `HasNotes` interface - the Notes UI will appear automatically.
+
 The integration happens in three layers:
 
-1. **Entity Level** - Implement `HasNotes` interface
-2. **Controller Level** - Extend `ViewableFilterController` (no additional code needed)
-3. **Template Level** - Framework automatically enables Notes UI
+1. **Entity Level** - Add `HasNotes` interface to existing entity
+2. **Controller Level** - Already extends `ViewableFilterController` (no changes needed)
+3. **Template Level** - Framework automatically enables Notes UI on the view page
 
-== Setup Steps
+== Setup
 
-=== 1. Entity Implementation
-
-Add `HasNotes interface` to your entity:
+Simply add `HasNotes` interface to your entity:
 
 [source,java]
 ----
 @Entity
-@Table
-@Audited
-public class Application extends AbstractAuditable implements NamedEntity, HasNotes {
-
-    @Column(nullable = false)
-    @Enumerated(STRING)
-    private ApplicationStatus status = ApplicationStatus.NEW;
-
-    // Other entity fields...
-
-    @Override
-    public String getDisplayedName() {
-        return getBorrowerParticipant().getDisplayedName();
-    }
+public class Application extends AbstractAuditable implements HasNotes {
+    // Your entity fields...
 }
 ----
 
-=== 2. Controller Implementation
-
-Your controller needs to extend the `ViewableFilterController` class and to override the `view.html` template.
-
-[source,java]
-----
-@Controller
-@RequestMapping(ApplicationController.PATH)
-@MenuItem(order = 5_100, name = "application")
-public class ApplicationController extends ViewableFilterController<UUID, Application, ApplicationFilter> {
-    public static final String PATH = "application";
-
-    @Override
-    protected String getViewPage() {
-        return "/application/view";
-    }
-}
-----
-
-=== 3. Template Integration
-
-The template automatically gets `notesEnabled` variable:
-
-[source,html]
-----
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml"
-    xmlns:th="http://www.thymeleaf.org">
-<body>
-    <div class="rui-page">
-        <div class="rui-page-content">
-            <div class="pumpkin-container d-flex">
-                <div class="pumpkin-container d-flex" th:data-notes-enabled="${notesEnabled}">
-                <!-- Notes UI will be automatically injected here by JavaScript -->
-                    <div class="d-flex composite-entity-page flex-column">
-                        <header
-                            class="entity__header entity__header-sticky bottom-shadow"
-                            th:if="${headerPage}"
-                            th:with="header=~{${headerPage}}"
-                        >
-                            <th:block th:replace="${header}"></th:block>
-                        </header>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-----
+Your controller should already extend `ViewableFilterController` - no additional code needed for Notes functionality.
 
 == What Happens Automatically
 
 When `ViewableFilterController` detects that your entity implements `HasNotes`:
 
 1. **Sets** `notesEnabled = true` in template model
-2. **Enables** Notes UI through `th:data-notes-enabled="${notesEnabled}"`
-3. **Provides** JavaScript integration for note operations
-
-The `ViewableFilterController` contains built-in classes (`ViewableFilterController$Note` and `ViewableFilterController$NoteChange`) that handle all Notes functionality.
+2. **Provides** JavaScript integration for note operations
 
 == Features You Get
 
