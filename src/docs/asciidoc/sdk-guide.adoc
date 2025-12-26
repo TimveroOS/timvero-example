@@ -55,9 +55,12 @@ This guide is organized into logical parts that build on each other:
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
 . **<<fast-search-system>>** - Unified search across all entities with Hibernate Search and Lucene
+. **<<counters>>** - Create dashboard counters and workflow statistics with Launchpad integration
+. **<<launchpad>>** - Integrate entities with unified workflow management and pending decisions
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
+. **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
 === PART III: BUSINESS LOGIC
 [start=11]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
@@ -103,6 +106,8 @@ include::_documents.adoc[leveloffset=+1]
 include::_document-templates.adoc[leveloffset=+1]
 
 include::_notifications.adoc[leveloffset=+1]
+
+include::_has-notes.adoc[leveloffset=+1]
 
 // PART III: BUSINESS LOGIC
 include::_entity-actions.adoc[leveloffset=+1]
