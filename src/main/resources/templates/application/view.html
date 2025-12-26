@@ -5,8 +5,8 @@
     <div class="rui-page">
         <div class="rui-page-content">
             <div class="pumpkin-container d-flex">
-                <div class="d-flex participants flex-column">
-                    <header class="participants__header bottom-shadow">
+                <div class="d-flex composite-entity-page flex-column">
+                    <header class="entity__header bottom-shadow">
                         <th:block th:replace="~{/application/header}"></th:block>
                     </header>
 
@@ -14,16 +14,11 @@
                         th:if="${tabs.primary.size() > 0}">
                         <div
                             class="article__header collapse-tabs d-flex justify-content-between align-items-center">
-                            <div
-                                class="header-left d-flex align-items-center">
+                            <div class="header-left">
                                 <p class="header__title">
                                     <span th:text="#{application.deal}"></span>
                                 </p>
                                 <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
-                            </div>
-                            <div
-                                class="header-right d-flex align-items-center">
-                                <div class="entity__actions"></div>
                             </div>
                         </div>
                         <th:block
@@ -47,11 +42,6 @@
                     th:data-url="*{'/collateral/' + id}"
                 ></article> */ -->
                 </div>
-                <!-- /* <div
-                id="view-notes-tab"
-                class="notes-wrapper tab-pane active"
-                th:data-url="@{${rootPath} + '/' + ${entity.id} + '/tab/notes'}"
-            ></div> */ -->
             </div>
         </div>
     </div>

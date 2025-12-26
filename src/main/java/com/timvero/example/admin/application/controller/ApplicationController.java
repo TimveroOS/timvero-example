@@ -18,4 +18,9 @@ public class ApplicationController extends ViewableFilterController<UUID, Applic
     protected String getViewPage() {
         return "/application/view";
     }
+
+    @Override
+    protected String getHeaderPage() {
+        return "/application/header";
+    }
 }

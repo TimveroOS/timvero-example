@@ -35,6 +35,7 @@ This SDK empowers developers to create financial applications through:
 * **Comprehensive Form System** - Handle complex forms with validation, nested components, and MapStruct mapping
 * **Credit Operations Framework** - Manage loan lifecycle with automated calculations, accruals, and payments
 * **Payment Transaction System** - Process real-world payments through multiple gateways with complete audit trails
+* **Entity Actions** - Add custom business actions as buttons: approve, close, register payment
 * **Entity Checkers** - Implement event-driven business rules that respond to data changes automatically
 
 For a complete working example, see the https://github.com/TimveroOS/timvero-example[timvero-example project^].
@@ -45,7 +46,7 @@ This guide is organized into logical parts that build on each other:
 
 === PART I: FOUNDATION
 . **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
-. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example  
+. **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE
@@ -54,12 +55,16 @@ This guide is organized into logical parts that build on each other:
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
 . **<<fast-search-system>>** - Unified search across all entities with Hibernate Search and Lucene
+. **<<counters>>** - Create dashboard counters and workflow statistics with Launchpad integration
+. **<<launchpad>>** - Integrate entities with unified workflow management and pending decisions
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
-. **<<entity-history>>** - Track and display entity changes with timeline views
+. **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
+=== PART III: BUSINESS LOGIC
 === PART III: BUSINESS LOGIC
 [start=12]
+. **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
@@ -87,6 +92,8 @@ include::_forms.adoc[leveloffset=+1]
 
 include::_form-templates.adoc[leveloffset=+1]
 
+include::_single-entity-layout.adoc[leveloffset=+1]
+
 include::_templates.adoc[leveloffset=+1]
 
 include::_fast-search.adoc[leveloffset=+1]
@@ -103,7 +110,11 @@ include::_notifications.adoc[leveloffset=+1]
 
 include::_history.adoc[leveloffset=+1]
 
+include::_has-notes.adoc[leveloffset=+1]
+
 // PART III: BUSINESS LOGIC
+include::_entity-actions.adoc[leveloffset=+1]
+
 include::_checkers.adoc[leveloffset=+1]
 
 include::_datasource.adoc[leveloffset=+1]

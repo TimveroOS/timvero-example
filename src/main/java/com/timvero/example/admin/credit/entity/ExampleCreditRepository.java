@@ -1,6 +1,7 @@
 package com.timvero.example.admin.credit.entity;
 
 import com.timvero.base.entity.SynchronousAccessRepository;
+import com.timvero.servicing.credit.entity.operation.CreditOperation;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -19,4 +20,5 @@ public interface ExampleCreditRepository extends JpaRepository<ExampleCredit, UU
         """)
     Stream<ExampleCredit> getAllByAdditiveId(Long additiveId);
 
+    ExampleCredit findByOperationsIn(CreditOperation... operation);
 }
