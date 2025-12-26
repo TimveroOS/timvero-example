@@ -12,7 +12,6 @@ The history system automatically tracks:
 * **Entity Creation** - When entities were created and by whom
 * **Field Changes** - What fields changed with before/after values
 * **Related Entities** - When related entities (comments, payments, etc.) were added
-* **Document Events** - Uploads, signatures, and deletions
 * **Custom Events** - Business-specific events tailored to your needs
 
 All events are displayed in a unified timeline with icons, dates, and user information.
@@ -21,11 +20,30 @@ All events are displayed in a unified timeline with icons, dates, and user infor
 
 To add history tracking to your entity:
 
-1. Annotate your entity with `@Audited`
-2. Create history suppliers extending base classes
-3. Add `EntityHistoryTabController` to display the timeline
+1. Create history suppliers extending base classes
+2. Add `EntityHistoryTabController` to display the timeline
+
+NOTE: Suppliers based on Envers audit tables (`AbstractAddedHistorySupplier`, `AbstractModifiedHistorySupplier`, and their related entity variants) require entities to be annotated with `@Audited`. Other suppliers (Credit, Custom) do not require this annotation.
 
 TIP: The framework provides base supplier classes for common scenarios. For business-specific events, implement custom suppliers.
+
+=== Creating History Tab
+
+To display history on an entity's detail page, create a controller extending `EntityHistoryTabController`:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/tab/ParticipantHistoryTab.java[tags=class]
+----
+
+Add tab label to i18n:
+
+[source,properties]
+----
+participant.tab.history=History
+----
+
+The History tab will automatically appear on entity detail pages with the timeline.
 
 == How It Works
 
@@ -60,21 +78,6 @@ The history module consists of several components working together:
 
 *Note:* You don't need to register your suppliers anywhere
 
-=== AuditService (Service)
-
-*What it is:* Low-level service for querying Hibernate Envers audit data.
-
-*What it does:*
-
-* Queries the audit tables created by Hibernate Envers
-* Returns revision history with before/after states of entities
-* Tracks which fields changed and their old/new values
-* Supports nested field paths (e.g., `"address.city"`)
-
-*When to use directly:* If you want to create a custom history supplier with your own logic, inject `AuditService` and use it to query audit data. The abstract supplier classes use this internally, so you typically don't need to call it directly unless you're implementing `HistoryEventSupplier` from scratch.
-
-*Note:* This service requires entities to be annotated with `@Audited`.
-
 === EntityHistoryTabController (Controller)
 
 *What it is:* Abstract controller for adding a History tab to entity detail pages.
@@ -107,12 +110,6 @@ The framework provides several types of history suppliers for different tracking
 
 |<<tracking-related-entity-changes,AbstractRelatedEntityModifiedHistorySupplier>>
 |Tracks field changes in a related entity
-
-|<<document-history,DocumentHistorySupplier>>
-|Automatically tracks document uploads
-
-|<<signable-document-history,SignableDocumentHistorySupplier>>
-|Tracks signable document lifecycle
 
 |<<credit-history,CreditPaymentHistorySupplier>>
 |Tracks credit payments and refunds
@@ -179,39 +176,6 @@ NOTE: All suppliers are automatically discovered by Spring when annotated with `
 
 *Template:* You provide custom template (e.g., `/history/fragments/comment`).
 
-=== DocumentHistorySupplier
-
-*Purpose:* Automatically tracks document uploads for entities with document management.
-
-*When to use:* Your entity implements `HasDocuments` interface.
-
-*What you provide:* Nothing - this is automatically registered as a Spring `@Component`.
-
-*What you get:* Automatic tracking of all document uploads with filename, size, and download links.
-
-*Template:* Uses standard `/history/fragments/entity_document` template.
-
-*Note:* This supplier works for ALL entities implementing `HasDocuments` - no code needed.
-
-=== SignableDocumentHistorySupplier
-
-*Purpose:* Tracks the complete lifecycle of signable documents (contracts, agreements, etc.).
-
-*When to use:* Your entity uses the signable document system.
-
-*What you provide:* Nothing - this is automatically registered as a Spring `@Component`.
-
-*What you get:* Four types of events:
-
-* *GENERATED* - Document generated from template
-* *UPLOADED* - New document version uploaded
-* *SIGNED* - Document signed
-* *DELETED* - Document removed
-
-*Template:* Uses standard `/history/fragments/signable_document` template.
-
-*Note:* This supplier works automatically for all signable documents - no code needed.
-
 [[tracking-entity-creation]]
 == Tracking Entity Creation
 
@@ -244,15 +208,8 @@ public class Participant extends AbstractAuditable {
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/participant/history/ParticipantAddedHistorySupplier.java[tags=!*]
+include::{sourcedir}/admin/participant/history/ParticipantAddedHistorySupplier.java[tags=class]
 ----
-
-Key components:
-
-* **`@Component`** - Enables Spring auto-discovery
-* **`Participant.class`** - The entity class being tracked
-* **`PARTICIPANT_CREATED`** - i18n key for the event type
-* **Constructor parameters** - That's all you need to configure!
 
 ==== 3. Add i18n Message
 
@@ -262,26 +219,6 @@ In `messages_en.properties`:
 ----
 history.type.PARTICIPANT_CREATED=Participant created
 ----
-
-==== 4. Create History Tab Controller
-
-To display the history on the Participant page, create a History tab:
-
-[source,java,indent=0]
-----
-include::{sourcedir}/admin/participant/tab/ParticipantHistoryTab.java[tags=!*]
-----
-
-=== What You Get
-
-When a Participant is created, the history timeline will show:
-
-* Icon: Plus symbol (ADD)
-* Event type: "Participant created" (from i18n)
-* Date: When the participant was created
-* User: Who created it
-
-The History tab will automatically appear on Participant detail pages with the timeline.
 
 [[tracking-field-changes]]
 == Tracking Field Changes
@@ -346,17 +283,10 @@ public class ContactInfo {
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/client/history/ClientModifiedHistorySupplier.java[tags=!*]
+include::{sourcedir}/admin/client/history/ClientModifiedHistorySupplier.java[tags=class]
 ----
 
-Key components:
-
-* **Constructor parameters** - Entity class and i18n event key
-* **`getTrackedFields()`** - Returns fields to monitor for changes
-* **JPA Metamodel constants** - Type-safe field references (e.g., `Client_.INDIVIDUAL_INFO`)
-* **Nested field support** - Use dot notation for embedded objects
-
-TIP: Always use JPA metamodel constants (classes ending with `_`) instead of hardcoded strings. This provides compile-time safety when refactoring field names.
+TIP: Use JPA metamodel constants (classes ending with `_`) instead of hardcoded strings for compile-time safety when refactoring.
 
 ==== 4. Add i18n Messages
 
@@ -375,32 +305,6 @@ client.contactInfo.phone=Phone
 ----
 
 The `history.type.*` key is for the event name. The `client.*` keys are for field labels shown in the changes table.
-
-==== 5. Create History Tab Controller
-
-To display the history on the Client page, create a History tab:
-
-[source,java,indent=0]
-----
-include::{sourcedir}/admin/client/tab/ClientHistoryTab.java[tags=!*]
-----
-
-Don't forget to add the tab label to i18n:
-
-[source,properties]
-----
-client.tab.history=History
-----
-
-=== What You Get
-
-When tracked fields in a Client are modified, the history timeline will show:
-
-* Icon: Edit symbol (MODIFY)
-* Event type: "Client modified" (from i18n)
-* Date: When the changes were made
-* User: Who made the changes
-* Table showing changed fields with old and new values
 
 [[tracking-related-entities]]
 == Tracking Related Entity Additions
@@ -460,18 +364,8 @@ public class Participant extends AbstractAuditable {
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/client/history/ClientParticipantCreatedEventSupplier.java[tags=!*]
+include::{sourcedir}/admin/client/history/ClientParticipantCreatedEventSupplier.java[tags=class]
 ----
-
-Key components:
-
-* **Parent entity class** - `Client.class` - the entity whose history you're tracking
-* **Related entity class** - `Participant.class` - the child entity being added
-* **Event type** - `"CLIENT_PARTICIPANT_CREATED"` - i18n key
-* **Template path** - Custom Thymeleaf template for rendering the event
-* **`getRelatedEntities()`** - Returns filtered collection of related entities
-
-In this example, we filter participants who are borrowers. The supplier creates one history event per related entity.
 
 ==== 3. Create Custom Template
 
@@ -508,16 +402,6 @@ history.type.CLIENT_PARTICIPANT_CREATED=Participant added
 # Template labels
 history.participant.created=Participant added
 ----
-
-=== What You Get
-
-When a Participant is added to a Client (excluding borrowers), the Client's history timeline will show:
-
-* Icon: Plus symbol (ADD)
-* Event type: "Participant added" (from i18n)
-* Date: When the participant was created
-* User: Who created it
-* Custom content: Link to the participant with their name
 
 [[tracking-related-entity-changes]]
 == Tracking Related Entity Field Changes
@@ -575,18 +459,8 @@ public class Application extends AbstractAuditable {
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/participant/history/ParticipantApplicationStatusChangedHistorySupplier.java[tags=!*]
+include::{sourcedir}/admin/participant/history/ParticipantApplicationStatusChangedHistorySupplier.java[tags=class]
 ----
-
-Key components:
-
-* **Parent entity type parameters** - `<UUID, Participant, ...>` - the root entity whose history you're tracking
-* **Related entity type parameters** - `<..., UUID, Application>` - the related entity whose fields are being tracked
-* **Constructor parameters** - Parent class, related class, and i18n event key
-* **`getTrackedFields()`** - Returns fields to monitor in the related entity
-* **`getRelatedEntity()`** - Returns the related entity from the parent entity
-
-TIP: Use JPA metamodel constants (e.g., `Application_.STATUS`) for type-safe field references.
 
 ==== 3. Add i18n Messages
 
@@ -603,153 +477,6 @@ application.status=Application Status
 
 The field labels follow the pattern: `{table_name}.{field_name}` where table_name comes from `@Table(name = "application")`.
 
-==== 4. Create History Tab Controller (if not already present)
-
-If you haven't created a History tab for Participant yet:
-
-[source,java,indent=0]
-----
-include::{sourcedir}/admin/participant/tab/ParticipantHistoryTab.java[tags=!*]
-----
-
-Add tab label to i18n:
-
-[source,properties]
-----
-participant.tab.history=History
-----
-
-=== What You Get
-
-When the Application status changes, the Participant's history timeline will show:
-
-* **Icon** - Edit symbol (MODIFY)
-* **Event type** - "Application status changed" (from i18n)
-* **Date** - When the status was changed
-* **User** - Who changed the status
-* **Table** - Showing the field name, old value, and new value
-
-The event appears in the Participant's history even though the change was made to the Application entity.
-
-=== How It Works Internally
-
-The supplier:
-
-1. Queries the audit history of the *related entity* (Application)
-2. Filters for changes to the tracked fields only (status)
-3. Returns events that are displayed in the *parent entity's* (Participant) timeline
-4. Uses the standard `/history/fragments/modified` template
-
-This is different from `AbstractModifiedHistorySupplier` which tracks changes to the root entity itself.
-
-TIP: You can track multiple fields by adding more field names to `getTrackedFields()`. Each change creates a separate event showing all modified fields in that revision.
-
-[[document-history]]
-== Automatic Document History
-
-`DocumentHistorySupplier` automatically tracks document uploads for entities with document management.
-
-TIP: This supplier works out of the box - no code needed. Just implement `HasDocuments` interface.
-
-=== How It Works
-
-If your entity implements the `HasDocuments` interface, document uploads are automatically tracked in history.
-
-The framework automatically:
-
-* Detects all entities implementing `HasDocuments`
-* Tracks when documents are uploaded
-* Shows document filename, size, and download link in history
-* Uses standard template `/history/fragments/entity_document`
-
-=== What You Need
-
-1. Entity implements `HasDocuments` interface
-2. That's it! No supplier code needed.
-
-=== Example
-
-[source,java]
-----
-@Entity
-@Table(name = "participant")
-@Audited
-public class Participant extends AbstractAuditable implements HasDocuments {
-
-    @OneToMany(mappedBy = "participant")
-    private List<EntityDocument> documents;
-
-    @Override
-    public List<EntityDocument> getDocuments() {
-        return documents;
-    }
-}
-----
-
-When you upload a document to a Participant, the history timeline automatically shows:
-
-* **Icon** - Document symbol
-* **Event type** - Document type name
-* **Date** - When the document was uploaded
-* **User** - Who uploaded it
-* **Document details** - Filename, size, download link
-
-NOTE: No configuration needed - works automatically for all entities implementing `HasDocuments`.
-
-[[signable-document-history]]
-== Automatic Signable Document History
-
-`SignableDocumentHistorySupplier` automatically tracks the complete lifecycle of signable documents (contracts, agreements, etc.).
-
-TIP: This supplier works out of the box - no code needed. The system automatically tracks all signable document events.
-
-=== How It Works
-
-If your entity uses the signable document system, the entire document lifecycle is automatically tracked.
-
-The framework automatically tracks four types of events:
-
-* *GENERATED* - Document generated from template
-* *UPLOADED* - New document version uploaded
-* *SIGNED* - Document signed by a party
-* *DELETED* - Document removed
-
-=== What You Need
-
-1. Entity uses signable document system
-2. That's it! No supplier code needed.
-
-=== Example
-
-When working with signable documents on Application entity:
-
-[source,java]
-----
-@Entity
-@Table(name = "application")
-@Audited
-public class Application extends AbstractAuditable {
-    // Signable document system is configured
-}
-----
-
-The history timeline automatically shows:
-
-* **Document Generated** - "Application Form generated"
-* **Document Uploaded** - "New version of Application Contract uploaded"
-* **Document Signed** - "Application Contract signed by John Doe"
-* **Document Deleted** - "Application Form deleted"
-
-Each event includes:
-
-* **Icon** - Appropriate symbol for the action
-* **Document type** - e.g., "Application Form", "Application Contract"
-* **Date** - When the action occurred
-* **User** - Who performed the action
-* **Download link** - For accessing the document
-
-NOTE: No configuration needed - works automatically for all signable documents.
-
 [[credit-history]]
 == Credit History Tracking
 
@@ -763,22 +490,8 @@ Abstract supplier that tracks credit payment and refund operations. Extend this 
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/credit/history/ExampleCreditPaymentHistorySupplier.java[tags=!*]
+include::{sourcedir}/admin/credit/history/ExampleCreditPaymentHistorySupplier.java[tags=class]
 ----
-
-Key components:
-
-* **Extends `CreditPaymentHistorySupplier`** - Pre-configured for payment tracking
-* **`@Component`** - Enables Spring auto-discovery
-* **Event type** - `CREDIT_PAYMENT` is predefined
-* **Template** - Uses standard `/history/fragments/credit_payment` template
-
-==== What It Tracks
-
-* **Payment events** - When payments are registered
-* **Refund events** - When refunds are processed
-* **Payment amount** - Amount of each payment/refund
-* **Operation type** - Distinguishes between PAYMENT and REFUND
 
 ==== Add i18n
 
@@ -797,21 +510,8 @@ Abstract supplier that tracks changes to the Credit's `actualSnapshot` field. Us
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/credit/history/ExampleCreditStatusChangedHistorySupplier.java[tags=!*]
+include::{sourcedir}/admin/credit/history/ExampleCreditStatusChangedHistorySupplier.java[tags=class]
 ----
-
-Key components:
-
-* **Extends `CreditActualSnapshotHistorySupplier`** - Monitors snapshot changes
-* **`getEventPage()`** - Returns path to custom template
-* **`getEventTitle()`** - Returns event type for i18n
-* **`shouldCreateHistoryEvent()`** - Determines when to create events
-
-In this example:
-
-* Monitors `actualSnapshot.status` changes
-* Creates event only when status actually changes
-* Uses custom template to display old and new status
 
 ==== Create Custom Template
 
@@ -856,34 +556,6 @@ You can track other snapshot changes by implementing different logic in `shouldC
 
 TIP: The `CreditSnapshot` contains all credit calculation data at a point in time. You can track any field changes by comparing before/after snapshots.
 
-==== Create History Tab
-
-To display credit history, create a tab controller:
-
-[source,java,indent=0]
-----
-include::{sourcedir}/admin/credit/tab/CreditHistoryTab.java[tags=!*]
-----
-
-Add tab label to i18n:
-
-[source,properties]
-----
-credit.tab.history=History
-----
-
-=== What You Get
-
-When viewing credit history, the timeline shows:
-
-* **Payment events** - With amounts and operation type (PAYMENT/REFUND)
-* **Status changes** - New credit status
-* **Icon** - Appropriate symbol for each event type
-* **Date** - When the event occurred
-* **User** - Who performed the action
-
-NOTE: Both suppliers work independently. Create as many `CreditActualSnapshotHistorySupplier` extensions as needed to track different snapshot changes.
-
 [[custom-history-supplier]]
 == Custom History Supplier
 
@@ -910,35 +582,10 @@ Use a custom supplier when you need to:
 
 [source,java,indent=0]
 ----
-include::{sourcedir}/admin/participant/history/ParticipantProcessExecutionsHistorySupplier.java[tags=!*]
+include::{sourcedir}/admin/participant/history/ParticipantProcessExecutionsHistorySupplier.java[tags=class]
 ----
 
-Key components:
-
-* **`implements HistoryEventSupplier`** - Direct interface implementation for full control
-* **Service injection** - Use `@Autowired` to inject business services
-* **`getRootClass()`** - Returns the entity class this supplier handles
-* **`getEventPage()`** - Returns path to your custom template
-* **`getHistoryEvents()`** - Queries data and creates custom events
-
-In this example:
-
-* Injects `ProcessExecutionService` and `DecisionFactService` for data access
-* Filters executions by status (only COMPLETED)
-* Fetches decision facts for each execution and groups them by value
-* Creates custom events with `ProcessExecution` and decision facts
-
-TIP: Use custom suppliers when you need to combine data from multiple services or apply complex business logic that doesn't fit the abstract suppliers.
-
-==== 2. Create Custom Event Class
-
-The custom event class holds your business-specific data:
-
-* Extends `HistoryEvent` (provides icon, type, date, auditor)
-* Adds `processExecution` field
-* Adds `decisionFacts` map for grouped facts
-
-==== 3. Create Custom Template
+==== 2. Create Custom Template
 
 Create a Thymeleaf template at `/history/fragments/participant/participant_process_execution.html`:
 
@@ -947,12 +594,7 @@ Create a Thymeleaf template at `/history/fragments/participant/participant_proce
 include::{templatedir}/history/fragments/participant/participant_process_execution.html[]
 ----
 
-The template has access to `event` with your custom fields:
-
-* `event.processExecution` - the ProcessExecution object
-* `event.decisionFacts` - the decision facts map
-
-==== 4. Add i18n Messages
+==== 3. Add i18n Messages
 
 In `messages_en.properties`:
 
@@ -965,13 +607,3 @@ history.type.PARTICIPANT_PROCESS_EXECUTION=Decision tree executed
 history.participant.process.execution=Decision tree executed
 history.participant.process.execution.facts=Decision facts
 ----
-
-=== What You Get
-
-When a process execution completes for a Participant, the history timeline will show:
-
-* Icon: Edit symbol (EDIT)
-* Event type: "Decision tree executed"
-* Date: When the process was created
-* Process name: Name of the executed process
-* Decision facts: Grouped by value with fact codes

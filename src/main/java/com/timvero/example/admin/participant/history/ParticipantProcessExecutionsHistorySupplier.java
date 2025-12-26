@@ -17,6 +17,7 @@ import java.util.stream.Collectors;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+// tag::class[]
 @Component
 public class ParticipantProcessExecutionsHistorySupplier implements
     HistoryEventSupplier<Participant, ParticipantProcessExecutionsHistorySupplier.ParticipantProcessExecutionHistoryEvent> {
@@ -85,3 +86,4 @@ public class ParticipantProcessExecutionsHistorySupplier implements
         }
     }
 }
+// end::class[]

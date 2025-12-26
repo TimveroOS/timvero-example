@@ -4,6 +4,7 @@ import com.timvero.servicing.credit.entity.CreditSnapshot;
 import com.timvero.servicing.credit.history.CreditActualSnapshotHistorySupplier;
 import org.springframework.stereotype.Component;
 
+// tag::class[]
 @Component
 public class ExampleCreditStatusChangedHistorySupplier extends CreditActualSnapshotHistorySupplier {
 
@@ -24,3 +25,4 @@ public class ExampleCreditStatusChangedHistorySupplier extends CreditActualSnaps
         return !beforeSnapshot.getStatus().equals(afterSnapshot.getStatus());
     }
 }
+// end::class[]

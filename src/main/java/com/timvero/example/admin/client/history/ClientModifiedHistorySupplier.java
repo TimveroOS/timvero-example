@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
 
+// tag::class[]
 @Component
 public class ClientModifiedHistorySupplier extends AbstractModifiedHistorySupplier<UUID, Client> {
 
@@ -28,3 +29,4 @@ public class ClientModifiedHistorySupplier extends AbstractModifiedHistorySuppli
         );
     }
 }
+// end::class[]

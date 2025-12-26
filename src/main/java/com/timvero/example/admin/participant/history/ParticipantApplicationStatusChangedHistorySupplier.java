@@ -8,6 +8,7 @@ import java.util.Set;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
 
+// tag::class[]
 @Component
 public class ParticipantApplicationStatusChangedHistorySupplier
     extends AbstractRelatedEntityModifiedHistorySupplier<UUID, Participant, UUID, Application> {
@@ -28,3 +29,4 @@ public class ParticipantApplicationStatusChangedHistorySupplier
         return participant.getApplication();
     }
 }
+// end::class[]

@@ -5,6 +5,7 @@ import com.timvero.example.admin.participant.entity.Participant;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
 
+// tag::class[]
 @Component
 public class ParticipantAddedHistorySupplier extends AbstractAddedHistorySupplier<UUID, Participant> {
 
@@ -14,3 +15,4 @@ public class ParticipantAddedHistorySupplier extends AbstractAddedHistorySupplie
         super(Participant.class, PARTICIPANT_CREATED);
     }
 }
+// end::class[]

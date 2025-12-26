@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
 
+// tag::class[]
 @Component
 public class ClientParticipantCreatedEventSupplier
     extends AbstractRelatedEntityAddedHistorySupplier<Client, UUID, Participant> {
@@ -30,3 +31,4 @@ public class ClientParticipantCreatedEventSupplier
             .toList();
     }
 }
+// end::class[]
