@@ -2,6 +2,7 @@ package com.timvero.example.admin.participant.form;
 
 import com.timvero.example.admin.participant.entity.Employment;
 import com.timvero.example.admin.participant.entity.Periodicity;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import javax.money.MonetaryAmount;
 
@@ -20,6 +21,7 @@ public class ParticipantForm {
     private MonetaryAmount monthlyOutgoings;
     // end::participant-form[]
 
+    @NotBlank
     private String githubUsername;
 
     public Employment getEmployment() {

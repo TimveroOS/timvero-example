@@ -4,7 +4,7 @@
 <body>
     <div class="rui-page">
         <div class="rui-page-content">
-            <div class="pumpkin-container d-flex">
+            <div class="pumpkin-container d-flex" th:data-notes-enabled="${notesEnabled}">
                 <div class="d-flex composite-entity-page flex-column">
                     <header class="entity__header bottom-shadow">
                         <th:block th:replace="~{/application/header}"></th:block>
