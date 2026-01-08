@@ -7,7 +7,7 @@
             <span th:unless="${entity.client}" th:text="${entity.displayedName}"></span>
             <span th:if="${entity.client}" th:href="@{'/client/' + ${entity.client.id}}" target="_blank"
                   th:text="${entity.displayedName}"></span>
-            <th:block th:insert="~{/templates/copyButton :: copyButton('Copy ID', ${entity.id})}" />
+            <th:block th:insert="~{/templates/copyButton :: copyButton(#{common.copy.id}, ${entity.id})}" />
         </p>
         <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
     </div>

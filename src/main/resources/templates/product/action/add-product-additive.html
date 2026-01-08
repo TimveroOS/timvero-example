@@ -3,50 +3,46 @@
 <form
     th:action="@{${actionPath}}"
     method="post"
-    class="modal-form"
     th:data-title="#{additive.title.add}"
     id="additive"
     th:object="${form}"
 >
     <div class="form-body">
-        <div class="form__container">
+        <input type="hidden" name="product" th:value="${productId}">
 
-            <input type="hidden" name="product" th:value="${productId}">
+        <input type="hidden" th:field="*{additiveId}">
 
-            <input type="hidden" th:field="*{additiveId}">
+        <th:block
+            th:insert="~{/form/components :: text(#{additive.name}, 'name', 'v-required')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{additive.minAmount}, 'minAmount', 'v-required app_decimal')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{additive.maxAmount}, 'maxAmount', 'v-required app_decimal')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{additive.minTerm}, 'minTerm', 'v-required app_decimal')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{additive.maxTerm}, 'maxTerm', 'v-required app_decimal')}"/>
+        <th:block
+            th:insert="~{/form/components :: text(#{additive.interestRate}, 'interestRate', 'v-required app_decimal')}"/>
 
-            <th:block
-                th:insert="~{/form/components :: text(#{additive.name}, 'name', 'v-required')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{additive.minAmount}, 'minAmount', 'v-required app_decimal')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{additive.maxAmount}, 'maxAmount', 'v-required app_decimal')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{additive.minTerm}, 'minTerm', 'v-required app_decimal')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{additive.maxTerm}, 'maxTerm', 'v-required app_decimal')}"/>
-            <th:block
-                th:insert="~{/form/components :: text(#{additive.interestRate}, 'interestRate', 'v-required app_decimal')}"/>
-
-            <th:block
-                th:each="engineType : ${offerEngineTypes}"
-                th:with="descriptors=${offerEngineDescriptors.get(engineType)}"
-            >
-                <th:block
-                    th:with="emptyOption = true, selectClassName = 'v-required'"
-                    th:insert="~{/form/components :: select(
-                        '__#{credit.product.additive.offerEngineDescriptor(${engineType.name})}__',
-                        'offerEngines[\'' + ${engineType} + '\']', ${descriptors})}"
-                ></th:block>
-            </th:block>
-
+        <th:block
+            th:each="engineType : ${offerEngineTypes}"
+            th:with="descriptors=${offerEngineDescriptors.get(engineType)}"
+        >
             <th:block
                 th:with="emptyOption = true, selectClassName = 'v-required'"
-                th:insert="~{/form/components :: select(#{credit.product.procuring}, 'procuringType', ${procuringTypes})}"/>
-        </div>
+                th:insert="~{/form/components :: select(
+                    '__#{credit.product.additive.offerEngineDescriptor(${engineType.name})}__',
+                    'offerEngines[\'' + ${engineType} + '\']', ${descriptors})}"
+            ></th:block>
+        </th:block>
+
+        <th:block
+            th:with="emptyOption = true, selectClassName = 'v-required'"
+            th:insert="~{/form/components :: select(#{credit.product.procuring}, 'procuringType', ${procuringTypes})}"/>
     </div>
 
-    <div class="modal-footer">
+    <div class="form__actions">
         <button
             type="button"
             class="btn btn-secondary"

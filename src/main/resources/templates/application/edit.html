@@ -2,14 +2,13 @@
     xmlns:th="http://www.thymeleaf.org">
 <form
     th:data-page-title="${isCreate} ? #{application.new} : #{application.edit}"
-    autocomplete="off" class="modal-form" th:action="@{${actionPath}}"
+    autocomplete="off" th:action="@{${actionPath}}"
     th:object="${form}">
     <th:block th:insert="~{/form/loader :: formLoader}" />
 
     <div class="form-body">
         <!-- tag::application-form-fields[] -->
-        <h2 th:text="#{application.borrowerInfo}">Borrower
-            Information</h2>
+        <h4 th:text="#{application.borrowerInfo}">Borrower Information</h4>
         <th:block
             th:insert="~{/form/components :: select(#{participant.employment},
                 'borrowerParticipant.employment', ${employmentTypes})}" />
@@ -17,8 +16,7 @@
             th:insert="~{/form/components :: select(#{participant.howOftenIncomeIsPaid},
                 'borrowerParticipant.howOftenIncomeIsPaid', ${periodicities})}" />
 
-        <h2 class="mt-10" th:text="#{participant.financialInfo}">Financial
-            Information</h2>
+        <h4 th:text="#{participant.financialInfo}">Financial Information</h4>
         <th:block
             th:insert="~{/form/components :: amount(#{participant.totalAnnualIncome},
                 'borrowerParticipant.totalAnnualIncome', 'v-required')}" />
@@ -31,12 +29,14 @@
                 'borrowerParticipant.githubUsername', 'v-required')}" />
     </div>
 
-    <div class="modal-footer">
-        <button type="button" class="btn btn-secondary"
-            data-dismiss="modal" th:text="#{button.close}">
-            Close</button>
-        <button type="submit" class="btn btn-success"
-            th:text="#{button.save}">Save</button>
+    <div class="form__actions">
+        <div class="ml-auto">
+            <button type="button" class="btn btn-secondary"
+                data-dismiss="modal" th:text="#{button.close}">
+                Close</button>
+            <button type="submit" class="btn btn-success"
+                th:text="#{button.save}">Save</button>
+        </div>
     </div>
 </form>
 </html>
