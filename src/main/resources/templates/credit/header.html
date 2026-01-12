@@ -7,7 +7,7 @@
         <li class="card-info__item d-flex">
           <span class="card-info__property" th:text="#{credit.application}"></span>
           <span class="card-info__value">
-            <a th:href="@{*{application}}">link</a>
+            <a th:href="@{*{@pathRegistry.getPath(application)}}">link</a>
           </span>
         </li>
         <li class="card-info__item d-flex">
