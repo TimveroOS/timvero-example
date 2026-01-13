@@ -1,0 +1,449 @@
+= Credit Accruals Tab Integration
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This document describes how to integrate the Credit Accruals Tab into your credit management system. The Accruals Tab displays detailed information about interest and fee accruals for credit entities.
+
+== Overview
+
+The `CreditAccrualsTab` provides a dedicated interface for viewing accrual history and calculations for credit accounts. It displays:
+
+* Daily interest accruals
+* Fee accruals
+* Accrual calculation history
+* Account-specific accrual breakdowns
+* Timeline of accrual events
+
+This tab extends the abstract base class `AbstractCreditAccrualsTab` from the loan servicing framework, which provides core accrual display functionality.
+
+== Implementation
+
+=== Basic Tab Controller
+
+The simplest implementation requires only extending the abstract base class and configuring the Spring annotations:
+
+[source,java]
+----
+include::{sourcedir}/credit/tab/CreditAccrualsTab.java[lines=1..14]
+----
+
+Key configuration elements:
+
+* **`@RequestMapping("/credit-accruals")`** - Defines the URL path for the tab. The tab will be accessible at `/credit/{id}/credit-accruals`
+* **`@Controller`** - Marks this as a Spring MVC controller
+* **`@Order(10002)`** - Determines the tab's position in the navigation. Higher numbers appear later in the tab list
+* **`AbstractCreditAccrualsTab<ExampleCredit>`** - Generic type parameter specifies which credit entity type this tab handles
+
+=== Integration Steps
+
+To add the Credit Accruals Tab to your project:
+
+==== Step 1: Create the Tab Controller
+
+Create a new controller class that extends `AbstractCreditAccrualsTab`:
+
+[source,java]
+----
+package com.yourcompany.yourapp.admin.credit.tab;
+
+import com.yourcompany.yourapp.admin.credit.entity.YourCredit;
+import com.timvero.servicing.credit.tab.AbstractCreditAccrualsTab;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.RequestMapping;
+
+@RequestMapping("/credit-accruals")
+@Controller
+@Order(10002)  // Adjust order as needed
+public class CreditAccrualsTab extends AbstractCreditAccrualsTab<YourCredit> {
+    // No additional implementation needed for basic functionality
+}
+----
+
+== Customization Options
+
+=== Overriding Visibility
+
+Control when the tab is visible by overriding the `isVisible()` method:
+
+[source,java]
+----
+@RequestMapping("/credit-accruals")
+@Controller
+@Order(10002)
+public class CreditAccrualsTab extends AbstractCreditAccrualsTab<ExampleCredit> {
+
+    @Override
+    public boolean isVisible(ExampleCredit credit) {
+        // Only show tab if credit has accruals
+        return credit.getCalculationDate() != null
+            && hasAccruals(credit);
+    }
+
+    private boolean hasAccruals(ExampleCredit credit) {
+        return credit.getActualSnapshot() != null
+            && !credit.getActualSnapshot().getDebt().isEmpty();
+    }
+}
+----
+
+=== Custom Data Preparation
+
+Add custom data to the tab by overriding `getTabTemplate()`:
+
+[source,java]
+----
+@RequestMapping("/credit-accruals")
+@Controller
+@Order(10002)
+public class CreditAccrualsTab extends AbstractCreditAccrualsTab<ExampleCredit> {
+
+    @Autowired
+    private AccrualService accrualService;
+
+    @Override
+    protected String getTabTemplate(UUID id, Model model) throws Exception {
+        ExampleCredit credit = loadEntity(id);
+
+        // Add custom data
+        model.addAttribute("accrualRate", credit.getCondition().getInterestRate());
+
+        return super.getTabTemplate(id, model);
+    }
+}
+----
+
+==== Add Templates (Optional)
+
+If you need to customize the tab's appearance, create a Thymeleaf template at:
+
+----
+src/main/resources/templates/credit/tab/credit-accruals.html
+----
+
+Example:
+
+[source,html]
+----
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+<div class="tab-content">
+  <h3 th:text="#{credit.accruals.title}">Accruals</h3>
+  <div th:each="accrualEntry, iterStat : ${accruals}">
+    <div class="ca-summary-cell" th:text="${#enums.name('debt.account', accrualEntry.key)}">Interest</div>
+    <div class="ca-summary-cell" th:text="${#monetary.format(totals.get(accrualEntry.key))}">EUR 32.61</div>
+    <table class="table">
+      <thead>
+      <tr>
+        <th th:text="#{credit.accruals.start}">Period start</th>
+        <th th:text="#{credit.accruals.end}">Period end</th>
+        <th th:text="#{credit.accruals.basis}">Basis</th>
+        <th th:text="#{credit.accruals.amount}">Accrual amount</th>
+      </tr>
+      </thead>
+      <tbody>
+      <tr th:each="accrual, accrualIterStat : ${accrualEntry.value}" th:object="${accrual}">
+        <td th:text="${#ldates.format(accrual.start)}"></td>
+        <td th:text="${#ldates.format(accrual.end)}"></td>
+        <td th:text="*{#monetary.format(basis)}"></td>
+        <td th:text="*{#monetary.format(increment)}"></td>
+      </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>
+----
+
+== Accrual Engine Implementation
+
+=== Understanding AbstractAccrualEngine
+
+The `AbstractAccrualEngine` extends `RangeBasedAccrualEngine` and provides a framework for calculating time-based accruals (interest, late fees, etc.) on credit accounts.
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[lines=23..23]
+----
+
+=== Required Methods
+
+These methods MUST be implemented in your accrual engine:
+
+==== `Method 1: getAccrualAccount()`
+
+Returns the account name where accruals will be posted.
+
+[source,java]
+----
+@Override
+public abstract String getAccrualAccount();
+----
+
+**Purpose**: Specifies which account in the credit's debt structure should receive the accrued amounts.
+
+**Example Implementation:**
+[source,java]
+----
+@Override
+public String getAccrualAccount() {
+    return "INTEREST";  // Accruals will be posted to the INTEREST account
+}
+----
+
+==== `Method 2: getBasisRanges()`
+
+Calculates the basis amount ranges over time for accrual calculations:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[lines=33..51]
+----
+
+**Parameters:**
+
+* `credit` - The credit entity for which accruals are calculated
+* `operations` - Collection of credit operations
+* `snapshots` - Map of date to snapshot records
+* `date` - Target date for calculation
+
+**Returns:** Map of dates to basis amounts used for accrual calculation
+
+==== `Method 3: getLoanRateRanges()`
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[lines=53..61]
+----
+
+**Purpose**: Returns a map of dates to interest/fee rates, allowing rate changes over time.
+
+**Default Behavior**: Returns a single rate starting from credit start date.
+
+==== `Method 4: getFixAccuralDays()`
+
+Returns the set of dates when accruals should be fixed (typically payment due dates).
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[lines=65..69]
+----
+
+**Method signature:**
+[source,java]
+----
+protected Set<LocalDate> getFixAccuralDays(
+    ExampleCredit credit,
+    Collection<OperationRecord> operations,
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date)
+----
+
+=== `Method 5: getDayCounters()`
+
+Returns the day count calculators used for accrual calculations.
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[lines=71..83]
+----
+
+**Method signature:**
+[source,java]
+----
+protected NavigableMap<LocalDate, DayCounter> getDayCounters(
+    ExampleCredit credit,
+    Collection<OperationRecord> operations,
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date)
+----
+
+=== Optional Methods
+
+=== `Method 1: getFeeRate(ExampleCredit credit)`
+
+Returns the interest or fee rate used for accrual calculations.
+
+[source,java]
+----
+@Override
+protected BigDecimal getFeeRate(ExampleCredit credit) {
+    return credit.getCondition().getInterestRate();
+}
+----
+
+**Return value:** `BigDecimal` representing the rate (e.g., 0.12 for 12% annual rate)
+
+**Purpose:** Determines the rate used to calculate accruals for the credit account.
+
+**Examples:**
+
+Interest rate accrual:
+[source,java]
+----
+@Override
+protected BigDecimal getFeeRate(ExampleCredit credit) {
+    return credit.getCondition().getInterestRate();
+}
+----
+
+Late fee rate accrual:
+[source,java]
+----
+@Override
+protected BigDecimal getFeeRate(ExampleCredit credit) {
+    return credit.getCondition().getLateFeeRate();
+}
+----
+
+==== `Method 2: getBasisAccounts()`
+
+Returns the set of account names used as the basis for accrual calculations.
+
+[source,java]
+----
+protected abstract Set<String> getBasisAccounts();
+----
+
+The accrual amount is calculated based on balances in these accounts. For example:
+
+* Interest accruals typically use `PRINCIPAL` as the basis
+* Late fee accruals might use `PAST_DUE_PRINCIPAL` and `PAST_DUE_INTEREST`
+
+===== Example Implementations
+
+**Interest Accruals** - accrue interest on the principal balance:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/InterestAccrualEngine.java[lines=17..19]
+----
+
+**Late Fee Accruals** - calculate fees on past due amounts:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/LateFeeAccrualEngine.java[lines=17..20]
+----
+
+== Complete Accrual Engine Implementation Examples
+
+=== Example 1: Abstract Accrual Engine
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[]
+----
+
+=== Example 2: Interest Accrual Engine
+
+This example shows a complete implementation for calculating interest accruals on principal balance:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/InterestAccrualEngine.java[]
+----
+
+Key points:
+* **Accrual Account**: `INTEREST` - where accrued interest is recorded
+* **Basis Accounts**: `PRINCIPAL` - interest accrues on principal balance
+* **Fee Rate**: Uses the interest rate from credit condition
+
+=== Example 3: Late Fee Accrual Engine
+
+This example shows implementation for calculating late fees on past due amounts:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/LateFeeAccrualEngine.java[]
+----
+
+Key points:
+* **Accrual Account**: `LATE_FEE` - where late fees are recorded
+* **Basis Accounts**: `PAST_DUE_PRINCIPAL` and `PAST_DUE_INTEREST` - late fees accrue on overdue amounts
+* **Fee Rate**: Uses the late fee rate from credit condition
+
+== Integration with Credit System
+
+=== Registering Accrual Engines
+
+Accrual engines must be registered as Spring beans:
+
+[source,java]
+----
+@Configuration
+public class CreditCalculationConfiguration {
+
+    @Bean
+    public InterestAccrualEngine interestAccrualEngine() {
+        return new InterestAccrualEngine();
+    }
+
+    @Bean
+    public LateFeeAccrualEngine lateFeeAccrualEngine() {
+        return new LateFeeAccrualEngine();
+    }
+}
+----
+
+== Best Practices for Accrual Engines
+
+=== Performance Optimization
+
+* **Cache Rate Lookups**: If rates change frequently, cache rate history to avoid database queries
+* **Batch Processing**: Process accruals in batches during off-peak hours
+* **Incremental Calculation**: Only recalculate accruals from the last calculation date forward
+
+=== Accuracy and Compliance
+
+* **Day Count Convention**: Choose appropriate day count method (Actual/360, Actual/365, 30/360, etc.)
+* **Rounding**: Use consistent rounding rules (typically half-up for financial calculations)
+
+=== Testing Strategy
+
+* **Test Edge Cases**: First day, last day, leap years, month-end dates
+* **Test Rate Changes**: Verify correct handling when rates change mid-period
+* **Test Past Due**: Ensure accruals stop or change behavior when payments become overdue
+* **Integration Tests**: Test complete calculation flow including multiple accrual types
+
+=== Documentation
+
+* **Document Formula**: Clearly document the accrual calculation formula used
+* **Document Assumptions**: Document any business rules or assumptions (e.g., accruals on past due amounts)
+* **Rate Sources**: Document where rates come from and how they're maintained
+
+== Troubleshooting Accrual Engines
+
+=== Common Issues
+
+==== Accruals Not Appearing
+
+Check:
+1. Accrual engine is registered as a Spring bean
+2. Credit has been calculated at least once
+3. Credit calculation date is set
+4. Account configuration includes accrual accounts
+
+==== Incorrect Accrual Amounts
+
+Check:
+1. Day count method is correctly configured
+2. Basis accounts return expected balances
+3. Rate is in the correct format (e.g., 0.10 for 10%, not 10)
+4. Rounding configuration matches business requirements
+
+==== Accruals on Wrong Dates
+
+Check:
+1. `getFixAccuralDays()` returns expected dates
+2. Payment schedule is correctly configured
+
+== Related Documentation
+
+* link:_credit.adoc[Credit Management System] - Credit lifecycle overview
+* link:_operations.adoc[Credit Operations] - Understanding operation types
+* link:_payment-transactions.adoc[Payment Transactions] - Payment processing integration
+
+The Credit Accruals Tab provides essential visibility into credit accrual calculations and helps users understand how interest and fees are computed over the life of a credit account.
