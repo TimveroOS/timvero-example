@@ -56,4 +56,9 @@ public class ExampleCredit extends Credit implements NamedEntity, HasCovenant {
     public LocalDate getMaturityDate() {
         return getStartDate().plus(getCondition().getPeriod().multipliedBy(getCondition().getTerm()));
     }
+
+    @Transient
+    public String getShortId() {
+        return getId().toString().substring(0, 6);
+    }
 }
