@@ -1,9 +1,9 @@
-package com.timvero.example.admin.credit.action;
+package com.timvero.example.admin.payment.action;
 
 import static com.timvero.common.validation.ValidationUtils.PATTERN_DATEPICKER_FORMAT;
 
 import com.timvero.example.admin.credit.CreditPaymentService;
-import com.timvero.example.admin.credit.action.ChangePaymentDateAction.ChangePaymentDateForm;
+import com.timvero.example.admin.payment.action.ChangePaymentDateAction.ChangePaymentDateForm;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.servicing.credit.entity.operation.CreditPayment;
 import com.timvero.servicing.credit.entity.operation.OperationStatus;

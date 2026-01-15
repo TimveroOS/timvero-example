@@ -1,0 +1,259 @@
+= Credit Accruals Tab Integration
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This document describes how to integrate the Credit Accruals Tab into your credit management system. The Accruals Tab displays detailed information about interest and fee accruals for credit entities.
+
+== Overview
+
+The `CreditAccrualsTab` provides a dedicated interface for viewing accrual history and calculations for credit accounts. It displays:
+
+* Daily interest accruals
+* Fee accruals
+* Accrual calculation history
+* Account-specific accrual breakdowns
+* Timeline of accrual events
+
+This tab extends the abstract base class `AbstractCreditAccrualsTab` from the loan servicing framework, which provides core accrual display functionality.
+
+== Implementation
+
+=== Basic Tab Controller
+
+The simplest implementation requires only extending the abstract base class and configuring the Spring annotations:
+
+[source,java]
+----
+@RequestMapping("/credit-accruals")
+@Controller
+@Order(10002)
+public class CreditAccrualsTab extends AbstractCreditAccrualsTab<ExampleCredit> {
+}
+----
+
+Key configuration elements:
+
+* **`@RequestMapping("/credit-accruals")`** - Defines the URL path for the tab. The tab will be accessible at `/credit/{id}/credit-accruals`
+* **`@Controller`** - Marks this as a Spring MVC controller
+* **`@Order(10002)`** - Determines the tab's position in the navigation. Higher numbers appear later in the tab list
+* **`AbstractCreditAccrualsTab<ExampleCredit>`** - Generic type parameter specifies which credit entity type this tab handles
+
+== Customization
+
+Override `isVisible()` to control tab visibility:
+
+[source,java]
+----
+@Override
+public boolean isVisible(ExampleCredit credit) {
+    return credit.getCalculationDate() != null;
+}
+----
+
+
+
+== Accrual Engine Architecture
+
+=== AccrualEngine Interface
+
+The top-level contract for accrual calculations:
+
+[source,java]
+----
+public interface AccrualEngine<C extends Credit> {
+    Debt calculateAccurals(C credit, NavigableMap<LocalDate, SnapshotRecord> snapshots, LocalDate date);
+}
+----
+
+**Purpose**: Calculate accruals for a credit on a given date.
+
+**Parameters**:
+* `credit` - Credit entity
+* `snapshots` - Historical snapshots of credit state
+* `date` - Target calculation date
+
+**Returns**: `Debt` object with accrued amounts by account
+
+Use this interface directly only for custom accrual logic that doesn't fit the standard patterns.
+
+=== RecordableAccrualEngine
+
+Extends `AccrualEngine` to provide detailed accrual records needed by `AbstractCreditAccrualsTab` for display.
+
+**Key Addition**: `AccrualRecord` - detailed breakdown of accrual calculations:
+
+[source,java]
+----
+public record AccrualRecord(
+    LocalDate start,        // Period start
+    LocalDate end,          // Period end
+    DayCountMethod dayCountMethod,
+    long daysCount,
+    MonetaryAmount basis,   // Amount accruals calculated on
+    BigDecimal rate,        // Interest/fee rate
+    BigFraction fraction,   // Time fraction
+    MonetaryAmount increment // Accrued amount for period
+)
+----
+
+**Abstract Methods**:
+
+[source,java]
+----
+public abstract String getAccrualAccount();
+
+public abstract List<AccrualRecord> calculateAccrualRecords(
+    C credit, 
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date);
+----
+
+**What it handles**:
+* Implements `calculateAccurals()` by:
+  - Subtracting already fixed accruals from operations
+  - Adding new accruals from `calculateAccrualRecords()`
+* Provides detailed records for UI display
+
+=== RangeBasedAccrualEngine
+
+Extends `RecordableAccrualEngine` with a range-based calculation approach. Splits time into ranges based on changes in basis amounts, rates, or day count methods.
+
+**Abstract Methods** (implement these):
+
+[source,java]
+----
+protected abstract NavigableMap<LocalDate, MonetaryAmount> getBasisRanges(
+    C credit,
+    Collection<OperationRecord> operations,
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date);
+----
+Returns history of basis amounts (e.g., principal balance changes).
+
+[source,java]
+----
+protected abstract NavigableMap<LocalDate, BigDecimal> getLoanRateRanges(
+    C credit,
+    Collection<OperationRecord> operations,
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date);
+----
+Returns history of rates (e.g., interest rate changes).
+
+[source,java]
+----
+protected abstract Set<LocalDate> getFixAccuralDays(
+    C credit,
+    Collection<OperationRecord> operations,
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date);
+----
+Returns dates when accruals should be fixed (typically payment due dates).
+
+[source,java]
+----
+protected abstract NavigableMap<LocalDate, DayCounter> getDayCounters(
+    C credit,
+    Collection<OperationRecord> operations,
+    NavigableMap<LocalDate, SnapshotRecord> snapshots,
+    LocalDate date);
+----
+Returns day count methods for time calculations (Actual/360, 30/360, etc.).
+
+**What it handles**:
+* Implements `calculateAccrualRecords()` by:
+  - Merging all range boundaries (basis changes, rate changes, fix days)
+  - Calculating accruals for each range segment
+  - Creating `AccrualRecord` for each period
+
+=== AbstractAccrualEngine - Simplification Example
+
+Example project provides `AbstractAccrualEngine` that simplifies `RangeBasedAccrualEngine` for the common case: **single fixed rate for entire credit term**.
+
+**Simplifies to 3 methods**:
+
+[source,java]
+----
+public abstract String getAccrualAccount();
+protected abstract Set<String> getBasisAccounts();
+protected abstract BigDecimal getFeeRate(ExampleCredit credit);
+----
+
+**What it implements**:
+
+* **`getBasisRanges()`** - sums balances from `getBasisAccounts()`
+* **`getLoanRateRanges()`** - returns single rate from `getFeeRate()` starting at credit start date
+* **`getFixAccuralDays()`** - uses payment schedule dates
+* **`getDayCounters()`** - creates `DayCounter` from credit conditions
+
+**When to use**: Most typical accrual scenarios (interest on principal, late fees on overdue amounts) with constant rates.
+
+== Complete Accrual Engine Implementation Examples
+
+=== Example 1: Abstract Accrual Engine
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[tags=class]
+----
+
+=== Example 2: Interest Accrual Engine
+
+This example shows a complete implementation for calculating interest accruals on principal balance:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/InterestAccrualEngine.java[]
+----
+
+Key points:
+* **Accrual Account**: `INTEREST` - where accrued interest is recorded
+* **Basis Accounts**: `PRINCIPAL` - interest accrues on principal balance
+* **Fee Rate**: Uses the interest rate from credit condition
+
+=== Example 3: Late Fee Accrual Engine
+
+This example shows implementation for calculating late fees on past due amounts:
+
+[source,java]
+----
+include::{sourcedir}/operation/accrual/LateFeeAccrualEngine.java[]
+----
+
+Key points:
+* **Accrual Account**: `LATE_FEE` - where late fees are recorded
+* **Basis Accounts**: `PAST_DUE_PRINCIPAL` and `PAST_DUE_INTEREST` - late fees accrue on overdue amounts
+* **Fee Rate**: Uses the late fee rate from credit condition
+
+== Integration with Credit System
+
+=== Registering Accrual Engines
+
+Accrual engines must be registered as Spring beans:
+
+[source,java]
+----
+@Configuration
+public class CreditCalculationConfiguration {
+
+    @Bean
+    public InterestAccrualEngine interestAccrualEngine() {
+        return new InterestAccrualEngine();
+    }
+
+    @Bean
+    public LateFeeAccrualEngine lateFeeAccrualEngine() {
+        return new LateFeeAccrualEngine();
+    }
+}
+----
+
+
+
+== Related Documentation
+
+* link:_credit.adoc[Credit Management System] - Credit lifecycle overview
+* link:_operations.adoc[Credit Operations] - Understanding operation types
+* link:_payment-transactions.adoc[Payment Transactions] - Payment processing integration
+
+The Credit Accruals Tab provides essential visibility into credit accrual calculations and helps users understand how interest and fees are computed over the life of a credit account.

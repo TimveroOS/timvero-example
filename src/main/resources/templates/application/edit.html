@@ -28,7 +28,7 @@
         <!-- end::application-form-fields[] -->
         <th:block
             th:insert="~{/form/components :: text(#{participant.githubUsername},
-                'borrowerParticipant.githubUsername', '')}" />
+                'borrowerParticipant.githubUsername', 'v-required')}" />
     </div>
 
     <div class="modal-footer">

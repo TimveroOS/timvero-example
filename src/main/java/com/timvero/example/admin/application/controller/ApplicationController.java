@@ -12,7 +12,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 @RequestMapping(ApplicationController.PATH)
 @MenuItem(order = 5_100, name = "application")
 public class ApplicationController extends ViewableFilterController<UUID, Application, ApplicationFilter> {
-    public static final String PATH = "application";
+
+    public static final String PATH = "/application";
 
     @Override
     protected String getViewPage() {

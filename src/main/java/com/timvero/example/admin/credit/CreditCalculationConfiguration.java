@@ -1,5 +1,6 @@
 package com.timvero.example.admin.credit;
 
+import com.timvero.example.admin.client.entity.Client;
 import com.timvero.example.admin.operation.accrual.AccrualOperationService;
 import com.timvero.example.admin.operation.accrual.InterestAccrualEngine;
 import com.timvero.example.admin.operation.accrual.LateFeeAccrualEngine;
@@ -11,6 +12,7 @@ import com.timvero.servicing.credit.entity.operation.CreditPaymentType;
 import com.timvero.servicing.engine.general.BasicLoanEngine;
 import com.timvero.servicing.engine.general.LoanEngine;
 import com.timvero.servicing.engine.operation.payment.CreditPaymentOperationHandler;
+import com.timvero.transfer.paymenthub.entity.PaymentTransactionPurpose;
 import java.util.LinkedHashMap;
 import java.util.List;
 import org.springframework.context.annotation.Bean;
@@ -19,7 +21,11 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class CreditCalculationConfiguration {
 
+    // tag::payment-hub-config[]
     public static final CreditPaymentType GENERAL = new CreditPaymentType("GENERAL");
+
+    public static final PaymentTransactionPurpose<Client> GENERAL_PURPOSE = new PaymentTransactionPurpose<>("GENERAL", Client.class);
+    // end::payment-hub-config[]
 
     public static final CreditStatus PENDING = new CreditStatus("PENDING", 1000, false);
     public static final CreditStatus ACTIVE = new CreditStatus("ACTIVE", 1100, false);

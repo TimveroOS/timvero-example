@@ -1,0 +1,1759 @@
+= Payment Hub — Automatic Payment Allocation
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:libdir: ../../main/java/com/timvero/transfer/paymenthub
+:templatedir: ../../main/resources/templates
+
+This section describes how to set up and use the Payment Hub system for automatic and manual allocation of incoming payments to credits.
+
+== Architecture Overview
+
+Payment Hub uses a provider-oriented architecture that separates payment lifecycle management from allocation business logic:
+
+[source]
+----
+PaymentHubTransaction (incoming payment)
+         │
+         ▼
+  PaymentHubService.allocate()
+         │
+         ├──► AllocationTargetProvider.provideAllocationTargets()
+         │         → list of credits available for allocation
+         │
+         ├──► AllocationPlanProvider.provideAllocationPlan()
+         │         → allocation plan (creditId, paymentType, amount)
+         │
+         └──► PaymentHubService.apply() for each plan item
+                   → creates CreditPayment and attaches to credit
+         │
+         ▼
+  CreditCalculationService.calculate()
+         → recalculates credit schedule
+----
+
+**Key Principle:** The framework manages transaction lifecycle and payment distribution mechanics. Business rules — *which* credits to pay and *how* to distribute funds — are fully configurable through provider interfaces.
+
+=== Allocation Modes
+
+The system supports three allocation modes:
+
+[cols="1,3",options="header"]
+|===
+|Mode |Description
+
+|**Smart Allocation**
+|Automatic distribution using `AllocationPlanProvider`. Operator selects date, previews the plan and confirms. Uses `PaymentHubService.allocate()`.
+
+|**Manual Allocation**
+|Operator manually selects specific credit, payment type and amount. Uses `PaymentHubService.apply()` directly.
+
+|**Void**
+|Cancellation of all allocated payments from a transaction. Requires recalculation of affected credits.
+|===
+
+=== What the Framework Does
+
+**Transaction Management:**
+
+* Storage of incoming payments linked to owner (`ownerId`)
+* Tracking of allocated and available amounts
+* Support for partial allocation
+
+**Payment Distribution:**
+
+* Provider lookup by owner type (`PaymentTransactionPurpose`)
+* Execution of allocation plan with available amount validation
+* Creation of `CreditPayment` operations
+
+**Integration:**
+
+* Automatic invocation of `CreditCalculationService` after allocation
+* UI components: actions, tabs, labels
+
+== What is Payment Hub?
+
+Payment Hub is a system for managing incoming payments and distributing them across multiple credits of a single owner.
+
+=== Key Features
+
+* **Automatic Allocation** — payment distribution according to configurable rules (FIFO, LIFO, priority by debt type)
+* **Manual Allocation** — operator selects specific credit and amount through UI
+* **Plan Preview** — viewing allocation plan before applying (Smart Allocation)
+* **Partial Allocation** — handling payments larger or smaller than total debt
+* **Payment Cancellation** — void of allocated payments with automatic credit recalculation
+
+=== Typical Use Cases
+
+[cols="1,3",options="header"]
+|===
+|Scenario |Description
+
+|**One Payment — Multiple Credits**
+|Customer transfers a single amount that must be distributed across multiple active credits according to rules (e.g., overdue amounts across all credits are paid first, then current payments).
+
+|**Overdue Debt Priority**
+|Incoming payment is first directed to pay off late fees, overdue interest and overdue principal, and only then — to current charges.
+
+|**FIFO Distribution**
+|Payments are distributed starting from the oldest credit (by origination date). Useful for "close old debts first" strategy.
+
+|**LIFO Distribution**
+|Payments are distributed starting from the newest credit. Applied for specific business requirements.
+
+|**Manual Adjustment**
+|Operator manually reallocates an incorrectly allocated payment or distributes payment to a specific credit upon customer request.
+
+|**Payment Registration Without Allocation**
+|Payment is registered in the system but remains unallocated until operator makes a decision.
+|===
+
+=== Process Participants
+
+[cols="1,3",options="header"]
+|===
+|Participant |Role
+
+|**Owner**
+|Entity that owns credits and receives payments. For example: `Client`, `Merchant`. Identified through `ownerId`.
+
+|**Credit**
+|Target entity for allocation. Must be active and in the same currency as the payment.
+
+|**Transaction (PaymentHubTransaction)**
+|Incoming payment with amount, owner and optional payment document data.
+
+|**Credit Payment (CreditPayment)**
+|Allocation result — operation linked to a specific credit with amount and payment type.
+|===
+
+== Core System Components
+
+=== Framework Components (library)
+
+[cols="1,3",options="header"]
+|===
+|Component |Description
+
+|**PaymentHubTransaction**
+|Incoming payment entity. Stores amount, owner reference (`ownerId`), purpose type (`purpose`) and collection of allocated payments. Calculates available balance (`availableAmount`).
+
+|**PaymentTransactionPurpose<E>**
+|Typed enum linking transaction to owner class. Used to find appropriate providers. Parameter `E` — owner entity class (e.g., `Client`).
+
+|**PaymentHubService**
+|Central allocation service. Finds providers by owner type, executes allocation plan, creates `CreditPayment` operations. Main methods: `allocate()`, `apply()`, `findAllocation()`.
+
+|**PaymentHubTransactionRepository**
+|JPA repository for working with transactions. Includes methods for finding transactions with unallocated balance.
+
+|**PaymentHubTransactionHandler**
+|Transaction handler. Invokes `allocate()` after successful payment processing (for external processing scenarios).
+|===
+
+=== Interfaces to Implement (application-level)
+
+[cols="1,3",options="header"]
+|===
+|Interface |Description
+
+|**AllocationTargetProvider<E>**
+|Defines which credits are available for allocation. Receives owner and returns list of active credits in required currency.
+
+|**AllocationPlanProvider<E>**
+|Defines how to distribute funds between credits. Returns ordered list of `AllocationPlanItem` — allocation plan.
+
+|**AllocationPlanItem**
+|Record with parameters of a single plan item: `creditId`, `shortId`, `description`, `paymentType`, `amount`. Item order determines allocation order.
+|===
+
+=== UI Components (library)
+
+[cols="1,3",options="header"]
+|===
+|Component |Description
+
+|**ManualAllocationPaymentTransactionAction**
+|Action for manual allocation. Operator selects credit, payment type, amount and date.
+
+|**VoidPaymentTransactionAction**
+|Action for cancelling unallocated transaction. Available only if entire amount is not yet allocated.
+
+|**PaymentHubTransactionCreditTab**
+|Tab on transaction page. Shows list of owner's credits and allocated payments.
+
+|**PaymentTransactionController**
+|Controller for transaction list and view.
+|===
+
+=== Labels (library)
+
+Visual markers for transaction allocation status:
+
+[cols="1,2,2",options="header"]
+|===
+|Label |Condition |Meaning
+
+|**Unallocated**
+|`amount == availableAmount`
+|Transaction is completely unallocated
+
+|**Partly Allocated**
+|`availableAmount > 0 && amount > availableAmount`
+|Transaction is partially allocated
+
+|**Allocated**
+|`availableAmount == 0`
+|Transaction is fully allocated
+|===
+
+== PaymentHubTransaction — Transaction Entity
+
+`PaymentHubTransaction` extends base `PaymentTransaction` and represents an incoming payment that can be allocated to credits.
+
+=== Entity Fields
+
+[cols="1,2,3",options="header"]
+|===
+|Field |Type |Description
+
+|**id**
+|`Long`
+|Unique transaction identifier (inherited from `PaymentTransaction`).
+
+|**amount**
+|`MonetaryAmount`
+|Transaction amount. Immutable after creation.
+
+|**status**
+|`TransactionStatus`
+|Transaction status: `SUCCEED`, `VOIDED`, etc.
+
+|**ownerId**
+|`UUID`
+|Owner identifier (e.g., `Client.id`). Used to find credits through providers.
+
+|**purpose**
+|`PaymentTransactionPurpose<?>`
+|Purpose type. Defines owner class and used to find corresponding providers.
+
+|**payments**
+|`List<CreditPayment>`
+|Collection of allocated payments. Each `CreditPayment` is linked to a specific credit.
+
+|**paymentMethod**
+|`PaymentMethod`
+|Optional. Payment document data (document number, bank reference, etc.).
+
+|**createdAt**
+|`Instant`
+|Transaction creation date and time.
+
+|**createdBy**
+|`UserReference`
+|User who created the transaction (for manual creation).
+|===
+
+=== Computed Fields
+
+[cols="1,2,3",options="header"]
+|===
+|Method |Return Type |Description
+
+|**getAvailableAmount()**
+|`MonetaryAmount`
+|Amount available for allocation. Calculated as `amount - sum(approved payments)`. Only payments with `APPROVED` status are considered.
+
+|**getDisplayedName()**
+|`String`
+|Display name for UI: `"#123 EUR 500.00"`.
+|===
+
+=== Methods
+
+[cols="1,2,3",options="header"]
+|===
+|Method |Parameters |Description
+
+|**addPayment()**
+|`CreditPayment payment`
+|Adds payment to collection. Validates that payment amount does not exceed `availableAmount`. Throws `IllegalArgumentException` on violation.
+|===
+
+=== Transaction Statuses
+
+[source]
+----
+SUCCEED ──► VOIDED
+    │
+    └──► (allocation through CreditPayment)
+----
+
+[cols="1,3",options="header"]
+|===
+|Status |Description
+
+|**SUCCEED**
+|Successful transaction. Available for allocation (if `availableAmount > 0`).
+
+|**VOIDED**
+|Cancelled transaction. Allocation not possible. On void all related `CreditPayment` must be cancelled.
+|===
+
+=== Relationship with CreditPayment
+
+`PaymentHubTransaction` contains a collection of `CreditPayment`:
+
+[source]
+----
+PaymentHubTransaction (amount: 1000 EUR)
+    │
+    ├── CreditPayment #1 (credit: A, amount: 400 EUR, status: APPROVED)
+    ├── CreditPayment #2 (credit: B, amount: 350 EUR, status: APPROVED)
+    └── CreditPayment #3 (credit: B, amount: 100 EUR, status: CANCELED)
+
+availableAmount = 1000 - 400 - 350 = 250 EUR
+(CANCELED payments are not counted)
+----
+
+=== PaymentMethod — Payment Document Data
+
+`PaymentMethod` — optional entity for storing payment document information.
+
+**Base fields:**
+
+* `type` — payment method type (discriminator)
+* Additional fields are defined in subclasses
+
+**Implementation example:**
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("HUB")
+public class HubPaymentMethod extends PaymentMethod {
+
+    @Column(name = "document_number")
+    private String documentNumber;
+
+    // constructors, getters, setters
+}
+----
+
+Used for storing payment order number, bank reference or other incoming payment details.
+
+== Provider Interfaces
+
+Providers define payment allocation business logic. The framework automatically finds providers by owner type from `PaymentTransactionPurpose`.
+
+=== AllocationTargetProvider — Credit Selection
+
+Defines which owner's credits are available for allocation.
+
+[source,java]
+----
+public interface AllocationTargetProvider<E extends Persistable<UUID>> {
+
+    List<? extends Credit> provideAllocationTargets(
+        LocalDate forDay,
+        PaymentTransactionPurpose<E> purpose,
+        E owner,
+        CurrencyUnit currency
+    );
+}
+----
+
+==== Method Parameters
+
+[cols="1,2,3",options="header"]
+|===
+|Parameter |Type |Description
+
+|**forDay**
+|`LocalDate`
+|Date for which available credits are determined. Affects status and term validation.
+
+|**purpose**
+|`PaymentTransactionPurpose<E>`
+|Transaction purpose type. Can be used for additional filtering.
+
+|**owner**
+|`E`
+|Owner entity (e.g., `Client`). Loaded by framework using `ownerId`.
+
+|**currency**
+|`CurrencyUnit`
+|Transaction currency. Credits in different currency must be excluded.
+|===
+
+==== Implementation Requirements
+
+* **Filter by status** — return only active credits
+* **Filter by currency** — exclude credits in different currency
+* **Return empty list** — if no suitable credits, return empty list (not `null`)
+
+==== Implementation Example
+
+[source,java]
+----
+@Override
+public List<? extends Credit> provideAllocationTargets(
+        LocalDate forDay,
+        PaymentTransactionPurpose<Client> purpose,
+        Client client,
+        CurrencyUnit currency) {
+
+    return client.getParticipants().stream()
+        .filter(p -> p.getRoles().contains(ParticipantRole.BORROWER))
+        .map(Participant::getApplication)
+        .map(Application::getCredit)
+        .filter(Objects::nonNull)
+        .filter(this::isActive)
+        .filter(c -> c.getCurrency().equals(currency))
+        .toList();
+}
+----
+
+=== AllocationPlanProvider — Allocation Plan
+
+Defines how to distribute funds between credits.
+
+[source,java]
+----
+public interface AllocationPlanProvider<E extends Persistable<UUID>> {
+
+    List<AllocationPlanItem> provideAllocationPlan(
+        LocalDate forDay,
+        List<? extends Credit> credits,
+        PaymentTransactionPurpose<E> purpose,
+        E owner,
+        CurrencyUnit currency
+    );
+}
+----
+
+==== Method Parameters
+
+[cols="1,2,3",options="header"]
+|===
+|Parameter |Type |Description
+
+|**forDay**
+|`LocalDate`
+|Allocation date. Used for current debt calculation.
+
+|**credits**
+|`List<? extends Credit>`
+|List of credits from `AllocationTargetProvider`. Already filtered by status and currency.
+
+|**purpose**
+|`PaymentTransactionPurpose<E>`
+|Transaction purpose type.
+
+|**owner**
+|`E`
+|Owner entity.
+
+|**currency**
+|`CurrencyUnit`
+|Transaction currency.
+|===
+
+==== AllocationPlanItem — Plan Item
+
+[source,java]
+----
+public record AllocationPlanItem(
+    UUID creditId,
+    String shortId,
+    String description,
+    CreditPaymentType paymentType,
+    MonetaryAmount amount
+) {}
+----
+
+[cols="1,2,3",options="header"]
+|===
+|Field |Type |Description
+
+|**creditId**
+|`UUID`
+|Credit identifier for allocation.
+
+|**shortId**
+|`String`
+|Short credit identifier for UI and logs display.
+
+|**description**
+|`String`
+|Plan item description (e.g., "Overdue interest", "Principal").
+
+|**paymentType**
+|`CreditPaymentType`
+|Payment type. Defines how payment will be processed within credit.
+
+|**amount**
+|`MonetaryAmount`
+|Maximum amount to allocate to this item.
+|===
+
+==== Implementation Requirements
+
+* **Order matters** — items are processed sequentially, funds are distributed until exhausted
+* **Sum can exceed availableAmount** — framework will stop when funds run out
+* **Return empty list** — if allocation is not possible, return empty list (not `null`)
+
+==== Implementation Example (FIFO with Overdue Priority)
+
+[source,java]
+----
+@Override
+public List<AllocationPlanItem> provideAllocationPlan(
+        LocalDate forDay,
+        List<? extends Credit> credits,
+        PaymentTransactionPurpose<Client> purpose,
+        Client client,
+        CurrencyUnit currency) {
+
+    List<AllocationPlanItem> plan = new ArrayList<>();
+
+    // FIFO sorting — oldest credits first
+    List<ExampleCredit> sortedCredits = credits.stream()
+        .map(c -> (ExampleCredit) c)
+        .sorted(Comparator.comparing(Credit::getStartDate))
+        .toList();
+
+    // Priority 1: overdue across ALL credits
+    for (ExampleCredit credit : sortedCredits) {
+        addOverdueItems(plan, credit, forDay);
+    }
+
+    // Priority 2: interest and principal
+    for (ExampleCredit credit : sortedCredits) {
+        addInterestItem(plan, credit, forDay);
+        addPrincipalItem(plan, credit, forDay);
+    }
+
+    return plan;
+}
+----
+
+=== Combining Providers
+
+Both interfaces can be implemented in a single class:
+
+[source,java]
+----
+@Service
+public class ClientAllocationPlannerImpl
+    implements AllocationPlanProvider<Client>, AllocationTargetProvider<Client> {
+
+    // Implementation of both interfaces
+}
+----
+
+**Advantages:**
+
+* Shared access to dependencies (`DebtService`, repositories)
+* Consistent filtering and allocation logic
+* Fewer classes in the project
+
+=== Provider Registration
+
+**Important:** For each owner type (`PaymentTransactionPurpose.entityClass`) there must be exactly one provider of each type.
+
+[cols="1,3",options="header"]
+|===
+|Situation |Result
+
+|0 providers
+|`IllegalStateException` on application startup
+
+|1 provider
+|✓ Correct operation
+
+|>1 providers
+|`IllegalStateException` on application startup
+|===
+
+The framework automatically finds providers through Spring Context by generic type.
+
+== PaymentHubService — Allocation Service
+
+`PaymentHubService` — central component orchestrating the payment allocation process.
+
+=== Main Methods
+
+[cols="1,2,3",options="header"]
+|===
+|Method |Parameters |Description
+
+|**allocate()**
+|`PaymentHubTransaction transaction, LocalDate today`
+|Automatic allocation. Finds credits, builds plan, applies it. Used for Smart Allocation.
+
+|**apply()**
+|`Credit credit, CreditPaymentType paymentType, MonetaryAmount amount, PaymentHubTransaction transaction, LocalDate today`
+|Manual allocation. Creates single `CreditPayment` for specified credit. Used for Manual Allocation.
+
+|**findAllocation()**
+|`PaymentHubTransaction transaction, LocalDate today`
+|Plan preview without applying. Returns `Map<UUID, Map<CreditPaymentType, MonetaryAmount>>`. Used for UI Smart Allocation.
+
+|**getAllocationTargets()**
+|`PaymentHubTransaction transaction, LocalDate today`
+|Gets list of credits available for allocation. Used for UI Manual Allocation.
+
+|**getOwner()**
+|`PaymentHubTransaction transaction`
+|Gets owner entity by `ownerId` and `purpose`. Used for UI display.
+|===
+
+=== Allocation Lifecycle
+
+==== Smart Allocation (automatic)
+
+[source]
+----
+allocate(transaction, today)
+    │
+    ├─► _getAllocationTargets()
+    │       └─► AllocationTargetProvider.provideAllocationTargets()
+    │
+    ├─► findAllocation()
+    │       └─► _getAllocationPlan()
+    │               └─► AllocationPlanProvider.provideAllocationPlan()
+    │
+    └─► For each plan item:
+            ├─► apply(credit, paymentType, amount, transaction, today)
+            │       └─► CreditPayment creation
+            │
+            └─► CreditCalculationService.calculate()
+                    └─► credit schedule recalculation
+----
+
+==== Manual Allocation
+
+[source]
+----
+apply(credit, paymentType, amount, transaction, today)
+    │
+    ├─► CreditPayment creation
+    │       ├─► status = APPROVED
+    │       ├─► date = today
+    │       └─► amount = specified amount
+    │
+    ├─► transaction.addPayment(payment)
+    │       └─► availableAmount validation
+    │
+    └─► credit.getOperations().add(payment)
+            └─► linking to credit
+----
+
+**Important:** For manual allocation `CreditCalculationService.calculate()` is called in Action, not in `PaymentHubService.apply()`.
+
+=== Allocation Logic in allocate()
+
+[source,java]
+----
+@Transactional
+public void allocate(PaymentHubTransaction transaction, LocalDate today) {
+    // 1. Get list of credits
+    List<? extends Credit> credits = getAllocationTargets(transaction, today);
+
+    if (!credits.isEmpty()) {
+        // 2. Build allocation plan
+        Map<UUID, Map<CreditPaymentType, MonetaryAmount>> allocation =
+            findAllocation(transaction, today, credits);
+
+        if (!allocation.isEmpty()) {
+            // 3. Apply plan
+            for (var entry : allocation.entrySet()) {
+                Credit credit = findCredit(credits, entry.getKey());
+
+                // 4. Create payments for each type
+                entry.getValue().forEach((paymentType, amount) ->
+                    apply(credit, paymentType, amount, transaction, today)
+                );
+
+                // 5. Recalculate credit
+                creditCalculationService.calculate(
+                    credit.getId(),
+                    today,
+                    credit.getCalculationDate()
+                );
+            }
+        }
+    }
+}
+----
+
+=== Plan Building Logic in findAllocation()
+
+[source,java]
+----
+private Map<UUID, Map<CreditPaymentType, MonetaryAmount>> findAllocation(
+        PaymentHubTransaction transaction,
+        LocalDate today,
+        List<? extends Credit> credits) {
+
+    Map<UUID, Map<CreditPaymentType, MonetaryAmount>> result = new LinkedHashMap<>();
+
+    // 1. Get plan from provider
+    List<AllocationPlanItem> planItems = _getAllocationPlan(
+        transaction.getPurpose(),
+        transaction.getOwnerId(),
+        transaction.getAvailableAmount(), today, credits);
+
+    if (!planItems.isEmpty()) {
+        // 2. Available amount for allocation
+        Mutator amount = Mutator.valueMutator(transaction.getAvailableAmount());
+
+        // 3. Process plan items sequentially
+        for (AllocationPlanItem item : planItems) {
+            if (!amount.positive()) {
+                break;  // Funds exhausted
+            }
+
+            // 4. Take minimum of requested and available
+            MonetaryAmount portion = Lang.min(item.amount(), amount.get());
+
+            // 5. Aggregate by credit and payment type
+            result.computeIfAbsent(item.creditId(), k -> new TreeMap<>())
+                  .merge(item.paymentType(), portion, MonetaryAmount::add);
+
+            // 6. Reduce available amount
+            amount.subtract(portion);
+        }
+    }
+
+    return result;
+}
+----
+
+=== CreditPayment Creation in apply()
+
+[source,java]
+----
+@Transactional
+public void apply(Credit credit, CreditPaymentType paymentType, MonetaryAmount amount,
+                  PaymentHubTransaction transaction, LocalDate today) {
+
+    // 1. Create payment operation
+    CreditPayment payment = new CreditPayment(
+        today,                    // payment date
+        OperationStatus.APPROVED, // status
+        amount,                   // amount
+        paymentType               // payment type
+    );
+
+    // 2. Add to transaction (validates availableAmount)
+    transaction.addPayment(payment);
+
+    // 3. Add to credit
+    credit.getOperations().add(payment);
+}
+----
+
+=== Provider Initialization
+
+`PaymentHubService` implements `ApplicationContextAware` and on application startup:
+
+1. Gets all registered `PaymentTransactionPurpose`
+2. For each owner type searches for `AllocationTargetProvider<E>` and `AllocationPlanProvider<E>`
+3. Validates that exactly one provider of each type is found
+4. Caches providers in `Map<Class, Provider>`
+
+[source,java]
+----
+@Override
+public void setApplicationContext(ApplicationContext ctx) throws BeansException {
+    Set<?> classes = Arrays.stream(PaymentTransactionPurpose.values(PaymentTransactionPurpose.class))
+        .map(PaymentTransactionPurpose::getEntityClass)
+        .collect(Collectors.toSet());
+
+    for (Class<?> entityClass : classes) {
+        // Provider lookup by generic type
+        String[] beanNames = ctx.getBeanNamesForType(
+            ResolvableType.forClassWithGenerics(AllocationTargetProvider.class, entityClass)
+        );
+
+        Assert.notEmpty(beanNames,
+            () -> "No beans of type AllocationTargetProvider<" + entityClass.getSimpleName() + ">");
+        Assert.state(beanNames.length == 1,
+            () -> "Multiple beans of type AllocationTargetProvider<" + entityClass.getSimpleName() + "> not allowed");
+
+        targetProviders.put(entityClass, ctx.getBean(beanNames[0]));
+    }
+
+    // Same for AllocationPlanProvider
+}
+----
+
+== Complete Implementation Example
+
+This section contains step-by-step instructions for integrating Payment Hub with `Client` entity as payment owner.
+
+=== Example Overview
+
+This example implements:
+
+* **Owner:** `Client` — customer with multiple credits
+* **Strategy:** FIFO with overdue priority
+* **Functionality:** transaction creation, Smart and Manual Allocation, Void
+
+**Implementation components:**
+
+[cols="1,3",options="header"]
+|===
+|Component |Description
+
+|`CreditCalculationConfiguration`
+|Registration of `PaymentTransactionPurpose` and `CreditPaymentType`
+
+|`ClientAllocationPlannerImpl`
+|Provider for credit selection and allocation plan building
+
+|`HubPaymentMethod`
+|Entity for storing payment document number
+
+|`AddTransactionClientAction`
+|Action for creating transaction from client card
+
+|`SmartAllocationPaymentTransactionAction`
+|Action for automatic allocation with preview
+
+|`VoidPaymentHubTransactionAction`
+|Action for transaction cancellation with credit recalculation
+|===
+
+=== Step 1: Register PaymentTransactionPurpose and CreditPaymentType
+
+Create constants for purpose type and payment type in configuration:
+
+[source,java]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[tags=payment-hub-config]
+----
+
+**Implementation example:**
+
+[source,java]
+----
+@Configuration
+public class CreditCalculationConfiguration {
+
+    // Payment type — used when creating CreditPayment
+    public static final CreditPaymentType GENERAL = new CreditPaymentType("GENERAL");
+
+    // Purpose type — links transaction to Client class
+    public static final PaymentTransactionPurpose<Client> GENERAL_PURPOSE =
+        new PaymentTransactionPurpose<>("GENERAL", Client.class);
+
+    // ... rest of configuration
+}
+----
+
+**Important:**
+
+* `PaymentTransactionPurpose` is parameterized with owner class (`Client.class`)
+* Purpose name must be unique
+* `CreditPaymentType` defines how payment is processed within credit
+
+=== Step 2: Implement Providers
+
+Create service implementing both provider interfaces:
+
+[source,java]
+----
+include::{sourcedir}/client/ClientAllocationPlannerImpl.java[tags=class-definition]
+----
+
+**Implementation example:**
+
+[source,java]
+----
+@Service
+public class ClientAllocationPlannerImpl
+    implements AllocationPlanProvider<Client>, AllocationTargetProvider<Client> {
+
+    @Autowired
+    private DebtService debtService;
+
+    // ... method implementations
+}
+----
+
+==== AllocationTargetProvider Implementation
+
+[source,java]
+----
+include::{sourcedir}/client/ClientAllocationPlannerImpl.java[tags=target-provider]
+----
+
+**Implementation example:**
+
+[source,java]
+----
+@Override
+public List<? extends Credit> provideAllocationTargets(
+        LocalDate forDay,
+        PaymentTransactionPurpose<Client> purpose,
+        Client client,
+        CurrencyUnit currency) {
+
+    return client.getParticipants().stream()
+        // Only participants with BORROWER role
+        .filter(p -> p.getRoles().contains(ParticipantRole.BORROWER))
+        // Get application and credit
+        .map(Participant::getApplication)
+        .map(Application::getCredit)
+        .filter(Objects::nonNull)
+        // Only active credits
+        .filter(this::isActive)
+        // Only in transaction currency
+        .filter(c -> c.getCondition().getPrincipal().getCurrency().equals(currency))
+        .toList();
+}
+
+private boolean isActive(ExampleCredit credit) {
+    return credit.getActualSnapshot() != null
+        && credit.getActualSnapshot().getStatus().in(CreditCalculationConfiguration.ACTIVE);
+}
+----
+
+==== AllocationPlanProvider Implementation
+
+[source,java]
+----
+include::{sourcedir}/client/ClientAllocationPlannerImpl.java[tags=plan-provider]
+----
+
+**Implementation example (FIFO with overdue priority):**
+
+[source,java]
+----
+@Override
+public List<AllocationPlanItem> provideAllocationPlan(
+        LocalDate forDay,
+        List<? extends Credit> credits,
+        PaymentTransactionPurpose<Client> purpose,
+        Client client,
+        CurrencyUnit currency) {
+
+    List<AllocationPlanItem> plan = new ArrayList<>();
+
+    // FIFO — sort by origination date (oldest first)
+    List<ExampleCredit> sortedCredits = credits.stream()
+        .map(c -> (ExampleCredit) c)
+        .filter(c -> !c.getActualSnapshot().getStatus().isEnding())
+        .sorted(Comparator.comparing(Credit::getStartDate))
+        .toList();
+
+    // Priority 1: overdue across ALL credits
+    for (ExampleCredit credit : sortedCredits) {
+        addOverdueItems(plan, credit, forDay);
+    }
+
+    // Priority 2: current interest and principal
+    for (ExampleCredit credit : sortedCredits) {
+        addInterestItem(plan, credit, forDay);
+        addPrincipalItem(plan, credit, forDay);
+    }
+
+    return plan;
+}
+----
+
+==== Helper Methods for Plan Building
+
+[source,java]
+----
+private void addOverdueItems(List<AllocationPlanItem> plan, ExampleCredit credit, LocalDate forDay) {
+    Optional<Debt> debtOpt = debtService.getTotalDebtByDate(credit, forDay);
+    if (debtOpt.isEmpty()) {
+        return;
+    }
+    Debt debt = debtOpt.get();
+
+    // Overdue repayment order
+    List<String> overdueAccounts = List.of(
+        CreditCalculationConfiguration.LATE_FEE,        // 1. Late fee
+        CreditCalculationConfiguration.PAST_DUE_INTEREST, // 2. Overdue interest
+        CreditCalculationConfiguration.PAST_DUE_PRINCIPAL // 3. Overdue principal
+    );
+
+    for (String accountKey : overdueAccounts) {
+        debt.getAccount(accountKey)
+            .filter(MonetaryAmount::isPositive)
+            .ifPresent(amount -> plan.add(new AllocationPlanItem(
+                credit.getId(),
+                credit.getShortId(),
+                "Overdue: " + accountKey,
+                CreditCalculationConfiguration.GENERAL,
+                amount
+            )));
+    }
+}
+
+private void addInterestItem(List<AllocationPlanItem> plan, ExampleCredit credit, LocalDate forDay) {
+    debtService.getTotalDebtByDate(credit, forDay)
+        .flatMap(debt -> debt.getAccount(CreditCalculationConfiguration.INTEREST))
+        .filter(MonetaryAmount::isPositive)
+        .ifPresent(amount -> plan.add(new AllocationPlanItem(
+            credit.getId(),
+            credit.getShortId(),
+            "Accrued interest",
+            CreditCalculationConfiguration.GENERAL,
+            amount
+        )));
+}
+
+private void addPrincipalItem(List<AllocationPlanItem> plan, ExampleCredit credit, LocalDate forDay) {
+    debtService.getTotalDebtByDate(credit, forDay)
+        .flatMap(debt -> debt.getAccount(CreditCalculationConfiguration.PRINCIPAL))
+        .filter(MonetaryAmount::isPositive)
+        .ifPresent(amount -> plan.add(new AllocationPlanItem(
+            credit.getId(),
+            credit.getShortId(),
+            "Principal balance",
+            CreditCalculationConfiguration.GENERAL,
+            amount
+        )));
+}
+----
+
+=== Step 3: PaymentMethod (optional)
+
+Create entity for storing payment document data:
+
+
+
+**Implementation example:**
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue(HubPaymentMethod.TYPE)
+public class HubPaymentMethod extends PaymentMethod {
+
+    public static final String TYPE = "HUB";
+
+    @Column(name = "document_number")
+    private String documentNumber;
+
+    protected HubPaymentMethod() {
+        super(TYPE);
+    }
+
+    public HubPaymentMethod(String documentNumber) {
+        super(TYPE);
+        this.documentNumber = documentNumber;
+    }
+
+    public String getDocumentNumber() {
+        return documentNumber;
+    }
+
+    @Override
+    public boolean isExpired() {
+        return false;
+    }
+}
+----
+
+=== Step 4: Action for Transaction Creation
+
+Create action for registering incoming payment:
+
+**Implementation example:**
+
+[source,java]
+----
+@RequestMapping("/add-transaction")
+@Controller
+public class AddTransactionClientAction
+    extends EntityActionController<UUID, Client, ClientTransactionForm> {
+
+    @Autowired
+    private PaymentHubTransactionRepository transactionRepository;
+
+    @Override
+    protected EntityAction<? super Client, ClientTransactionForm> action() {
+        return when(client -> true)
+            .then((client, form, user) -> {
+                // 1. Create transaction
+                PaymentHubTransaction transaction = new PaymentHubTransaction();
+                transaction.setType(TransactionType.INCOMING);
+                transaction.setStatus(TransactionStatus.SUCCEED);
+                transaction.setPurpose(CreditCalculationConfiguration.GENERAL_PURPOSE);
+                transaction.setAmount(form.getAmount());
+                transaction.setOwnerId(client.getId());
+
+                // 2. Optional: payment document data
+                transaction.setPaymentMethod(new HubPaymentMethod(form.getDocumentNumber()));
+
+                // 3. Save
+                transaction = transactionRepository.save(transaction);
+
+                // 4. Redirect to transaction page
+                setRedirectToPath("/transaction/" + transaction.getId());
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(UUID id, Model model, String actionPath) {
+        model.addAttribute("form", new ClientTransactionForm());
+        return "/transaction/edit";
+    }
+}
+----
+
+==== Transaction Creation Form
+
+[source,java]
+----
+public static class ClientTransactionForm {
+
+    @Positive
+    @NotNull
+    private MonetaryAmount amount;
+
+    @NotNull
+    @DateTimeFormat(pattern = PATTERN_DATEPICKER_FORMAT)
+    @PastOrPresent
+    private LocalDate date;
+
+    @NotBlank
+    private String documentNumber;
+
+    // getters and setters
+}
+----
+
+=== Step 5: Action for Smart Allocation
+
+Create action for automatic allocation with preview:
+
+**Implementation example:**
+
+[source,java]
+----
+@RequestMapping("/smart-distribute")
+@Controller
+@Order(1000)
+public class SmartAllocationPaymentTransactionAction
+    extends EntityActionController<Long, PaymentHubTransaction, SmartAllocationForm> {
+
+    @Autowired
+    private PaymentHubService paymentHubService;
+    @Autowired
+    private ReloadPageHelper reloadPageHelper;
+    @Autowired
+    private PaymentHubTransactionRepository transactionRepository;
+
+    @Override
+    public String getHighlighted() {
+        return BTN_SUCCESS;  // Green button
+    }
+
+    @Override
+    protected EntityAction<? super PaymentHubTransaction, SmartAllocationForm> action() {
+        return when(t -> t.getStatus().isSuccessful() && t.getAvailableAmount().isPositive())
+            .then((transaction, form, user) -> {
+                // Execute allocation
+                paymentHubService.allocate(transaction, form.getDate());
+                reloadPageHelper.reload(transaction);
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(Long id, Model model, String actionPath) {
+        model.addAttribute("form", new SmartAllocationForm());
+        model.addAttribute("transactionId", id);
+        return "/transaction/action/smart-distribute";
+    }
+
+    // Endpoint for AJAX plan request (preview)
+    @RequestMapping(value = "/get-plan", method = RequestMethod.GET)
+    @ResponseBody
+    public Map<UUID, Map<CreditPaymentType, MonetaryAmount>> getPlan(
+            @RequestParam("transactionId") Long transactionId,
+            @RequestParam("date") String dateString) {
+
+        LocalDate date = LocalDate.parse(dateString,
+            DateTimeFormatter.ofPattern(PATTERN_DATEPICKER_FORMAT));
+        PaymentHubTransaction transaction = transactionRepository.getReferenceById(transactionId);
+
+        return paymentHubService.findAllocation(transaction, date);
+    }
+}
+----
+
+=== Step 6: Action for Void with Recalculation
+
+Create action for transaction cancellation:
+
+**Implementation example:**
+
+[source,java]
+----
+@Controller
+@RequestMapping("/void-paid")
+public class VoidPaymentHubTransactionAction
+    extends EntityActionController<Long, PaymentHubTransaction, Object> {
+
+    @Autowired
+    private CreditCalculationService creditCalculationService;
+    @Autowired
+    private ExampleCreditRepository creditRepository;
+    @Autowired
+    private PaymentHubTransactionRepository transactionRepository;
+    @Autowired
+    private EntityManager entityManager;
+
+    @Override
+    protected EntityAction<? super PaymentHubTransaction, Object> action() {
+        return when(t -> t.getStatus().isSuccessful() && t.getStatus().isComplete())
+            .then((transaction, form, user) -> {
+                // 1. Set status to VOIDED
+                transaction.setStatus(TransactionStatus.VOIDED);
+
+                // 2. Find all active payments
+                List<CreditPayment> payments = transaction.getPayments().stream()
+                    .filter(p -> p.getStatus() == OperationStatus.APPROVED)
+                    .toList();
+
+                // 3. Cancel payments
+                payments.forEach(p -> p.setStatus(OperationStatus.CANCELED));
+                transactionRepository.saveAndFlush(transaction);
+                entityManager.clear();
+
+                // 4. Recalculate affected credits
+                for (CreditPayment payment : payments) {
+                    ExampleCredit credit = creditRepository.findByOperationsIn(payment);
+                    creditCalculationService.calculate(
+                        credit.getId(),
+                        credit.getStartDate(),
+                        credit.getCalculationDate()
+                    );
+                }
+            });
+    }
+
+    @Override
+    protected String getActionTemplate(Long id, Model model, String actionPath) {
+        model.addAttribute("title", "transaction.dialog.action.void.title");
+        model.addAttribute("message", "transaction.dialog.action.void.message");
+        return "/common/action/yes-no";
+    }
+}
+----
+
+=== Step 7: UI Templates
+
+==== Transaction Creation Template
+
+File: `{templatedir}/transaction/edit.html`
+
+==== Smart Allocation Template
+
+File: `{templatedir}/transaction/action/smart-distribute.html`
+
+**Key elements:**
+
+* Date selection field
+* Plan preview table (populated via AJAX)
+* JavaScript for loading plan on date change
+
+=== Step 8: Localization
+
+Add translations to `messages.properties`:
+
+[source,properties]
+----
+# Actions
+client.action.add-transaction=Add Payment
+transaction.action.smart-distribute=Distribute Automatically
+transaction.action.void-paid=Cancel
+
+# Dialogs
+transaction.dialog.distribute=Payment Distribution
+transaction.distribution.plan=Distribution Plan
+transaction.dialog.action.void.title=Cancel Transaction
+transaction.dialog.action.void.message=Are you sure you want to cancel the transaction? All allocated payments will be cancelled.
+
+# Fields
+transaction.credit=Credit
+transaction.amount=Amount
+transaction.date=Date
+transaction.unallocatedAmount=Unallocated Balance
+transaction.owner=Owner
+transaction.ownerId=Owner ID
+hubPaymentMethod.documentNumber=Document Number
+
+# Labels
+label.paymentHubTransactionAllocated=Allocated
+label.paymentHubTransactionPartlyAllocated=Partly Allocated
+label.paymentHubTransactionUnallocated=Unallocated
+----
+
+== UI Integration
+The library provides ready-to-use UI components that can be used or extended.
+
+=== Library Components
+[cols="1,2,2",options="header"]
+|===
+|Component |Class |Purpose
+|Transaction List
+|PaymentTransactionController
+|Display transaction list with filtering
+|Manual Allocation
+|ManualAllocationPaymentTransactionAction
+|Manual allocation to specific credit
+|Void (unallocated)
+|VoidPaymentTransactionAction
+|Cancel transaction without allocated payments
+|Credits Tab
+|PaymentHubTransactionCreditTab
+|List of owner's credits and allocated payments
+|===
+
+
+=== ManualAllocationPaymentTransactionAction — Manual Allocation
+Action for allocating part of amount to specific credit. +
+Endpoint: `/manual-distribute` +
+Availability condition:
+[source,java]
+when(t -> t.getOwnerId() != null
+&& t.getStatus().isSuccessful()
+&& t.getAvailableAmount().isPositive())
+
+Form parameters:
+[cols="1,2,2",options="header"]
+|===
+|Field |Type |Description
+|creditId
+|UUID
+|Selected credit from available list
+|creditPaymentType
+|CreditPaymentType
+|Payment type
+|amount
+|MonetaryAmount
+|Amount (not exceeding availableAmount)
+|date
+|LocalDate
+|Payment date (not in future)
+|===
+
+Template: `{templatedir}/transaction/action/manual-distribute.html`
+
+Feature: Supports `?credit=creditId` parameter for credit preselection from tab.
+
+=== VoidPaymentTransactionAction — Transaction Cancellation
+Action for cancelling transaction that has no allocated payments. +
+Endpoint: `/void` +
+Availability condition:
+[source,java]
+
+when(t -> t.getStatus().isSuccessful()
+&& t.getAmount().isEqualTo(t.getAvailableAmount()))
+
+Important: Available only if transaction is completely unallocated (`amount == availableAmount`). For cancelling allocated transaction a custom action is needed (see Step 6 in implementation example).
+
+=== PaymentHubTransactionCreditTab — Credits Tab
+Tab on transaction page showing owner's credits and allocated payments. +
+Endpoint: /credits +
+Visibility condition:
+[source,java]
+----
+@Override
+public boolean isVisible(PaymentHubTransaction entity) {
+    return entity.getOwnerId() != null;
+}
+----
+Displays:
+
+List of owner's credits (from `AllocationTargetProvider`)
+For each credit — Manual Allocation button with preselection
+Allocated payments with account breakdown
+
+Template: `{templatedir}/transaction/tab/credits.html`
+
+=== Extending UI Components
+==== Adding Custom Action
+[source,java]
+----
+@RequestMapping("/smart-distribute")
+@Controller
+@Order(1000)  // Display order (lower = earlier)
+public class SmartAllocationPaymentTransactionAction
+    extends EntityActionController<Long, PaymentHubTransaction, SmartAllocationForm> {
+    @Override
+    public String getHighlighted() {
+        return BTN_SUCCESS;  // Button color: BTN_SUCCESS, BTN_SECONDARY, BTN_DANGER
+    }
+
+    @Override
+    protected EntityAction<? super PaymentHubTransaction, SmartAllocationForm> action() {
+    return when(t -> true /* availability condition */)
+    .then((t, f, u) -> { /* logic */ });
+    }
+}
+----
+
+==== Adding Custom Tab
+[source,java]
+----
+@RequestMapping("/allocation-history")
+@Controller
+@Order(9000)
+public class AllocationHistoryTab extends EntityTabController<Long, PaymentHubTransaction> {
+    @Override
+    protected String getTabTemplate(Long id, Model model) {
+        PaymentHubTransaction transaction = loadEntity(id);
+        model.addAttribute("payments", transaction.getPayments());
+        return "/transaction/tab/allocation-history";
+    }
+
+    @Override
+    public boolean isVisible(PaymentHubTransaction entity) {
+        return !entity.getPayments().isEmpty();
+    }
+}
+----
+
+=== Labels — Visual Markers
+The library provides three labels for displaying allocation status.
+
+==== Label Registration
+Labels are automatically registered as Spring beans:
+[source,java]
+----
+@Bean
+public PaymentHubTransactionAllocatedLabel allocatedLabel() {
+    return new PaymentHubTransactionAllocatedLabel();
+}
+@Bean
+public PaymentHubTransactionPartlyAllocatedLabel partlyAllocatedLabel() {
+    return new PaymentHubTransactionPartlyAllocatedLabel();
+}
+@Bean
+public PaymentHubTransactionUnallocatedLabel unallocatedLabel() {
+    return new PaymentHubTransactionUnallocatedLabel();
+}
+----
+
+==== Usage in Templates
+[source,html]
+----
+<td th:with="labels = ${@entityLabelService.getLabelsForEntity(entity)}"
+    th:insert="~{/templates/label :: table-labels(${labels})}">
+</td>
+----
+
+== Best Practices
+Recommendations for designing and implementing Payment Hub.
+
+=== Provider Design
+==== One Provider per Owner Type
+
+Combine AllocationTargetProvider and AllocationPlanProvider in one class +
+This simplifies access to shared dependencies and ensures logic consistency
+
+==== Filtering in AllocationTargetProvider
+
+Always filter by currency — credit and transaction must be in the same currency +
+Always filter by status — only active credits +
+Return empty list, not null
+
+==== Building Plan in AllocationPlanProvider
+
+Item order determines allocation order +
+Item sum can exceed availableAmount — framework will stop automatically +
+Use clear description for logs and debugging
+
+=== Working with Transactions
+==== Transaction Creation
+
+Set status = SUCCEED for transactions ready for allocation +
+Always specify purpose — without it providers will not be found +
+ownerId must correspond to existing entity
+
+==== Credit Recalculation
+
+After allocate() recalculation is called automatically +
+After apply() call CreditCalculationService.calculate() yourself +
+On void don't forget to recalculate all affected credits
+
+=== Error Handling
+==== Amount Validation
+
+addPayment() validates that amount does not exceed availableAmount +
+Catch IllegalArgumentException on manual allocation +
+Show availableAmount to user in UI
+
+==== Transactionality
+
+allocate() and apply() must execute within transaction +
+On error entire operation is rolled back +
+Use @Transactional at Action or Service level
+
+=== UI and UX
+==== Smart Allocation
+
+Always show plan preview before applying +
+Allow selecting allocation date +
+Display total allocation amount +
+
+==== Manual Allocation
+
+Prefill credit if user came from credits tab +
+Limit amount to availableAmount value +
+Show current debt for selected credit
+
+==== Labels
+
+Use color coding for allocation status +
+Allocated — green, Partly — yellow, Unallocated — gray +
+Labels help quickly assess status in transaction list
+
+=== Testing
+==== Provider Unit Tests
+
+Test filtering by currency and status +
+Test item order in plan +
+Test edge cases: empty credit list, zero debt
+
+==== Integration Tests
+
+Test full cycle: creation → allocation → void +
+Verify credit recalculation after each operation +
+Test partial allocation
+
+== Anti-Patterns
+Common mistakes when working with Payment Hub and how to avoid them.
+
+=== Provider Errors
+==== Not Checking Currency
+[.unstyled]
+
+{bad} Problem: Credit in EUR, transaction in USD — results in incorrect allocation or error.
+
+Bad:
+[source,java]
+return client.getCredits().stream()
+    .filter(this::isActive)
+    .toList();  // currency not checked!
+
+Good:
+[source,java]
+return client.getCredits().stream()
+    .filter(this::isActive)
+    .filter(c -> c.getCurrency().equals(currency))
+    .toList();
+
+=== Returning null Instead of Empty List
+[.unstyled]
+
+{bad} Problem: NullPointerException in PaymentHubService.
+
+Bad:
+[source,java]
+
+if (credits.isEmpty()) {
+    return null;
+}
+
+Good:
+
+[source,java]
+if (credits.isEmpty()) {
+    return List.of();
+}
+
+=== Not Filtering by Credit Status
+[.unstyled]
+
+{bad} Problem: Allocation to closed or cancelled credit.
+
+Bad:
+[source,java]
+return client.getCredits();  // including CLOSED, VOID
+
+Good:
+[source,java]
+return client.getCredits().stream()
+    .filter(c -> c.getStatus().in(ACTIVE, GRACE_PERIOD))
+    .toList();
+
+==== Multiple Providers for Same Type
+[.unstyled]
+
+{bad} Problem: IllegalStateException on application startup.
+
+Bad:
+[source,java]
+@Service
+public class ClientTargetProvider implements AllocationTargetProvider<Client> { }
+@Service
+public class AnotherClientProvider implements AllocationTargetProvider<Client> { }  // duplicate!
+
+Good:
+[source,java]
+@Service
+public class ClientAllocationPlanner
+    implements AllocationTargetProvider<Client>, AllocationPlanProvider<Client> { }
+
+=== Allocation Errors
+
+==== Not Recalculating Credit After apply()
+[.unstyled]
+
+{bad} Problem: Credit schedule is not updated, data is out of sync.
+
+Bad:
+[source,java]
+paymentHubService.apply(credit, paymentType, amount, transaction, today);
+// forgot to recalculate!
+
+Good:
+
+[source,java]
+paymentHubService.apply(credit, paymentType, amount, transaction, today);
+creditCalculationService.calculate(credit.getId(), today, credit.getCalculationDate());
+
+==== Not Recalculating Credits on Void
+[.unstyled]
+
+{bad} Problem: Cancelled payments are still counted in schedule.
+
+Bad:
+[source,java]
+transaction.setStatus(TransactionStatus.VOIDED);
+payments.forEach(p -> p.setStatus(OperationStatus.CANCELED));
+// credits not recalculated!
+
+Good:
+[source,java]
+transaction.setStatus(TransactionStatus.VOIDED);
+payments.forEach(p -> p.setStatus(OperationStatus.CANCELED));
+for (CreditPayment payment : payments) {
+    Credit credit = findCreditByPayment(payment);
+    creditCalculationService.calculate(credit.getId(), ...);
+}
+
+==== Ignoring Payment Status When Counting
+[.unstyled]
+
+{bad} Problem: availableAmount is calculated incorrectly, including cancelled payments.
+
+Bad:
+[source,java]
+MonetaryAmount paid = payments.stream()
+    .map(CreditPayment::getAmount)
+    .reduce(MonetaryAmount::add)
+    .orElse(zero);
+
+Good:
+[source,java]
+MonetaryAmount paid = payments.stream()
+    .filter(p -> p.getStatus() == OperationStatus.APPROVED)
+    .map(CreditPayment::getAmount)
+    .reduce(MonetaryAmount::add)
+    .orElse(zero);
+
+=== UI Errors
+==== Not Limiting Amount in Form
+[.unstyled]
+
+{bad} Problem: User enters amount greater than availableAmount, gets error.
+
+Solution: Server-side validation + display maximum amount in UI.
+
+==== Not Refreshing Page After Allocation
+[.unstyled]
+
+{bad} Problem: User sees stale data.
+
+Solution: Use `reloadPageHelper.reload(transaction)` after successful allocation.
+
+=== Configuration Errors
+==== Not Registering PaymentTransactionPurpose
+[.unstyled]
+
+{bad} Problem: Providers not found, allocation doesn't work.
+
+Solution: Create PaymentTransactionPurpose constant in configuration:
+[source,java]
+public static final PaymentTransactionPurpose<Client> GENERAL_PURPOSE =
+new PaymentTransactionPurpose<>("GENERAL", Client.class);
+
+== Production Checklist
+Final checklist before launching Payment Hub in production.
+
+=== Configuration
+[.unstyled]
+
+* {todo} PaymentTransactionPurpose registered for each owner type
+* {todo} CreditPaymentType defined for all payment types
+
+=== Providers
+[.unstyled]
+
+* {todo} AllocationTargetProvider implemented and marked with @Service or @Component
+* {todo} AllocationPlanProvider implemented and marked with @Service or @Component
+* {todo} Exactly one provider of each type per owner class
+* {todo} Currency filtering in provideAllocationTargets()
+* {todo} Credit status filtering (only active)
+* {todo} Return empty list instead of null
+* {todo} Clear description in AllocationPlanItem
+
+=== Allocation
+[.unstyled]
+
+* {todo} CreditCalculationService.calculate() called after apply()
+* {todo} On void all affected credits are recalculated
+* {todo} APPROVED status considered when calculating availableAmount
+* {todo} Transactionality ensured (@Transactional)
+
+=== UI and Actions
+[.unstyled]
+
+* {todo} Transaction creation action works correctly
+* {todo} Smart Allocation shows plan preview
+* {todo} Manual Allocation validates amount (not exceeding availableAmount)
+* {todo} Void Action recalculates credits after cancellation
+* {todo} Credits tab displays allocated payments
+* {todo} Labels displayed in transaction list
+* {todo} reloadPageHelper.reload() called after changes
+
+=== Localization
+[.unstyled]
+
+* {todo} Translations for actions added to messages.properties
+* {todo} Translations for labels added
+* {todo} Translations for form fields added
+* {todo} Translations for confirmation dialogs added
+
+=== Testing
+[.unstyled]
+
+* {todo} Unit tests for AllocationTargetProvider
+* {todo} Unit tests for AllocationPlanProvider
+* {todo} Tests for currency and status filtering
+* {todo} Tests for allocation order (FIFO/LIFO/Priority)
+* {todo} Integration test: creation → allocation → verification
+* {todo} Integration test: void with credit recalculation
+* {todo} Partial allocation test
+* {todo} Zero debt allocation test
+
+=== Monitoring and Logging
+[.unstyled]
+
+* {todo} Transaction creation logging
+* {todo} Allocation results logging
+* {todo} Void operations logging
+* {todo} Metrics: transaction count by status
+* {todo} Metrics: average allocation time
+* {todo} Alerts on allocation errors
