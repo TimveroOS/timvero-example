@@ -1,0 +1,553 @@
+= Entity History
+
+:sourcedir: ../../main/java/com/timvero/example
+:templatedir: ../../main/resources/templates
+
+Track and display entity changes over time with automatic timeline views showing who changed what and when.
+
+== Overview
+
+The history system automatically tracks:
+
+* **Entity Creation** - When entities were created and by whom
+* **Field Changes** - What fields changed with before/after values
+* **Related Entities** - When related entities (comments, payments, etc.) were added
+* **Custom Events** - Business-specific events tailored to your needs
+
+All events are displayed in a unified timeline with icons, dates, and user information.
+
+== Quick Setup
+
+To add history tracking to your entity:
+
+1. Create history suppliers extending base classes
+2. Add `EntityHistoryTabController` to display the timeline
+
+NOTE: Suppliers based on Envers audit tables (`AbstractAddedHistorySupplier`, `AbstractModifiedHistorySupplier`, and their related entity variants) require entities to be annotated with `@Audited`. Other suppliers (Credit, Custom) do not require this annotation.
+
+TIP: The framework provides base supplier classes for common scenarios. For business-specific events, implement custom suppliers.
+
+=== Creating History Tab
+
+To display history on an entity's detail page, create a controller extending `EntityHistoryTabController`:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/tab/ParticipantHistoryTab.java[tags=class]
+----
+
+Add tab label to i18n:
+
+[source,properties]
+----
+participant.tab.history=History
+----
+
+The History tab will automatically appear on entity detail pages with the timeline.
+
+== How It Works
+
+The history module consists of several components working together:
+
+=== HistoryEventSupplier (Interface)
+
+*What it is:* The base interface that all history suppliers implement.
+
+*What it does:* Defines how to get history events for a specific entity type.
+
+*Key methods:*
+
+* `getRootClass()` - Returns the entity class this supplier handles (e.g., `Product.class`)
+* `getHistoryEvents(entity)` - Returns list of history events for the entity
+* `getEventPage()` - Returns path to Thymeleaf template for rendering events
+* `getEventModel()` - Returns additional data for the template (optional)
+
+*You implement this by:* Extending one of the abstract supplier classes (AbstractAddedHistorySupplier, etc.) rather than implementing directly.
+
+=== HistoryEventProvider (Service)
+
+*What it is:* The central service that collects and provides history events.
+
+*What it does:*
+
+* Automatically finds all `HistoryEventSupplier` beans registered in Spring
+* For a given entity, finds all suppliers that handle that entity type
+* Calls each supplier to get events
+* Aggregates all events and sorts them by date (newest first)
+* Returns events ready for display
+
+*Note:* You don't need to register your suppliers anywhere
+
+=== EntityHistoryTabController (Controller)
+
+*What it is:* Abstract controller for adding a History tab to entity detail pages.
+
+*What it does:*
+
+* Automatically creates a History tab on your entity's detail page
+* Injects `HistoryEventProvider` to fetch events
+* Renders the history timeline using standard Thymeleaf template
+* Provides `isVisible()` method to conditionally show/hide the tab
+
+*You use it by:* Creating a class that extends it, specifying your entity type, and annotating with `@Controller`.
+
+== History Supplier Classes
+
+The framework provides several types of history suppliers for different tracking scenarios:
+
+[cols="2,3"]
+|===
+|Supplier Class |Purpose
+
+|<<tracking-entity-creation,AbstractAddedHistorySupplier>>
+|Tracks entity creation
+
+|<<tracking-field-changes,AbstractModifiedHistorySupplier>>
+|Tracks field changes with before/after values
+
+|<<tracking-related-entities,AbstractRelatedEntityAddedHistorySupplier>>
+|Tracks related entity additions
+
+|<<tracking-related-entity-changes,AbstractRelatedEntityModifiedHistorySupplier>>
+|Tracks field changes in a related entity
+
+|<<credit-payment-history,CreditPaymentHistorySupplier>>
+|Tracks credit payments and refunds
+|===
+
+NOTE: All suppliers are automatically discovered by Spring when annotated with `@Component`. No manual registration needed.
+
+=== AbstractAddedHistorySupplier
+
+*Purpose:* Tracks when an entity is created.
+
+*When to use:* You want to show "Entity created" events in the timeline.
+
+*What you provide:*
+
+* Entity class
+* Event type name (i18n key)
+
+*What you get:* Single event showing creation date and who created the entity.
+
+*Template:* Uses standard `/history/fragments/added` template.
+
+=== AbstractModifiedHistorySupplier
+
+*Purpose:* Tracks changes to specific fields in your entity.
+
+*When to use:* You want to show what fields changed with before/after values.
+
+*What you provide:*
+
+* Entity class
+* Event type name (i18n key)
+* List of tracked fields via `getTrackedFields()` method
+
+*What you get:* Events showing field changes in a table format with old and new values.
+
+*Template:* Uses standard `/history/fragments/modified` template.
+
+*Field tracking features:*
+
+* Simple fields: `"name"`, `"price"`, `"status"`
+* Nested fields: `"address.city"`, `"customer.email"`
+* Only tracks changes when values actually differ
+* Nested objects must also be `@Audited`
+
+=== AbstractRelatedEntityAddedHistorySupplier
+
+*Purpose:* Tracks when related/child entities are added to a parent entity.
+
+*When to use:* You want to show "Comment added", "Payment added", "Line item added" type events in the parent's history.
+
+*What you provide:*
+
+* Parent entity class
+* Child entity class
+* Event type name (i18n key)
+* Custom Thymeleaf template path
+* `getRelatedEntities()` method returning the collection of child entities
+
+*What you get:* Event for each related entity creation with your custom template rendering the details.
+
+*Template:* You provide custom template (e.g., `/history/fragments/comment`).
+
+[[tracking-entity-creation]]
+== Tracking Entity Creation
+
+Use `AbstractAddedHistorySupplier` when you want to track and display when an entity was created.
+
+=== What You Need
+
+1. Entity annotated with `@Audited`
+2. History supplier class extending `AbstractAddedHistorySupplier`
+3. i18n message for the event type
+
+=== Step-by-Step Guide
+
+==== 1. Ensure Entity is Audited
+
+Your entity must be annotated with `@Audited`:
+
+[source,java]
+----
+@Entity
+@Audited  // Required for history tracking
+public class Participant extends AbstractAuditable {
+    private ParticipantStatus status;
+    private Employment employment;
+    // ... other fields
+}
+----
+
+==== 2. Create the History Supplier
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/history/ParticipantAddedHistorySupplier.java[tags=class]
+----
+
+==== 3. Add i18n Message
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+history.type.PARTICIPANT_CREATED=Participant created
+----
+
+[[tracking-field-changes]]
+== Tracking Field Changes
+
+Use `AbstractModifiedHistorySupplier` when you want to track changes to specific fields in your entity and display before/after values.
+
+=== What You Need
+
+1. Entity annotated with `@Audited`
+2. Nested objects (if any) annotated with `@Audited`
+3. History supplier class extending `AbstractModifiedHistorySupplier`
+4. i18n message for the event type
+
+=== Step-by-Step Guide
+
+==== 1. Ensure Entity is Audited
+
+Your entity must be annotated with `@Audited` and `@Table` with name:
+
+[source,java]
+----
+@Entity
+@Table(name = "client")  // Required for field localization
+@Audited  // Required for history tracking
+public class Client extends AbstractAuditable {
+    @Embedded
+    private IndividualInfo individualInfo;
+
+    @Embedded
+    private ContactInfo contactInfo;
+
+    // ... other fields
+}
+----
+
+NOTE: The `@Table(name = "client")` attribute is required. The table name is used as the prefix for field localization keys (e.g., `client.individualInfo.fullName`).
+
+==== 2. Ensure Nested Objects are Audited
+
+If you're tracking fields in nested objects (using dot notation like `"individualInfo.fullName"`), those nested objects must also be `@Audited`:
+
+[source,java]
+----
+@Embeddable
+@Audited  // Required for tracking nested fields
+public class IndividualInfo {
+    private String fullName;
+    private LocalDate dateOfBirth;
+    // ... other fields
+}
+
+@Embeddable
+@Audited  // Required for tracking nested fields
+public class ContactInfo {
+    private String email;
+    private String phone;
+    // ... other fields
+}
+----
+
+==== 3. Create the History Supplier
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/client/history/ClientModifiedHistorySupplier.java[tags=class]
+----
+
+TIP: Use JPA metamodel constants (classes ending with `_`) instead of hardcoded strings for compile-time safety when refactoring.
+
+==== 4. Add i18n Messages
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+# Event type
+history.type.CLIENT_MODIFIED=Client modified
+
+# Field labels - used in the change table
+client.individualInfo.fullName=Full Name
+client.individualInfo.dateOfBirth=Date of Birth
+client.contactInfo.email=Email
+client.contactInfo.phone=Phone
+----
+
+The `history.type.*` key is for the event name. The `client.*` keys are for field labels shown in the changes table.
+
+[[tracking-related-entities]]
+== Tracking Related Entity Additions
+
+Use `AbstractRelatedEntityAddedHistorySupplier` when you want to track when related/child entities are added to a parent entity.
+
+=== What You Need
+
+1. Parent entity annotated with `@Audited`
+2. Related entity annotated with `@Audited`
+3. History supplier class extending `AbstractRelatedEntityAddedHistorySupplier`
+4. Custom Thymeleaf template for displaying the related entity
+5. i18n message for the event type
+
+=== Step-by-Step Guide
+
+==== 1. Ensure Entities are Audited
+
+Both parent and related entities must be annotated with `@Audited`:
+
+[source,java]
+----
+@Entity
+@Table(name = "client")
+@Audited
+public class Client extends AbstractAuditable {
+    @OneToMany(mappedBy = Participant_.CLIENT)
+    private Set<Participant> participants;
+    // ...
+}
+
+@Entity
+@Table(name = "application")
+@Audited
+public class Application extends AbstractAuditable {
+    @OneToMany(mappedBy = Participant_.APPLICATION, cascade = ALL, fetch = EAGER)
+    private Set<Participant> participants;
+    // ...
+}
+
+@Entity
+@Table(name = "participant")
+@Audited
+public class Participant extends AbstractAuditable {
+    @ManyToOne(fetch = EAGER)
+    @JoinColumn(nullable = false, updatable = false)
+    private Client client;
+
+    @ManyToOne(fetch = EAGER)
+    @JoinColumn(nullable = false, updatable = false)
+    private Application application;
+    // ...
+}
+----
+
+==== 2. Create the History Supplier
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/client/history/ClientParticipantCreatedEventSupplier.java[tags=class]
+----
+
+==== 3. Create Custom Template
+
+Create a Thymeleaf template at `/history/fragments/client/participant_created.html`:
+
+[source,html]
+----
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<th:block th:fragment="history">
+    <div>
+        <span th:text="#{history.participant.created}">Participant added:</span>
+        <a th:href="@{/participant/{id}(id=${event.relatedEntity.id})}"
+           th:text="${event.relatedEntity.displayedName}"></a>
+    </div>
+</th:block>
+</html>
+----
+
+The template has access to:
+
+* `event.relatedEntity` - the related entity instance (Participant in this case)
+* `event.icon`, `event.type`, `event.date`, `event.auditor` - standard event properties
+
+==== 4. Add i18n Messages
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+# Event type
+history.type.CLIENT_PARTICIPANT_CREATED=Participant added
+
+# Template labels
+history.participant.created=Participant added
+----
+
+[[tracking-related-entity-changes]]
+== Tracking Related Entity Field Changes
+
+Use `AbstractRelatedEntityModifiedHistorySupplier` when you want to track changes to fields in a related entity and display them in the parent entity's history.
+
+=== What You Need
+
+1. Parent entity annotated with `@Audited`
+2. Related entity annotated with `@Audited`
+3. History supplier class extending `AbstractRelatedEntityModifiedHistorySupplier`
+4. i18n message for the event type
+5. i18n messages for field labels
+
+=== When to Use
+
+This supplier is useful when:
+
+* You want to show changes to a related entity in the parent's history timeline
+* The parent has a ManyToOne or OneToOne relationship with the related entity
+* You want to track specific fields in the related entity (e.g., status changes)
+
+*Example:* Show Application status changes in the Participant's history timeline.
+
+=== Step-by-Step Guide
+
+==== 1. Ensure Entities are Audited
+
+Both parent and related entities must be annotated with `@Audited`:
+
+[source,java]
+----
+@Entity
+@Table(name = "participant")
+@Audited
+public class Participant extends AbstractAuditable {
+    @ManyToOne(fetch = EAGER)
+    @JoinColumn(nullable = false, updatable = false)
+    private Application application;
+    // ...
+}
+
+@Entity
+@Table(name = "application")
+@Audited
+public class Application extends AbstractAuditable {
+    @Column(nullable = false)
+    @Enumerated(STRING)
+    private ApplicationStatus status = ApplicationStatus.NEW;
+    // ...
+}
+----
+
+==== 2. Create the History Supplier
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/history/ParticipantApplicationStatusChangedHistorySupplier.java[tags=class]
+----
+
+==== 3. Add i18n Messages
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+# Event type
+history.type.APPLICATION_STATUS_CHANGED=Application status changed
+
+# Field labels - used in the change table
+application.status=Application Status
+----
+
+The field labels follow the pattern: `{table_name}.{field_name}` where table_name comes from `@Table(name = "application")`.
+
+[[credit-history]]
+== Credit History Tracking
+
+For Credit entities, the framework provides a specialized history supplier that tracks payment and refund operations.
+
+[[credit-payment-history]]
+=== CreditPaymentHistorySupplier
+
+Abstract supplier that tracks credit payment and refund operations. Extend this class to enable payment tracking for your credit entity.
+
+==== Implementation Example
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/credit/history/ExampleCreditPaymentHistorySupplier.java[tags=class]
+----
+
+==== Add i18n
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+history.type.CREDIT_PAYMENT=Payment registered
+----
+
+[[custom-history-supplier]]
+== Custom History Supplier
+
+When the abstract supplier classes don't fit your needs, you can implement `HistoryEventSupplier` directly.
+
+=== When to Use
+
+Use a custom supplier when you need to:
+
+* Query data from multiple services (not just Envers audit tables)
+* Apply custom business logic to filter events
+* Include additional data that doesn't come from audit tables
+
+=== What You Need
+
+1. Class implementing `HistoryEventSupplier<EntityType, YourCustomEvent>`
+2. Custom event class extending `HistoryEvent` with your additional data
+3. Custom Thymeleaf template for rendering
+4. i18n messages
+
+=== Step-by-Step Guide
+
+==== 1. Create the History Supplier
+
+[source,java,indent=0]
+----
+include::{sourcedir}/admin/participant/history/ParticipantProcessExecutionsHistorySupplier.java[tags=class]
+----
+
+==== 2. Create Custom Template
+
+Create a Thymeleaf template at `/history/fragments/participant/participant_process_execution.html`:
+
+[source,html,indent=0]
+----
+include::{templatedir}/history/fragments/participant/participant_process_execution.html[]
+----
+
+==== 3. Add i18n Messages
+
+In `messages_en.properties`:
+
+[source,properties]
+----
+# Event type
+history.type.PARTICIPANT_PROCESS_EXECUTION=Decision tree executed
+
+# Template labels
+history.participant.process.execution=Decision tree executed
+history.participant.process.execution.facts=Decision facts
+----

@@ -1,0 +1,21 @@
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<th:block th:fragment="history">
+    <div>
+        <span th:text="#{history.participant.process.execution}">Process execution:</span>
+        <strong th:text="${event.processExecution.processSpecification.name}"></strong>
+
+        <div th:if="${!event.decisionFacts.isEmpty()}" class="mt-2">
+            <small class="text-muted">
+                <span th:text="#{history.participant.process.execution.facts}">Decision facts:</span>
+                <ul class="mb-0">
+                    <li th:each="entry : ${event.decisionFacts.entrySet()}">
+                        <strong th:text="${entry.key}"></strong>:
+                        <span th:text="${#strings.listJoin(entry.value, ', ')}"></span>
+                    </li>
+                </ul>
+            </small>
+        </div>
+    </div>
+</th:block>
+</html>

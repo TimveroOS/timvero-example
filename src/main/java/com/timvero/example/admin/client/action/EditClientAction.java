@@ -10,5 +10,9 @@ import org.springframework.stereotype.Controller;
 @Controller
 public class EditClientAction extends EditEntityActionController<UUID, Client, ClientForm> {
 
+    @Override
+    protected boolean isOwnPage() {
+        return false;
+    }
 }
 // end::action-class[]

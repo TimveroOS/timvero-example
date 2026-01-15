@@ -16,7 +16,7 @@ import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 import org.hibernate.search.mapper.pojo.mapping.definition.annotation.IndexedEmbedded;
 
 @Entity
-@Table
+@Table(name = "client")
 @Audited
 @Indexed
 public class Client extends AbstractAuditable implements NamedEntity, Notifiable {
