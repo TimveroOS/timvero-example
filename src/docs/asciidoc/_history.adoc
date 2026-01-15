@@ -111,11 +111,8 @@ The framework provides several types of history suppliers for different tracking
 |<<tracking-related-entity-changes,AbstractRelatedEntityModifiedHistorySupplier>>
 |Tracks field changes in a related entity
 
-|<<credit-history,CreditPaymentHistorySupplier>>
+|<<credit-payment-history,CreditPaymentHistorySupplier>>
 |Tracks credit payments and refunds
-
-|<<credit-history,CreditActualSnapshotHistorySupplier>>
-|Tracks changes to credit snapshot (status, amounts, etc.)
 |===
 
 NOTE: All suppliers are automatically discovered by Spring when annotated with `@Component`. No manual registration needed.
@@ -480,8 +477,9 @@ The field labels follow the pattern: `{table_name}.{field_name}` where table_nam
 [[credit-history]]
 == Credit History Tracking
 
-For Credit entities, the framework provides specialized history suppliers that track payments and snapshot changes (status, amounts, etc.).
+For Credit entities, the framework provides a specialized history supplier that tracks payment and refund operations.
 
+[[credit-payment-history]]
 === CreditPaymentHistorySupplier
 
 Abstract supplier that tracks credit payment and refund operations. Extend this class to enable payment tracking for your credit entity.
@@ -501,60 +499,6 @@ In `messages_en.properties`:
 ----
 history.type.CREDIT_PAYMENT=Payment registered
 ----
-
-=== CreditActualSnapshotHistorySupplier
-
-Abstract supplier that tracks changes to the Credit's `actualSnapshot` field. Use this to monitor status changes, balance updates, or any snapshot-tracked data.
-
-==== Implementation Example
-
-[source,java,indent=0]
-----
-include::{sourcedir}/admin/credit/history/ExampleCreditStatusChangedHistorySupplier.java[tags=class]
-----
-
-==== Create Custom Template
-
-Create a Thymeleaf template at `/history/fragments/credit/credit_status_changed.html`:
-
-[source,html]
-----
-<html xmlns="http://www.w3.org/1999/xhtml"
-      xmlns:th="http://www.thymeleaf.org">
-<th:block th:fragment="history">
-    <div>
-        <span th:text="#{history.credit.status.changed}"></span>
-        <strong th:text="#{${'credit.status.' + event.snapshot.status}}"></strong>
-    </div>
-</th:block>
-</html>
-----
-
-The template has access to:
-
-* `event.snapshot` - The CreditSnapshot after the change
-* `event.snapshot.status` - Credit status value
-* Standard event properties: `event.icon`, `event.type`, `event.date`
-
-==== Add i18n
-
-In `messages_en.properties`:
-
-[source,properties]
-----
-history.type.CREDIT_STATUS_CHANGED=Credit status changed
-history.credit.status.changed=Status changed to
-----
-
-==== Other Use Cases
-
-You can track other snapshot changes by implementing different logic in `shouldCreateHistoryEvent()`:
-
-* **Balance changes** - Compare `beforeSnapshot.debt` and `afterSnapshot.debt`
-* **Interest rate changes** - Compare rate values
-* **Date changes** - Track maturity date or payment schedule updates
-
-TIP: The `CreditSnapshot` contains all credit calculation data at a point in time. You can track any field changes by comparing before/after snapshots.
 
 [[custom-history-supplier]]
 == Custom History Supplier
