@@ -20,6 +20,7 @@ import java.util.TreeMap;
 import javax.money.MonetaryAmount;
 import org.springframework.beans.factory.annotation.Autowired;
 
+// tag::class[]
 public abstract class AbstractAccrualEngine extends RangeBasedAccrualEngine<ExampleCredit> {
 
     @Autowired
@@ -82,3 +83,4 @@ public abstract class AbstractAccrualEngine extends RangeBasedAccrualEngine<Exam
         return counters;
     }
 }
+// end::class[]
