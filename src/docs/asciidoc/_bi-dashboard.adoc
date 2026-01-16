@@ -1,0 +1,709 @@
+= BI Dashboard Embedding
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+Integrate Apache Superset dashboards into your TimveroOS application with built-in role-based access control, automatic guest token management, and configurable embedding options.
+
+== What You'll Learn
+
+After reading this chapter, you'll know how to:
+
+* **Enable** the BI module via application properties
+* **Configure** Superset connection and embedding options
+* **Create** dashboard entities in the database
+* **Assign** dashboards to user roles for access control
+* **Customize** the embedded dashboard appearance
+* **Extend** with custom refresh and display logic
+
+== The Big Picture
+
+The BI module provides a secure way to embed Apache Superset dashboards directly into your application. Users see dashboards based on their role assignments, with automatic guest token authentication.
+
+=== Architecture Overview
+
+[source]
+----
++------------------------------------------------------------------+
+|                        User Browser                               |
++------------------------------------------------------------------+
+|  +--------------+    +--------------+    +---------------------+  |
+|  | /bi page     |--->| Fetch embed  |--->| Superset SDK loads  |  |
+|  | (Thymeleaf)  |    | info + token |    | iframe with token   |  |
+|  +--------------+    +------+-------+    +---------------------+  |
++----------------------------|-------------------------------------+
+                             |
++----------------------------|-------------------------------------+
+|                     Spring Boot Backend                           |
++------------------------------------------------------------------+
+|  BiController --> BiService --> SupersetClientService             |
+|       |               |                    |                      |
+|       v               v                    v                      |
+|  [Permission]   [BiDashboard]      [Guest Token API]              |
+|   BI_VIEW         Entity            POST /security/               |
+|                                     guest_token/                  |
++------------------------------------------------------------------+
+                             |
++----------------------------|-------------------------------------+
+|                    Apache Superset                                |
++------------------------------------------------------------------+
+|  - Authenticates via username/password                           |
+|  - Issues guest tokens for specific dashboards                   |
+|  - Serves embedded dashboard iframe                              |
++------------------------------------------------------------------+
+----
+
+=== Conditional Bean Activation
+
+All BI beans activate automatically when `bi.base-url` is configured:
+
+[source,java]
+----
+@Configuration
+@ConditionalOnProperty(name = "bi.base-url")
+public class BiConfiguration {
+    // BI components are only loaded when bi.base-url is set
+}
+----
+
+This means:
+
+* **No `bi.base-url`** = BI module is completely disabled
+* **With `bi.base-url`** = All BI services, controllers, and menu items are active
+
+== Core Components
+
+The BI module consists of these main components:
+
+[cols="2,3", options="header"]
+|===
+| Component | Purpose
+
+| `BiDashboardProperties`
+| Configuration properties for Superset connection and embedding
+
+| `BiDashboard`
+| JPA entity representing a dashboard configuration
+
+| `BiService`
+| Business logic for dashboard access and role validation
+
+| `SupersetClientService`
+| REST client for Superset API (authentication, guest tokens)
+
+| `BiDashboardEmbedInfo`
+| DTO containing embed URL, config, and token callback info
+
+| `BiController`
+| HTTP endpoints for viewing and API operations
+|===
+
+=== BiDashboard Entity
+
+The `BiDashboard` entity stores dashboard configurations:
+
+[source,java]
+----
+@Entity
+public class BiDashboard extends AbstractAuditable<UUID> {
+
+    @Column(nullable = false)
+    private String name;
+
+    @Column(nullable = false)
+    private String supersetDashboardId;
+
+    @Column(nullable = false)
+    private String supersetDashboardUuid;
+
+    private boolean active = true;
+
+    // Optional: override global embed config per dashboard
+    private String embedConfigJson;
+}
+----
+
+=== BiDashboardEmbedInfo DTO
+
+The frontend receives this DTO for embedding:
+
+[source,java]
+----
+public class BiDashboardEmbedInfo {
+    private String dashboardId;           // Superset dashboard UUID
+    private String dashboardUrl;          // Superset public URL
+    private String guestTokenEndpoint;    // Backend endpoint for token refresh
+    private Map<String, Object> embedConfig;  // Superset SDK config
+}
+----
+
+== Configuration
+
+=== Application Properties
+
+Configure the BI module in your `application.properties`:
+
+[source,properties]
+----
+# Required: Superset server URL (enables BI module)
+bi.base-url=https://superset.example.com
+
+# Optional: Public URL if different from base-url (for iframe access)
+bi.public-url=https://superset-public.example.com
+
+# Required: Superset admin credentials for guest token generation
+bi.username=admin
+bi.password=${BI_PASSWORD}
+
+# Embedding options
+bi.embed.hide-title=true
+bi.embed.hide-tab=true
+bi.embed.hide-chart-controls=false
+bi.embed.standalone=true
+bi.embed.theme=light
+
+# Connection settings
+bi.connection.timeout=PT30S
+bi.connection.max-retry-attempts=3
+bi.connection.validate-ssl=true
+----
+
+=== Configuration Properties Reference
+
+[cols="2,1,3", options="header"]
+|===
+| Property | Default | Description
+
+| `bi.base-url`
+| (required)
+| Superset server URL for API calls
+
+| `bi.public-url`
+| `bi.base-url`
+| Public URL for iframe embedding (use if different)
+
+| `bi.username`
+| (required)
+| Superset admin username for authentication
+
+| `bi.password`
+| (required)
+| Superset admin password
+
+| `bi.embed.hide-title`
+| `false`
+| Hide dashboard title in embed
+
+| `bi.embed.hide-tab`
+| `false`
+| Hide tab navigation for multi-tab dashboards
+
+| `bi.embed.hide-chart-controls`
+| `false`
+| Hide chart-level controls (export, filter)
+
+| `bi.embed.standalone`
+| `false`
+| Use standalone mode (minimal chrome)
+
+| `bi.embed.theme`
+| `light`
+| Theme: `light` or `dark`
+
+| `bi.connection.timeout`
+| `PT30S`
+| HTTP connection timeout (ISO 8601 duration)
+
+| `bi.connection.max-retry-attempts`
+| `3`
+| Retry attempts for failed API calls
+
+| `bi.connection.validate-ssl`
+| `true`
+| Validate SSL certificates
+|===
+
+WARNING: Never commit credentials to source control. Use environment variables or secrets management.
+
+== Quick Start
+
+=== Step 1: Enable BI Module
+
+Add configuration to `application.properties`:
+
+[source,properties]
+----
+bi.base-url=https://your-superset.example.com
+bi.username=admin
+bi.password=${BI_PASSWORD}
+----
+
+NOTE: All BI beans activate automatically when `bi.base-url` is configured.
+
+=== Step 2: Run Database Migration
+
+The BI module requires database tables. Run migration `V250826093451__biDashboard.sql`:
+
+[source,sql]
+----
+-- Creates bi_dashboard table
+CREATE TABLE bi_dashboard (
+    id UUID PRIMARY KEY,
+    version BIGINT,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    created_by VARCHAR(255),
+    updated_by VARCHAR(255),
+    name VARCHAR(255) NOT NULL,
+    superset_dashboard_id VARCHAR(255) NOT NULL,
+    superset_dashboard_uuid VARCHAR(255) NOT NULL,
+    active BOOLEAN DEFAULT TRUE,
+    embed_config_json TEXT
+);
+
+-- Adds bi_dashboard reference to user_role
+ALTER TABLE user_role ADD COLUMN bi_dashboard_id UUID
+    REFERENCES bi_dashboard(id);
+----
+
+=== Step 3: Register Dashboard
+
+Create a dashboard record in the database:
+
+[source,sql]
+----
+INSERT INTO bi_dashboard (
+    id,
+    active,
+    name,
+    superset_dashboard_id,
+    superset_dashboard_uuid
+)
+VALUES (
+    gen_random_uuid(),
+    true,
+    'Sales Dashboard',
+    '1',                      -- Superset internal ID
+    'abc-123-def-456-ghi'     -- Superset dashboard UUID
+);
+----
+
+TIP: Find the dashboard UUID in Superset: Dashboard → Edit → Embed settings.
+
+=== Step 4: Assign Dashboard to Role
+
+**Via Admin UI:**
+
+1. Navigate to **System → User Roles**
+2. Edit the target role
+3. Select the BI Dashboard from the dropdown
+4. Save
+
+**Or via SQL:**
+
+[source,sql]
+----
+UPDATE user_role
+SET bi_dashboard_id = 'your-dashboard-uuid'
+WHERE name = 'ANALYST';
+----
+
+=== Step 5: Grant Permission
+
+Ensure the role has `BI_VIEW` permission:
+
+[source,sql]
+----
+INSERT INTO user_role_permissions (user_role_id, permission)
+SELECT id, 'BI_VIEW' FROM user_role WHERE name = 'ANALYST';
+----
+
+Users with this role can now access the `/bi` page.
+
+== Controller Endpoints
+
+The `BiController` exposes these endpoints:
+
+=== View Page
+
+**GET `/bi`** - Main dashboard view page
+
+Returns the Thymeleaf template that loads the Superset SDK and embeds the dashboard.
+
+**Access:** Requires `BI_VIEW` permission
+
+=== Embed Info API
+
+**GET `/bi/api/{id}/embed`** - Get embedding information
+
+Returns `BiDashboardEmbedInfo` with dashboard configuration:
+
+[source,json]
+----
+{
+    "dashboardId": "abc-123-def-456",
+    "dashboardUrl": "https://superset.example.com",
+    "guestTokenEndpoint": "/bi/api/abc-123/guest-token",
+    "embedConfig": {
+        "hideTitle": true,
+        "hideTab": true,
+        "standalone": true
+    }
+}
+----
+
+=== Guest Token API
+
+**POST `/bi/api/{id}/guest-token`** - Generate fresh guest token
+
+Returns a Superset guest token for iframe authentication:
+
+[source,json]
+----
+{
+    "token": "eyJhbGciOiJIUzI1NiIsInR5..."
+}
+----
+
+NOTE: Guest tokens expire. The frontend automatically refreshes them using the callback mechanism.
+
+=== Dashboard Refresh API
+
+**POST `/bi/api/{id}/refresh`** - Trigger dashboard data refresh
+
+Forces Superset to refresh dashboard data (datasets, charts, cache):
+
+[source,json]
+----
+{
+    "success": true,
+    "message": "Dashboard refresh initiated"
+}
+----
+
+== Frontend Integration
+
+=== Template Structure
+
+The BI view template (`bi/view.html`) handles dashboard loading:
+
+[source,html]
+----
+<!DOCTYPE html>
+<html th:replace="~{layout :: base(content=~{::content})}">
+<th:block th:fragment="content">
+    <div id="bi-dashboard-container"
+         th:data-dashboard-id="${dashboard.id}"
+         th:data-embed-endpoint="@{/bi/api/{id}/embed(id=${dashboard.id})}">
+        <div class="loading-spinner" th:text="#{bi.dashboard.loading}">
+            Loading dashboard...
+        </div>
+    </div>
+
+    <script th:src="@{/static/js/bi/dashboard-embed.js}"></script>
+</th:block>
+</html>
+----
+
+=== JavaScript Embedding Flow
+
+The dashboard embedding uses the Superset Embedded SDK:
+
+[source,javascript]
+----
+// dashboard-embed.js
+import { embedDashboard } from '@superset-ui/embedded-sdk';
+
+async function initDashboard() {
+    const container = document.getElementById('bi-dashboard-container');
+    const embedEndpoint = container.dataset.embedEndpoint;
+
+    // Fetch embed configuration from backend
+    const response = await fetch(embedEndpoint);
+    const embedInfo = await response.json();
+
+    // Embed the dashboard
+    await embedDashboard({
+        id: embedInfo.dashboardId,
+        supersetDomain: embedInfo.dashboardUrl,
+        mountPoint: container,
+        fetchGuestToken: () => fetchGuestToken(embedInfo.guestTokenEndpoint),
+        dashboardUiConfig: embedInfo.embedConfig
+    });
+}
+
+async function fetchGuestToken(endpoint) {
+    const response = await fetch(endpoint, { method: 'POST' });
+    const data = await response.json();
+    return data.token;
+}
+
+document.addEventListener('DOMContentLoaded', initDashboard);
+----
+
+=== Guest Token Callback
+
+The `fetchGuestToken` callback is called:
+
+* On initial dashboard load
+* When the current token expires
+* After network reconnection
+
+This ensures seamless token refresh without page reloads.
+
+== Advanced Features
+
+=== Dashboard Refresh
+
+Users can manually refresh dashboard data:
+
+[source,javascript]
+----
+async function refreshDashboard(dashboardId) {
+    const response = await fetch(`/bi/api/${dashboardId}/refresh`, {
+        method: 'POST'
+    });
+
+    if (response.ok) {
+        // Reload iframe to show fresh data
+        document.querySelector('#bi-dashboard-container iframe').src += '';
+    }
+}
+----
+
+The backend refresh process:
+
+1. Authenticates with Superset admin credentials
+2. Calls Superset's refresh endpoint for each dataset
+3. Clears chart cache
+4. Returns success/failure status
+
+=== Per-Dashboard Configuration
+
+Override global embed settings for specific dashboards:
+
+[source,sql]
+----
+UPDATE bi_dashboard
+SET embed_config_json = '{"hideTitle": false, "theme": "dark"}'
+WHERE id = 'your-dashboard-uuid';
+----
+
+The JSON is merged with global defaults:
+
+[source,java]
+----
+public Map<String, Object> getEmbedConfig(BiDashboard dashboard) {
+    Map<String, Object> config = new HashMap<>(globalEmbedConfig);
+
+    if (dashboard.getEmbedConfigJson() != null) {
+        Map<String, Object> override = parseJson(dashboard.getEmbedConfigJson());
+        config.putAll(override);
+    }
+
+    return config;
+}
+----
+
+=== Multi-Role Dashboard Access
+
+Users can have multiple roles with different dashboards. The service returns the first assigned dashboard:
+
+[source,java]
+----
+public Optional<BiDashboard> getDashboardForUser(UserDetails user) {
+    return user.getRoles().stream()
+        .map(Role::getBiDashboard)
+        .filter(Objects::nonNull)
+        .filter(BiDashboard::isActive)
+        .findFirst();
+}
+----
+
+TIP: For users needing multiple dashboards, consider creating a combined "executive" dashboard in Superset.
+
+== Best Practices
+
+=== Security
+
+**Credential Management:**
+
+[source,properties]
+----
+# Good: Environment variable
+bi.password=${BI_PASSWORD}
+
+# Bad: Hardcoded value
+bi.password=admin123
+----
+
+**Network Security:**
+
+* Use HTTPS for `bi.base-url` and `bi.public-url`
+* Consider VPN or private network for Superset server
+* Enable SSL validation in production (`bi.connection.validate-ssl=true`)
+
+**Permission Scope:**
+
+* Use row-level security in Superset for data isolation
+* Guest tokens inherit the minimum required permissions
+* Avoid admin-level Superset accounts for embedding
+
+=== Performance
+
+**Token Caching:**
+
+Guest tokens have a configurable TTL. Consider caching tokens on the backend:
+
+[source,java]
+----
+@Cacheable(value = "guestTokens", key = "#dashboardId + '-' + #userId")
+public String getGuestToken(UUID dashboardId, UUID userId) {
+    return supersetClient.createGuestToken(dashboardId);
+}
+----
+
+**Connection Pooling:**
+
+Configure HTTP client connection pooling for Superset API calls:
+
+[source,properties]
+----
+bi.connection.pool-size=10
+bi.connection.keep-alive=PT5M
+----
+
+=== User Experience
+
+**Loading States:**
+
+[source,html]
+----
+<div id="bi-dashboard-container">
+    <div class="loading-state">
+        <div class="spinner"></div>
+        <span th:text="#{bi.dashboard.loading}">Loading...</span>
+    </div>
+</div>
+----
+
+**Error Handling:**
+
+[source,javascript]
+----
+try {
+    await embedDashboard({...});
+} catch (error) {
+    showError(i18n('bi.dashboard.error'));
+    console.error('Dashboard embed failed:', error);
+}
+----
+
+== Internationalization
+
+Add these message keys to your `messages.properties`:
+
+[source,properties]
+----
+# Menu and navigation
+menu.bi=BI
+
+# Page content
+bi.page.title=Business Intelligence
+
+# Status messages
+bi.dashboard.not.configured=BI dashboard is not configured
+bi.dashboard.not.assigned=No dashboard assigned to your role
+bi.dashboard.loading=Loading dashboard...
+bi.dashboard.error=Error loading dashboard
+
+# Actions
+bi.dashboard.refresh=Refresh
+bi.dashboard.last.updated=Last updated
+----
+
+== Troubleshooting
+
+=== Common Issues
+
+**"BI not available" / Menu item missing**
+
+The BI module is disabled. Check:
+
+* `bi.base-url` is set in application.properties
+* Application was restarted after adding configuration
+* No typos in property name
+
+**"Dashboard not found"**
+
+UUID mismatch between database and Superset:
+
+[source,sql]
+----
+-- Check stored UUID
+SELECT superset_dashboard_uuid FROM bi_dashboard;
+
+-- Compare with Superset dashboard settings
+----
+
+**"Token expired" / Authentication errors**
+
+Guest token TTL issues:
+
+* Check Superset's `GUEST_TOKEN_JWT_EXP_SECONDS` setting
+* Verify `fetchGuestToken` callback is being called
+* Check browser console for network errors
+
+**"Connection refused"**
+
+Network or firewall issues:
+
+* Verify Superset is accessible from application server
+* Check `bi.base-url` is correct (include port if non-standard)
+* Test with `curl` from the server
+
+**"SSL certificate error"**
+
+For development environments:
+
+[source,properties]
+----
+# Development only - do not use in production
+bi.connection.validate-ssl=false
+----
+
+For production, install proper certificates.
+
+**"No dashboard assigned to user"**
+
+Role configuration issue:
+
+[source,sql]
+----
+-- Check user's role
+SELECT ur.* FROM user_role ur
+JOIN user_roles_mapping urm ON ur.id = urm.role_id
+WHERE urm.user_id = 'your-user-id';
+
+-- Check role has dashboard assigned
+SELECT bi_dashboard_id FROM user_role WHERE id = 'role-id';
+----
+
+=== Debug Logging
+
+Enable debug logging for troubleshooting:
+
+[source,properties]
+----
+logging.level.com.timvero.bi=DEBUG
+logging.level.org.apache.http=DEBUG
+----
+
+== Related Chapters
+
+* **<<getting-started>>** - Entity-Form-Controller pattern fundamentals
+* **<<launchpad>>** - Similar dashboard and workflow concepts
+* **<<api-integration>>** - External API integration patterns
+
+---
+
+*Next:* Continue with Part III Business Logic chapters for entity actions and event-driven automation.
