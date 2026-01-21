@@ -4,11 +4,14 @@ Build lending applications fast with pre-built components.
 
 == What You Get
 
-* **Forms** — Collect customer data with built-in validation
-* **Database** — Automatic setup for loan data
-* **Payments** — Connect to banks and card processors
-* **UI Components** — Works on desktop and mobile
-* **Business Rules** — Automate loan decisions
+* **Entity-Form-Controller Pattern** — Define entities, get automatic CRUD operations and UI
+* **Credit Operations Framework** — Complete loan lifecycle with automated calculations, accruals, and past due processing
+* **Payment Transaction System** — Multi-gateway payment processing with complete audit trails
+* **Entity Actions & Checkers** — Add business logic as buttons and event-driven automation rules
+* **Document Management** — Upload requirements, generate contracts from templates, DocuSign integration
+* **Fast Search System** — Unified search across all entities using Hibernate Search and Lucene
+* **Workflow Integration** — Built-in decision workflows and launchpad for pending tasks
+* **Compliance & Audit** — Automatic audit trails, KYC/AML frameworks, complete change history
 
 ## What You Build
 

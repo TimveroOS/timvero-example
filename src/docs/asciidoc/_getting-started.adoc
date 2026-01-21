@@ -19,7 +19,7 @@ Before you begin, ensure you have the following installed:
 +
 [source,bash]
 ----
-git clone https://github.com/TimveroOS/timvero-example.git
+git clone https://github.com/timveroOS/timvero-example.git
 cd timvero-example
 ----
 
@@ -736,4 +736,4 @@ You're now ready to build powerful financial applications with the Timvero platf
 **Related Chapters:**
 * <<form-classes-setup-and-usage>> - Form classes, validation, MapStruct mappers, and service layers
 * <<html-template-integration>> - Thymeleaf components, validation classes, and UI integration
-* <<entity-checkers-setup-and-usage>> - Entity Checkers for event-driven business rules
+* <<entity-checkers-setup-usage>> - Entity Checkers for event-driven business rules

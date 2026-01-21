@@ -6,7 +6,7 @@ External data integration powers modern lending decisions through the DataSource
 
 == Architecture Overview
 
-The TimveroOS data integration follows a three-layer architecture:
+The timveroOS data integration follows a three-layer architecture:
 
 1. **DataSource Layer** - Fetches raw data from external APIs
 2. **DataSourceManager** - Manages caching, loading modes, and data lifecycle

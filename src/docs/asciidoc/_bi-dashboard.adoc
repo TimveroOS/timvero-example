@@ -2,7 +2,7 @@
 
 :sourcedir: ../../main/java/com/timvero/example/admin
 
-Integrate Apache Superset dashboards into your TimveroOS application with built-in role-based access control, automatic guest token management, and configurable embedding options.
+Integrate Apache Superset dashboards into your timveroOS application with built-in role-based access control, automatic guest token management, and configurable embedding options.
 
 == What You'll Learn
 
@@ -701,7 +701,7 @@ logging.level.org.apache.http=DEBUG
 == Related Chapters
 
 * **<<getting-started>>** - Entity-Form-Controller pattern fundamentals
-* **<<launchpad>>** - Similar dashboard and workflow concepts
+* **<<launchpad-integration>>** - Similar dashboard and workflow concepts
 * **<<api-integration>>** - External API integration patterns
 
 ---

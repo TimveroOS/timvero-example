@@ -13,9 +13,9 @@ ifndef::imagesdir[:imagesdir: images]
 :numbered:
 
 
-== Why TimveroOS?
+== Why timveroOS?
 
-Building financial applications traditionally means months of development for basic features like payment processing, KYC compliance, and risk management. TimveroOS changes this by providing production-ready financial components that you customize through code, not configuration.
+Building financial applications traditionally means months of development for basic features like payment processing, KYC compliance, and risk management. timveroOS changes this by providing production-ready financial components that you customize through code, not configuration.
 
 === The Problem
 * **6-12 months** to build basic lending platform from scratch
@@ -23,7 +23,7 @@ Building financial applications traditionally means months of development for ba
 * **Regulatory compliance** requirements that slow development
 * **Scalability challenges** as your business grows
 
-=== The TimveroOS Solution
+=== The timveroOS Solution
 * **2-4 weeks** to customize and deploy with pre-built components
 * **Built-in integrations** for payments, documents, notifications
 * **Compliance frameworks** for KYC, AML, reporting built-in
@@ -38,7 +38,7 @@ This SDK empowers developers to create financial applications through:
 * **Entity Actions** - Add custom business actions as buttons: approve, close, register payment
 * **Entity Checkers** - Implement event-driven business rules that respond to data changes automatically
 
-For a complete working example, see the https://github.com/TimveroOS/timvero-example[timvero-example project^].
+For a complete working example, see the https://github.com/timveroOS/timvero-example[timvero-example project^].
 
 == Learning Path
 
@@ -55,8 +55,8 @@ This guide is organized into logical parts that build on each other:
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
 . **<<fast-search-system>>** - Unified search across all entities with Hibernate Search and Lucene
-. **<<counters>>** - Create dashboard counters and workflow statistics with Launchpad integration
-. **<<launchpad>>** - Integrate entities with unified workflow management and pending decisions
+. **<<entity-counters-and-launchpad-integration>>** - Create dashboard counters and workflow statistics with Launchpad integration
+. **<<launchpad-integration>>** - Integrate entities with unified workflow management and pending decisions
 . **<<bi-dashboard-embedding>>** - Embed Apache Superset dashboards with role-based access
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
@@ -66,7 +66,7 @@ This guide is organized into logical parts that build on each other:
 === PART III: BUSINESS LOGIC
 [start=12]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
-. **<<entity-checkers-setup-and-usage>>** - Event-driven business rules and automation
+. **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
 . **<<product-web-components-configuration>>** - Automated web component setup for credit products and additives
@@ -80,7 +80,7 @@ This guide is organized into logical parts that build on each other:
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
-TIP: New to TimveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
+TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
 
 // PART I: FOUNDATION
 include::_platform-overview.adoc[leveloffset=+1]

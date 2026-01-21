@@ -1,11 +1,11 @@
 [[api-integration]]
 = REST API Integration
 
-TimveroOS provides a complete REST API framework that runs as a separate application alongside your main admin interface. This architecture enables clean separation between internal operations and external integrations.
+timveroOS provides a complete REST API framework that runs as a separate application alongside your main admin interface. This architecture enables clean separation between internal operations and external integrations.
 
 == Multi-Application Architecture
 
-TimveroOS applications can run multiple Spring Boot contexts simultaneously, each serving different purposes:
+timveroOS applications can run multiple Spring Boot contexts simultaneously, each serving different purposes:
 
 [source,java]
 ----
@@ -57,7 +57,7 @@ Key components provided by the framework:
 
 == Controller Patterns
 
-TimveroOS API controllers follow enterprise patterns with comprehensive documentation:
+timveroOS API controllers follow enterprise patterns with comprehensive documentation:
 
 [source,java]
 ----

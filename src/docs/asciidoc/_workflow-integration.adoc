@@ -14,7 +14,7 @@ After reading this chapter, you'll know how to:
 
 == The Big Picture
 
-TimveroOS separates **what** decisions to make from **how** to make them:
+timveroOS separates **what** decisions to make from **how** to make them:
 
 * **Workflow Engine** (admin configures): Decision logic, scoring rules, approval criteria
 * **Your Code** (this chapter): When to start workflows, how to handle results

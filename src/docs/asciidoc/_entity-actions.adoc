@@ -737,6 +737,6 @@ Simple yes/no confirmation:
 
 ---
 
-**Related:** <<getting-started>>, <<form-classes-setup-and-usage>>, <<entity-checkers-setup-and-usage>>
+**Related:** <<getting-started>>, <<form-classes-setup-and-usage>>, <<entity-checkers-setup-usage>>
 
 **Next:** <<workflow-integration>>, <<credit-operations-framework>>
