@@ -62,9 +62,9 @@ This guide is organized into logical parts that build on each other:
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
 . **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
+
 === PART III: BUSINESS LOGIC
-=== PART III: BUSINESS LOGIC
-[start=12]
+[start=23]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
@@ -73,8 +73,9 @@ This guide is organized into logical parts that build on each other:
 . **<<offer-engine-credit-products>>** - Generate personalized loan offers from credit products and participant data
 . **<<api-integration>>** - REST API setup and external system integration
 . **<<docusign-integration>>** - Document signing integration with DocuSign
+
 === PART IV: FINANCIAL OPERATIONS
-[start=17]
+[start=31]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
