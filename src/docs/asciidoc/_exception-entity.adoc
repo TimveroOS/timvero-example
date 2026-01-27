@@ -1,0 +1,385 @@
+[[exception-entity]]
+= Exception Entity Logging
+
+:sourcedir: ../../main/java/com/timvero/base/exception
+
+The `ExceptionEntity` provides a persistent storage mechanism for tracking application exceptions. This entity captures exception details including message, cause, stack trace, and service name for audit and debugging purposes.
+
+== Overview
+
+The exception logging system consists of:
+
+* **`ExceptionEntity`** - JPA entity that stores exception details in the database
+* **`ExceptionEntityService`** - Service layer for saving exceptions with transaction management
+* **`ExceptionRepository`** - Spring Data repository for database operations
+* **`ExceptionEntityController`** - Web interface for viewing and filtering logged exceptions
+
+=== Accessing Exception Log UI
+
+The Exception Log is available through the admin interface:
+
+1. **Navigate to** Tools menu → **Exception log**
+2. **URL path**: `/exception-entity`
+
+== ExceptionEntity Structure
+
+[source,java]
+----
+@Entity
+@Table(name = "exception_entity")
+@EntityListeners(AuditingEntityListener.class)
+@HideInDocs
+public class ExceptionEntity extends BasePersistable<Long> implements NamedEntity {
+
+    @CreatedDate
+    private Instant createdAt;       // Automatically set on creation
+
+    private String message;          // Exception message
+    private String cause;            // Exception cause toString()
+    private String serviceName;      // Service/component name where exception occurred
+    private String stackTrace;       // Full stack trace (optional)
+}
+----
+
+Key fields:
+
+* **`createdAt`** - Timestamp when exception was logged (automatically managed by JPA auditing)
+* **`message`** - The exception message describing what went wrong
+* **`cause`** - String representation of the exception cause
+* **`serviceName`** - Identifies which service or component threw the exception
+* **`stackTrace`** - Complete stack trace for detailed debugging (nullable)
+
+== When to Use Exception Logging
+
+Use `ExceptionEntityService` to log exceptions in these scenarios:
+
+* **External service failures** - API calls, payment gateway errors, third-party integrations
+* **Critical business operation failures** - Operations that require audit trail and investigation
+* **Recurring errors** - Track frequency and patterns of specific error types
+* **Production debugging** - Capture detailed context when errors occur in production
+
+TIP: Not all exceptions need to be logged to database. Use this for exceptions that require persistence, analysis, or audit trail. Regular application logging (SLF4J/Logback) is sufficient for most cases.
+
+== Using ExceptionEntityService
+
+The `ExceptionEntityService` provides two methods for logging exceptions:
+
+=== Method 1: Logging Generic Exceptions
+
+Use `saveException(Exception, String)` for any exception with a service name:
+
+[source,java]
+----
+@Service
+public class PaymentProcessingService {
+
+    @Autowired
+    private ExceptionEntityService exceptionEntityService;
+
+    @Autowired
+    private PaymentGateway paymentGateway;
+
+    public void processPayment(Payment payment) {
+        try {
+            paymentGateway.charge(payment);
+        } catch (Exception e) {
+            // Log exception to database with service context
+            ExceptionEntity logged = exceptionEntityService.saveException(e, "PaymentProcessingService");
+
+            // Continue with error handling
+            throw new PaymentProcessingException("Payment failed: " + logged.getId(), e);
+        }
+    }
+}
+----
+
+Key features:
+
+* **Returns** `ExceptionEntity` - The saved entity with generated ID
+* **Transaction isolation** - Uses `@Transactional(propagation = Propagation.REQUIRES_NEW)`
+* **Service name** - Pass meaningful identifier for the component/service
+
+=== Method 2: Logging ExternalServiceUnavailableException
+
+For framework exceptions that already contain service context:
+
+[source,java]
+----
+@Service
+public class CreditBureauService {
+
+    @Autowired
+    private ExceptionEntityService exceptionEntityService;
+
+    @Autowired
+    private ExternalCreditBureauApi creditBureauApi;
+
+    public CreditReport getCreditReport(String ssn) {
+        try {
+            return creditBureauApi.fetch(ssn);
+        } catch (ExternalServiceUnavailableException e) {
+            // Exception already contains service name and error code
+            exceptionEntityService.saveException(e);
+
+            // Re-throw or handle appropriately
+            throw e;
+        }
+    }
+}
+----
+
+This method:
+
+* Automatically extracts service name from `ExternalServiceUnavailableException`
+* Returns `void` - used for fire-and-forget logging
+
+== Transaction Management
+
+IMPORTANT: Both `saveException` methods use `@Transactional(propagation = Propagation.REQUIRES_NEW)`. This ensures exceptions are logged **even if the calling transaction rolls back**.
+
+[source,java]
+----
+@Service
+public class ApplicationService {
+
+    @Autowired
+    private ExceptionEntityService exceptionEntityService;
+
+    @Transactional
+    public void approveApplication(Application app) {
+        try {
+            // Business logic that might fail
+            app.setStatus(ApplicationStatus.APPROVED);
+            creditService.createCredit(app);
+
+        } catch (Exception e) {
+            // Exception logged in separate transaction
+            exceptionEntityService.saveException(e, "ApplicationService");
+
+            // Current transaction rolls back, but exception is still persisted
+            throw e;
+        }
+    }
+}
+----
+
+== Web Interface
+
+=== Exception List Page
+
+The list page displays all logged exceptions in a sortable, filterable table.
+
+**Available Filters:**
+
+* **Created from** - Start date for filtering exceptions
+* **Created to** - End date for filtering exceptions
+* **Service name** - Filter by specific service name
+* **Message** - Search within exception messages
+
+**Table Columns:**
+
+* **ID** - Exception entity identifier (sortable)
+* **Created at** - Timestamp when exception was logged (sortable)
+* **Service Name** - Name of the service that logged the exception (sortable)
+* **Message** - Exception message, truncated to 255 characters for display
+* **Cause** - Exception cause, truncated to 255 characters for display
+
+Click any row to view full exception details.
+
+TIP: Use date range filters to analyze exceptions during specific time periods. Filter by service name to track errors from specific components.
+
+=== Exception Details Page
+
+The details page shows complete exception information:
+
+**Details Tab:**
+
+* **Created at** - Exact timestamp of exception occurrence
+* **Service Name** - Full service/component identifier
+* **Message** - Complete exception message (no truncation)
+* **Cause** - Full exception cause details
+* **Stack Trace** - Complete stack trace in preformatted text for debugging
+
+The stack trace is displayed in monospace font preserving formatting, making it easy to:
+
+* Identify the exact line of code where exception occurred
+* Trace the call stack leading to the error
+* Copy stack traces for further investigation
+
+WARNING: Exception entities cannot be edited or deleted through the UI - they serve as immutable audit records. If you need to manage old exceptions, use database queries or scheduled cleanup jobs.
+
+=== Typical Workflow
+
+1. **Exception occurs** in your service code
+2. **Service logs** exception using `ExceptionEntityService.saveException()`
+3. **Navigate to** Tools → Exception log in admin interface
+4. **Filter exceptions** by date range, service name, or message
+5. **Click on exception** to view full details including stack trace
+6. **Copy stack trace** for debugging or sharing with team
+7. **Investigate and fix** the underlying issue
+
+This workflow provides full visibility into production errors while maintaining an immutable audit trail.
+
+== Integration Examples
+
+=== External API Integration
+
+[source,java]
+----
+@Service
+public class KycProviderService {
+
+    @Autowired
+    private ExceptionEntityService exceptionEntityService;
+
+    @Autowired
+    private KycApiClient kycApiClient;
+
+    public KycVerificationResult verify(Client client) {
+        try {
+            return kycApiClient.verifyIdentity(client);
+
+        } catch (ApiConnectionException | ApiTimeoutException e) {
+            // Log transient failures for monitoring
+            exceptionEntityService.saveException(e, "KycProviderService");
+
+            // Return fallback or retry logic
+            return KycVerificationResult.retry();
+
+        } catch (ApiAuthenticationException e) {
+            // Log authentication failures for immediate attention
+            exceptionEntityService.saveException(e, "KycProviderService");
+            throw new SystemConfigurationException("KYC API authentication failed", e);
+        }
+    }
+}
+----
+
+=== EntityChecker Error Handling
+
+[source,java]
+----
+@Component
+public class CreditStatusChecker extends EntityChecker<UUID, ExampleCredit> {
+
+    @Autowired
+    private ExceptionEntityService exceptionEntityService;
+
+    @Override
+    protected void perform(ExampleCredit credit) {
+        try {
+            // Business logic
+            updateCreditStatus(credit);
+
+        } catch (Exception e) {
+            // Log checker failures for investigation
+            exceptionEntityService.saveException(e,
+                "CreditStatusChecker - Entity: " + credit.getId());
+
+            // Prevent checker from breaking
+            logger.error("Checker failed for credit: {}", credit.getId(), e);
+        }
+    }
+
+    @Override
+    protected void registerListeners() {
+        register(ExampleCredit.class, EntityChangeEvent.Operation.UPDATE);
+    }
+}
+----
+
+== Common Patterns
+
+=== Service Name Conventions
+
+Use consistent naming for easy filtering and analysis:
+
+```java
+// ✅ Good: Descriptive service names
+exceptionEntityService.saveException(e, "PaymentGatewayService");
+exceptionEntityService.saveException(e, "CreditCalculationService");
+exceptionEntityService.saveException(e, "DocumentGenerationService");
+
+// ✅ Good: Include entity context for bulk operations
+exceptionEntityService.saveException(e, "AccrualScheduler - Credit: " + creditId);
+
+// ❌ Avoid: Generic or vague names
+exceptionEntityService.saveException(e, "Service");
+exceptionEntityService.saveException(e, "Error");
+```
+
+=== When to Log vs When to Throw
+
+```java
+// ✅ Good: Log and handle transient failures
+try {
+    externalApi.call();
+} catch (TimeoutException e) {
+    exceptionEntityService.saveException(e, "ApiService");
+    return fallbackValue();  // Continue with degraded functionality
+}
+
+// ✅ Good: Log before re-throwing critical errors
+try {
+    criticalOperation();
+} catch (Exception e) {
+    exceptionEntityService.saveException(e, "CriticalService");
+    throw e;  // Still propagate the error
+}
+
+// ❌ Avoid: Logging every exception everywhere
+try {
+    simpleOperation();
+} catch (Exception e) {
+    exceptionEntityService.saveException(e, "Service");  // Creates noise
+}
+```
+
+== Querying Logged Exceptions
+
+Use `ExceptionRepository` to analyze logged exceptions:
+
+[source,java]
+----
+@Repository
+public interface ExceptionRepository extends JpaRepository<ExceptionEntity, Long> {
+
+    // Find recent exceptions by service
+    List<ExceptionEntity> findByServiceNameOrderByCreatedAtDesc(String serviceName);
+
+    // Find exceptions in date range
+    @Query("SELECT e FROM ExceptionEntity e WHERE e.createdAt BETWEEN :start AND :end")
+    List<ExceptionEntity> findByDateRange(@Param("start") Instant start,
+                                         @Param("end") Instant end);
+
+    // Count exceptions by service in last 24 hours
+    @Query("SELECT e.serviceName, COUNT(e) FROM ExceptionEntity e " +
+           "WHERE e.createdAt > :since GROUP BY e.serviceName")
+    List<Object[]> countByServiceSince(@Param("since") Instant since);
+}
+----
+
+== Performance Considerations
+
+* **Stack traces** - Full stack traces are stored as TEXT columns, consider:
+  - Limiting stack trace depth for high-volume scenarios
+
+* **Transaction overhead** - `REQUIRES_NEW` creates separate transaction:
+  - Minimal overhead for exception cases
+  - Acceptable for error handling paths
+  - Ensures audit trail even on rollback
+
+* **Monitoring** - Set up alerts for:
+  - Spike in exceptions from specific service
+  - New exception types appearing
+  - Recurring patterns in error messages
+
+== Best Practices
+
+1. **Use meaningful service names** that identify the component/operation
+2. **Don't log user validation errors** - these are expected business cases
+3. **Include entity context** in service name for batch operations
+4. **Set up monitoring** and alerting based on exception patterns
+5. **Use regular logging** (SLF4J) for non-critical errors
+
+TIP: Think of `ExceptionEntity` as an audit trail, not a replacement for application logging. Use it for exceptions that need investigation, analysis, or compliance documentation.
