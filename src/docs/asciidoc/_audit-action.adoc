@@ -1,0 +1,70 @@
+[[user-action-audit]]
+== User Action Audit
+
+The User Action Audit system provides comprehensive tracking and logging of all user activities in the back-office application. This feature is essential for compliance, security monitoring, and troubleshooting user issues.
+
+=== Overview
+
+The audit system automatically captures:
+
+* **HTTP Requests**: All HTTP methods (GET, POST, PUT, DELETE, etc.)
+* **User Identity**: Which user performed each action
+* **Network Information**: Client IP addresses
+* **Request Details**: Full URL paths and query parameters
+* **Timestamps**: Exact time of each action
+* **Authentication Events**: Successful login attempts
+
+All audit records are persisted to the database with asynchronous batch processing to ensure minimal performance impact on user requests.
+
+=== Configuration
+
+==== Enabling the Feature
+
+Add the following property to your `application.properties`:
+
+[source,properties]
+----
+audit.action.enabled=true
+----
+
+==== Optional Configuration
+
+[source,properties]
+----
+# Feature enablement (required)
+audit.action.enabled=true
+
+# Batch size - how many actions to collect before flushing to database
+# Default: 1000
+audit.action.batch-size=1000
+
+# Scheduled save timing (cron expression)
+# Default: 0 28 * * * * (every hour at minute 28)
+audit.action.cron=0 28 * * * *
+----
+
+=== Viewing Audit Logs
+
+==== Accessing the Audit Interface
+
+The audit log interface is available in the back-office security menu:
+
+1. Navigate to **Security → Activity Log** or directly to `/audit`
+2. Use the filter form to search audit records
+
+==== Available Filters
+
+**Date Range**::
+Filter actions between specific dates using "Date from" and "Date to" fields
+
+**Action Type**::
+Filter by HTTP method (GET, POST, PUT, DELETE, LOGIN, etc.)
+
+**URL**::
+Search for specific request URLs using partial matching
+
+**IP Address**::
+Filter by client IP address using partial matching
+
+**User**::
+Filter by specific user account

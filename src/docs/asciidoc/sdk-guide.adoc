@@ -81,6 +81,10 @@ This guide is organized into logical parts that build on each other:
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
+=== PART V: MONITORING
+[start=35]
+. **<<user-action-audit>>** - Track and audit all user actions in the back-office application
+
 TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
 
 // PART I: FOUNDATION
@@ -146,3 +150,6 @@ include::_credit-accruals-tab.adoc[leveloffset=+1]
 include::_payment-transactions.adoc[leveloffset=+1]
 
 include::_payment-hub.adoc[leveloffset=+1]
+
+// PART V: MONITORING
+include::_audit-action.adoc[leveloffset=+1]
