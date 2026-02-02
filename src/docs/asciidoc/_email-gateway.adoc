@@ -1,0 +1,272 @@
+= Email Gateway Implementation
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This guide covers implementing custom email gateways for the Timvero notification system. Email gateways handle the actual delivery of email notifications through various email service providers.
+
+== AbstractEmailGateway Overview
+
+The `AbstractEmailGateway` class provides a foundation for implementing email notification delivery. It handles the common aspects of email sending while allowing you to integrate with any email service provider (SendGrid, AWS SES, SMTP, etc.).
+
+=== Gateway Architecture
+
+The notification system uses a gateway pattern where:
+
+* **`NotificationGateway`** - Base interface defining gateway contract
+* **`AbstractEmailGateway`** - Abstract implementation handling email-specific logic
+* **Custom Gateway** - Your implementation connecting to a specific email provider
+
+=== Key Methods
+
+==== Gateway Type
+
+[source,java]
+----
+@Override
+public NotificationGatewayType getType() {
+    return NotificationGatewayType.EMAIL;
+}
+----
+
+Returns `EMAIL` to identify this gateway as handling email notifications.
+
+==== Send Method
+
+The main method you must implement:
+
+[source,java]
+----
+protected abstract String sendEmail(
+    String sender,
+    String email,
+    String subject,
+    String body,
+    List<DocumentResource> attachments
+) throws Exception;
+----
+
+**Parameters**:
+
+* **`sender`** - Sender name or email address
+* **`email`** - Recipient email address
+* **`subject`** - Email subject line (already rendered from template)
+* **`body`** - HTML email body (already rendered from template)
+* **`attachments`** - List of document resources to attach to the email
+
+**Returns**: Message ID from the email provider for tracking delivery status
+
+**Throws**: Exception if email sending fails
+
+==== Check Delivery Status
+
+[source,java]
+----
+@Override
+public Map<String, NotificationStatus> check(
+    Collection<String> messageIds
+) throws Exception;
+----
+
+Checks the delivery status of previously sent emails by their message IDs.
+
+**Returns**: Map of message ID to delivery status (SENT, DELIVERED, FAILED, etc.)
+
+== Implementing a Custom Email Gateway
+
+=== Step 1: Create Gateway Class
+
+Extend `AbstractEmailGateway` and implement the required methods:
+
+[source,java]
+----
+package com.timvero.ground.service.notification;
+
+import com.timvero.ground.service.storage.DocumentResource;
+import com.timvero.ground.service.storage.DocumentStorage;
+import com.timvero.structure.notification.entity.NotificationStatus;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class DevEmailGateway extends AbstractEmailGateway {
+
+    private static final Logger logger = LoggerFactory.getLogger(DevEmailGateway.class);
+
+    private LongAdder longAdder = new LongAdder();
+
+    public DevEmailGateway(DocumentStorage documentStorage) {
+        longAdder.add(System.currentTimeMillis());
+        this.documentStorage = documentStorage;
+    }
+
+    @Override
+    protected String defaultSender() {
+        return "Sender";
+    }
+
+    @Override
+    public String sendEmail(String sender, String email, String subject, String body, List<DocumentResource> attachments) {
+        logger.debug("Outgoing email, email: '{}', subject: '{}', body: '{}', attachments: '{}'", email, subject, body,
+                attachments != null ? attachments.size() : "");
+        longAdder.increment();
+        return String.valueOf(longAdder);
+    }
+
+    @Override
+    public Map<String, NotificationStatus> check(Collection<String> messageIds) {
+        return messageIds.stream().collect(Collectors.toMap(id -> id, id -> NotificationStatus.PERFORMED));
+    }
+}
+----
+
+For development, use the built-in `DevEmailGateway` that saves emails to files instead of sending:
+
+[source,java]
+----
+@Configuration
+public class NotificationConfiguration {
+
+    @Bean
+    @Profile("dev")
+    public NotificationGateway devEmailGateway(DocumentStorage documentStorage) {
+        return new DevEmailGateway(documentStorage);
+    }
+}
+----
+
+The `DevEmailGateway`:
+
+* Saves email content as HTML files in the document storage
+* Logs email details to console
+* Returns mock message IDs
+* Allows visual inspection of email templates
+
+== Best Practices
+
+=== Error Handling
+
+Implement robust error handling with retries:
+
+[source,java]
+----
+@Override
+protected String sendEmail(String sender, String to, String subject, String body, List<DocumentResource> attachments) throws Exception {
+    int maxRetries = 3;
+    int retryCount = 0;
+    Exception lastException = null;
+
+    while (retryCount < maxRetries) {
+        try {
+            // Attempt to send email
+            return attemptSend(to, subject, body);
+        } catch (Exception e) {
+            lastException = e;
+            retryCount++;
+
+            if (retryCount < maxRetries) {
+                // Wait before retry (exponential backoff)
+                Thread.sleep(1000 * retryCount);
+                log.warn("Email send failed, retrying ({}/{})", retryCount, maxRetries);
+            }
+        }
+    }
+
+    throw new Exception("Failed to send email after " + maxRetries + " attempts", lastException);
+}
+----
+
+=== Logging
+
+Add detailed logging for troubleshooting:
+
+[source,java]
+----
+@Override
+protected String sendEmail(String sender, String to, String subject, String body, List<DocumentResource> attachments) throws Exception {
+    log.info("Sending email to: {}, subject: {}", to, subject);
+
+    try {
+        String messageId = attemptSend(to, subject, body);
+        log.info("Email sent successfully, messageId: {}", messageId);
+        return messageId;
+    } catch (Exception e) {
+        log.error("Failed to send email to: {}, error: {}", to, e.getMessage());
+        throw e;
+    }
+}
+----
+
+== Multiple Gateway Support
+
+You can have multiple email gateways active simultaneously for different scenarios:
+
+[source,java]
+----
+@Configuration
+public class EmailGatewayConfiguration {
+
+    @Bean
+    @Profile("production")
+    public NotificationGateway yourEmailGateway() {
+        return new YourEmailGateway();
+    }
+
+    @Bean
+    @Profile("development")
+    public NotificationGateway devEmailGateway(DocumentStorage storage) {
+        return new DevEmailGateway(storage);
+    }
+}
+----
+
+== Troubleshooting
+
+=== Email Not Sending
+
+**Check logs** for error messages:
+```
+Failed to send email to: user@example.com, error: Authentication failed
+```
+
+**Common issues**:
+
+* Invalid API credentials
+* Incorrect email addresses
+* Provider rate limits exceeded
+* Network connectivity problems
+
+**Solutions**:
+
+1. Verify credentials in application.properties
+2. Check provider dashboard for API usage and limits
+3. Test with curl or Postman directly against provider API
+
+=== Emails Going to Spam
+
+**Common causes**:
+
+* Missing SPF/DKIM records
+* No sender domain verification
+* HTML-only content without plain text alternative
+* Suspicious content patterns
+
+**Solutions**:
+
+1. Configure SPF and DKIM records in DNS
+2. Verify sender domain with email provider
+3. Add plain text alternative to emails
+
+== Summary
+
+The `AbstractEmailGateway` provides a robust foundation for email delivery:
+
+* **Simple integration** - Implement one method to connect any provider
+* **Flexible configuration** - Support for multiple providers and environments
+* **Built-in patterns** - Error handling, retries, and status tracking
+* **Development support** - Dev gateway for testing without sending real emails
+
+This integration seamlessly works with the notification template system, allowing you to focus on business logic while the platform handles email delivery.

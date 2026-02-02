@@ -61,6 +61,7 @@ This guide is organized into logical parts that build on each other:
 . **<<document-management>>** - Document upload, requirements, and UI integration
 . **<<document-templates>>** - Generate contracts, reports, and formatted documents
 . **<<notifications>>** - Multi-channel automated notifications with template-based content
+. **<<email-gateway-implementation>>** - Implement custom email gateways with SendGrid, SMTP, or AWS SES
 . **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
 
 === PART III: BUSINESS LOGIC
@@ -112,6 +113,8 @@ include::_documents.adoc[leveloffset=+1]
 include::_document-templates.adoc[leveloffset=+1]
 
 include::_notifications.adoc[leveloffset=+1]
+
+include::_email-gateway.adoc[leveloffset=+1]
 
 include::_history.adoc[leveloffset=+1]
 
