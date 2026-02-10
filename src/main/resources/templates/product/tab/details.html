@@ -24,6 +24,14 @@
             <li class="card-info__item d-flex">
                 <span
                     class="card-info__property"
+                    th:text="#{credit.dayCountMethod}"
+                    th:title="#{credit.dayCountMethod}"
+                >Engine name</span>
+                <span class="card-info__value" th:text="*{dayCountMethod}"></span>
+            </li>
+            <li class="card-info__item d-flex">
+                <span
+                    class="card-info__property"
                     th:text="#{credit.product.maxAmount}"
                     th:title="#{credit.product.maxAmount}"
                 >Max amount</span>

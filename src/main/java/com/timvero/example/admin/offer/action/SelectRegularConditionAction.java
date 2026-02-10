@@ -72,7 +72,7 @@ public class SelectRegularConditionAction extends SelectConditionAction<ExampleP
 
                 ExampleCreditCondition condition = new ExampleCreditCondition(principal,
                     offer.getCreditProduct().getEngineName(), interestRate, offer.getCreditProduct().getLateFeeRate(),
-                    Method_30_360_BB.NAME, period, term, regularPayment, securedOffer);
+                    period, term, regularPayment, securedOffer);
                 application.setCondition(condition);
 
                 PaymentSchedule paymentSchedule =

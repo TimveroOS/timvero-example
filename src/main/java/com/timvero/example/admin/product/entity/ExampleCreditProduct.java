@@ -31,6 +31,9 @@ public class ExampleCreditProduct extends CreditProduct {
     @Column(nullable = false, columnDefinition = NUMERIC)
     private BigDecimal lateFeeRate;
 
+    @Column(nullable = false)
+    private String dayCountMethod;
+
     public ExampleCreditProduct() {
         super();
     }
@@ -81,5 +84,13 @@ public class ExampleCreditProduct extends CreditProduct {
 
     public void setLateFeeRate(BigDecimal lateFeeRate) {
         this.lateFeeRate = lateFeeRate;
+    }
+
+    public String getDayCountMethod() {
+        return dayCountMethod;
+    }
+
+    public void setDayCountMethod(String dayCountMethod) {
+        this.dayCountMethod = dayCountMethod;
     }
 }
