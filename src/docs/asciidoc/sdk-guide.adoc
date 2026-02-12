@@ -67,6 +67,7 @@ This guide is organized into logical parts that build on each other:
 === PART III: BUSINESS LOGIC
 [start=24]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
+. **<<exception-entity>>** - Exception logging and error tracking with persistent storage
 . **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
 . **<<workflow-integration>>** - Integration for decision workflows
@@ -76,14 +77,14 @@ This guide is organized into logical parts that build on each other:
 . **<<docusign-integration>>** - Document signing integration with DocuSign
 
 === PART IV: FINANCIAL OPERATIONS
-[start=32]
+[start=33]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
 === PART V: MONITORING
-[start=35]
+[start=36]
 . **<<user-action-audit>>** - Track and audit all user actions in the back-office application
 
 TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
@@ -126,6 +127,8 @@ include::_has-notes.adoc[leveloffset=+1]
 
 // PART III: BUSINESS LOGIC
 include::_entity-actions.adoc[leveloffset=+1]
+
+include::_exception-entity.adoc[leveloffset=+1]
 
 include::_checkers.adoc[leveloffset=+1]
 
