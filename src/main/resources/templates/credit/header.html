@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <th:block xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
-  <div class="card-info-wrapper d-flex" th:object="${entity}" th:with="product = *{condition.securedOffer.originalOffer.productAdditive.product}">
+  <div class="card-info-wrapper d-flex" th:object="${entity}"
+       th:with="product = *{condition.securedOffer.originalOffer.productAdditive.product}">
     <!-- Basic Credit Information -->
     <div class="card-info d-flex pl-20 pb-15">
       <ul class="card-info__body d-flex">
@@ -49,7 +50,7 @@
         </li>
         <li class="card-info__item d-flex">
           <span class="card-info__property" th:text="#{credit.dayCountMethod}"></span>
-          <span class="card-info__value" th:text="*{#enums.name('day.count.method', condition.dayCountMethod)}"></span>
+          <span class="card-info__value" th:text="${#enums.name('day.count.method', product.dayCountMethod)}"></span>
         </li>
         <li class="card-info__item d-flex">
           <span class="card-info__property" th:text="#{credit.regularPayment}"></span>
