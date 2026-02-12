@@ -47,10 +47,11 @@ This guide is organized into logical parts that build on each other:
 === PART I: FOUNDATION
 . **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
 . **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example
+. **<<application-setup>>** - Entry point, multi-context architecture, and Actuator configuration
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE
-[start=4]
+[start=5]
 . **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
@@ -64,7 +65,7 @@ This guide is organized into logical parts that build on each other:
 . **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
 
 === PART III: BUSINESS LOGIC
-[start=23]
+[start=24]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
 . **<<datasource-integration>>** - External API integration and data enrichment
@@ -75,7 +76,7 @@ This guide is organized into logical parts that build on each other:
 . **<<docusign-integration>>** - Document signing integration with DocuSign
 
 === PART IV: FINANCIAL OPERATIONS
-[start=31]
+[start=32]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
@@ -87,6 +88,8 @@ TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced de
 include::_platform-overview.adoc[leveloffset=+1]
 
 include::_getting-started.adoc[leveloffset=+1]
+
+include::_application-setup.adoc[leveloffset=+1]
 
 include::_data-model.adoc[leveloffset=+1]
 
