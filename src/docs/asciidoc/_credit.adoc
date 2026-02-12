@@ -176,19 +176,6 @@ public class InterestAccrual extends CreditOperation {
 
 Actions provide user interface operations for credit management:
 
-==== Payment Registration
-
-[source,java]
-----
-include::{sourcedir}/credit/action/RegisterPaymentAction.java[lines=25..44]
-----
-
-The action uses a form to collect payment details:
-
-[source,java]
-----
-include::{sourcedir}/credit/action/RegisterPaymentAction.java[lines=64..99]
-----
 
 ==== Disbursement Processing
 

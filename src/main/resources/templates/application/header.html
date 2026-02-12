@@ -2,8 +2,8 @@
     xmlns:th="http://www.thymeleaf.org">
     <div class="header-left">
         <h2 class="header__title" th:text="${entity.displayedName}"></h2>
-        <th:block
-            th:insert="~{/templates/copyButton :: copyButton('Copy ID', ${entity.id})}" />
+        <th:block th:insert="~{/templates/copyButton :: copyButton('Copy ID', ${entity.id})}" />
+        <th:block th:insert="~{/templates/label :: labels(${labels})}"></th:block>
     </div>
     <div class="header-right">
         <p class="entity__date"

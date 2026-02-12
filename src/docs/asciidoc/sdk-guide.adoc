@@ -47,10 +47,11 @@ This guide is organized into logical parts that build on each other:
 === PART I: FOUNDATION
 . **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
 . **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example
+. **<<application-setup>>** - Entry point, multi-context architecture, and Actuator configuration
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE
-[start=4]
+[start=5]
 . **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
@@ -64,7 +65,7 @@ This guide is organized into logical parts that build on each other:
 . **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
 
 === PART III: BUSINESS LOGIC
-[start=23]
+[start=24]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<exception-entity>>** - Exception logging and error tracking with persistent storage
 . **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
@@ -82,12 +83,18 @@ This guide is organized into logical parts that build on each other:
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
+=== PART V: MONITORING
+[start=35]
+. **<<user-action-audit>>** - Track and audit all user actions in the back-office application
+
 TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
 
 // PART I: FOUNDATION
 include::_platform-overview.adoc[leveloffset=+1]
 
 include::_getting-started.adoc[leveloffset=+1]
+
+include::_application-setup.adoc[leveloffset=+1]
 
 include::_data-model.adoc[leveloffset=+1]
 
@@ -149,3 +156,6 @@ include::_credit-accruals-tab.adoc[leveloffset=+1]
 include::_payment-transactions.adoc[leveloffset=+1]
 
 include::_payment-hub.adoc[leveloffset=+1]
+
+// PART V: MONITORING
+include::_audit-action.adoc[leveloffset=+1]

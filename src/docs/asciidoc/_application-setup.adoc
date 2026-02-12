@@ -1,0 +1,73 @@
+[[application-setup]]
+= Application Setup
+
+:appsourcedir: ../../main/java/com/timvero/example
+
+timveroOS uses a hierarchical Spring context: a non-web parent and multiple child web applications. Each child runs on its own port with its own configuration.
+
+== Entry Point
+
+[source,java]
+----
+include::{appsourcedir}/ExampleApplication.java[tags=entry-point]
+----
+
+Each child context loads its own properties file via `spring.config.name` (e.g. `main.properties`, `portal.properties`, `workflow.properties`). Use this to configure ports, context paths, and other settings per child.
+
+== Spring Boot Actuator
+
+Actuator provides health checks, metrics, and monitoring endpoints. It is not included by default — add it explicitly if needed:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+----
+
+=== Management Port
+
+Each child context should configure its own Actuator port. Use `-1` to disable Actuator for a child, or a dedicated port to expose it:
+
+[source,properties]
+----
+# Expose Actuator on a dedicated port (main.properties)
+management.server.port=8189
+----
+
+This keeps management endpoints separate from application traffic.
+
+=== Endpoint Exposure
+
+By default, only `health` is exposed over HTTP. Control which endpoints are available:
+
+[source,properties]
+----
+# Disable all web endpoints
+management.endpoints.web.exposure.exclude=*
+
+# Or selectively enable specific endpoints
+management.endpoints.web.exposure.include=health,info,metrics
+
+# Disable a specific endpoint entirely
+management.endpoint.health.enabled=false
+
+# Show full health details (default: "never")
+management.endpoint.health.show-details=always
+----
+
+=== Kubernetes Probes
+
+Enable liveness and readiness probes for Kubernetes deployments:
+
+[source,properties]
+----
+# Enable /actuator/health/liveness and /actuator/health/readiness
+management.endpoint.health.probes.enabled=true
+
+# Customize liveness probe indicators
+management.endpoint.health.group.liveness.include=livenessState,webContexts
+----
+
+For the full list of Actuator properties and endpoints, see the https://docs.spring.io/spring-boot/reference/actuator/endpoints.html[Spring Boot Actuator documentation^].

@@ -79,7 +79,7 @@ public abstract class AbstractAccrualEngine extends RangeBasedAccrualEngine<Exam
         NavigableMap<LocalDate, DayCounter> counters = new TreeMap<>();
         counters.put(credit.getStartDate(), new DayCounter(
             new PaymentGrid(maturityDate, credit.getStartDate().getDayOfMonth(), condition.getPeriod()),
-            dayCountMethods.get(condition.getDayCountMethod())));
+            dayCountMethods.get(condition.getSecuredOffer().getOriginalOffer().getCreditProduct().getDayCountMethod())));
         return counters;
     }
 }

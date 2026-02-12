@@ -13,17 +13,22 @@ public class ExampleApplication {
     public static void main(String[] args) {
         SpringApplicationBuilder parentBuilder = new SpringApplicationBuilder(BaseConfiguration.class, CustomConfiguration.class)
                 .web(WebApplicationType.NONE);
-        parentBuilder.run(args);
-        
-        // Admin interface on port 8081
-        parentBuilder.child(WebMvcConfig.class, CustomWebConfiguration.class)
-            .properties("server.port=8081")
-            .run(args);
-            
-        // REST API on port 8082
-        parentBuilder.child(PortalWebConfiguration.class)
-            .properties("server.port=8082")
-            .run(args);
+
+        ConfigurableApplicationContext parentContext = parentBuilder.run(args);
+        try {
+            // Admin interface on port 8081
+            parentBuilder.child(WebMvcConfig.class, CustomWebConfiguration.class)
+                .properties("server.port=8081")
+                .run(args);
+
+            // REST API on port 8082
+            parentBuilder.child(PortalWebConfiguration.class)
+                .properties("server.port=8082")
+                .run(args);
+        } catch (Throwable e) {
+            parentContext.close();
+            throw e;
+        }
     }
 }
 ----
