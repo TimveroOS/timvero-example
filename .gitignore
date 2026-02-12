@@ -32,3 +32,5 @@ target/
 /Client/
 /UserAccount/
 business-logic-analysis/
+
+.DS_Store
