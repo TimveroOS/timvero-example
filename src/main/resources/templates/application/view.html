@@ -4,9 +4,9 @@
 <body>
     <div class="rui-page">
         <div class="rui-page-content">
-            <div class="pumpkin-container d-flex" th:data-notes-enabled="${notesEnabled}">
-                <div class="d-flex composite-entity-page flex-column">
-                    <header class="entity__header bottom-shadow">
+            <div class="pumpkin-container">
+                <div class="composite-entity-page content-wrapper">
+                    <header class="entity__header">
                         <th:block th:replace="~{/application/header}"></th:block>
                     </header>
 
@@ -18,7 +18,6 @@
                                 <p class="header__title">
                                     <span th:text="#{application.deal}"></span>
                                 </p>
-                                <th:block th:replace="~{/templates/label :: labels(${labels})}"></th:block>
                             </div>
                         </div>
                         <th:block

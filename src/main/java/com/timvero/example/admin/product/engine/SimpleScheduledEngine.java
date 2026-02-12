@@ -36,7 +36,8 @@ public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondi
     @Override
     public List<PaymentSegment> payments(ExampleCreditCondition condition, LocalDate interestStart,
         LocalDate paymentStart, MonetaryAmount principal, MonetaryAmount interest) {
-        DayCountMethod dayCountMethod = dayCountMethods.get(condition.getDayCountMethod());
+        DayCountMethod dayCountMethod = dayCountMethods
+            .get(condition.getSecuredOffer().getOriginalOffer().getCreditProduct().getDayCountMethod());
         return payments(condition.getRegularPayment(), condition.getInterestRate(),
             condition.getPeriod(), principal, interest, interestStart, paymentStart,
             condition.getTerm(), dayCountMethod);

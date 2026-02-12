@@ -1,11 +1,13 @@
 package com.timvero.example.admin.product.form;
 
+import static com.timvero.ground.tools.Messages.NOT_BLANK;
 import static com.timvero.ground.tools.Messages.NUMBER;
 import static com.timvero.ground.tools.Messages.POSITIVE_NUMBER;
 
 import com.timvero.loan.product.form.BaseCreditProductForm;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.PositiveOrZero;
 import java.math.BigDecimal;
@@ -35,6 +37,9 @@ public class CreditProductForm extends BaseCreditProductForm {
     @NotNull
     @PositiveOrZero
     private BigDecimal lateFeeRate;
+
+    @NotBlank(message = NOT_BLANK)
+    private String dayCountMethod;
 
     public BigDecimal getMinAmount() {
         return minAmount;
@@ -82,5 +87,13 @@ public class CreditProductForm extends BaseCreditProductForm {
 
     public void setLateFeeRate(BigDecimal lateFeeRate) {
         this.lateFeeRate = lateFeeRate;
+    }
+
+    public String getDayCountMethod() {
+        return dayCountMethod;
+    }
+
+    public void setDayCountMethod(String dayCountMethod) {
+        this.dayCountMethod = dayCountMethod;
     }
 }

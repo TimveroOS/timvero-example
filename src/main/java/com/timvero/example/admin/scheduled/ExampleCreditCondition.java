@@ -37,9 +37,6 @@ public class ExampleCreditCondition extends UUIDPersistable implements CreditCon
     private BigDecimal lateFeeRate;
 
     @Column(nullable = false)
-    private String dayCountMethod;
-
-    @Column(nullable = false)
     private Period period;
 
     @Column(nullable = false)
@@ -56,14 +53,13 @@ public class ExampleCreditCondition extends UUIDPersistable implements CreditCon
     protected ExampleCreditCondition() {}
 
     public ExampleCreditCondition(MonetaryAmount principal, String engineName, BigDecimal interestRate,
-        BigDecimal lateFeeRate, String dayCountMethod, Period period, Integer term, MonetaryAmount regularPayment,
+        BigDecimal lateFeeRate, Period period, Integer term, MonetaryAmount regularPayment,
         ExampleSecuredOffer securedOffer) {
         super();
         this.principal = principal;
         this.engineName = engineName;
         this.interestRate = interestRate;
         this.lateFeeRate = lateFeeRate;
-        this.dayCountMethod = dayCountMethod;
         this.period = period;
         this.term = term;
         this.regularPayment = regularPayment;
@@ -86,10 +82,6 @@ public class ExampleCreditCondition extends UUIDPersistable implements CreditCon
 
     public BigDecimal getLateFeeRate() {
         return lateFeeRate;
-    }
-
-    public String getDayCountMethod() {
-        return dayCountMethod;
     }
 
     public Period getPeriod() {
