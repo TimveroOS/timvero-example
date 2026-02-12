@@ -21,7 +21,6 @@ import com.timvero.ground.hibernate.TransactionTemplateBuilderImpl;
 import com.timvero.ground.util.MonetaryUtil;
 import com.timvero.loan.engine.util.PaymentCalculator;
 import com.timvero.scheduled.ScheduledConfiguration;
-import com.timvero.scheduled.day_count.Method_30_360_BB;
 import com.timvero.servicing.ServicingConfiguration;
 import com.timvero.servicing.credit.entity.debt.Debt;
 import com.timvero.servicing.credit.entity.operation.CreditPayment;
@@ -301,13 +300,13 @@ public class CalculationTest {
             String engineName = product.getEngineName();
             BigDecimal interestRate = additive.getInterestRate();
             BigDecimal lateFeeRate = product.getLateFeeRate();
-            String dayCountMethod = Method_30_360_BB.NAME;
             Period period = Period.ofMonths(1);
             Integer term = 12;
             MonetaryAmount regularPayment = PaymentCalculator.calcAnnuityPayment(principal,
                 MonetaryUtil.zero(principal.getCurrency()), periodicInterest(period, interestRate), term, 0);
             ExampleSecuredOffer securedOffer = null;
-            ExampleCreditCondition condition = new ExampleCreditCondition(principal, engineName, interestRate, lateFeeRate, dayCountMethod, period, term, regularPayment, securedOffer);
+            ExampleCreditCondition condition = new ExampleCreditCondition(principal, engineName, interestRate,
+                lateFeeRate, period, term, regularPayment, securedOffer);
             entityManager.persist(condition);
 
             Application application = new Application();

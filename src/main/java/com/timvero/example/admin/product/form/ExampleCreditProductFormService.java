@@ -3,10 +3,12 @@ package com.timvero.example.admin.product.form;
 import com.timvero.base.form.EntityFormService;
 import com.timvero.example.admin.offer.ExampleDataProcessor;
 import com.timvero.example.admin.participant.document.ApplicationContractDocumentCategory;
-import com.timvero.example.admin.product.engine.SimpleScheduledEngine;
 import com.timvero.example.admin.product.entity.ExampleCreditProduct;
+import com.timvero.example.admin.scheduled.ExampleCreditCondition;
+import com.timvero.loan.engine.scheduled.ScheduledEngine;
 import com.timvero.loan.execution_result.ExecutionResultType;
 import com.timvero.loan.product.entity.CreditType;
+import com.timvero.scheduled.day_count.DayCountMethod;
 import com.timvero.structure.template.form.DocumentTemplateFormService;
 import java.util.Map;
 import java.util.UUID;
@@ -18,14 +20,19 @@ public class ExampleCreditProductFormService extends EntityFormService<ExampleCr
 
     @Autowired
     private DocumentTemplateFormService documentTemplateService;
+    @Autowired
+    protected Map<String, DayCountMethod> dayCountMethods;
+    @Autowired
+    protected Map<String, ScheduledEngine<ExampleCreditCondition>> productEngines;
 
     @Override
     protected void assembleEditModel(ExampleCreditProduct entity, CreditProductForm form, Map<String, Object> model) {
-        model.put("productEngines", SimpleScheduledEngine.NAME);
+        model.put("productEngines", productEngines.keySet());
         model.put("offerEngineTypes", new ExecutionResultType[]{ExampleDataProcessor.TYPE});
         model.put("creditProductForm", form);
         model.put("creditTypes", CreditType.values(CreditType.class));
         model.put("templates", documentTemplateService.getTemplatesMap(ApplicationContractDocumentCategory.TYPE));
+        model.put("dayCountMethods", dayCountMethods.keySet());
     }
 
 }

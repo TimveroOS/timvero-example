@@ -355,17 +355,22 @@ public class MyLendingApplication {
     public static void main(String[] args) {
         SpringApplicationBuilder parent = new SpringApplicationBuilder(BaseConfiguration.class)
                 .web(WebApplicationType.NONE);
-        parent.run(args);
-        
-        // Main application (port 8081)
-        parent.child(WebMvcConfig.class, MyConfiguration.class)
-            .properties("server.port=8081")
-            .run(args);
-            
-        // Workflow engine (separate port)
-        parent.child(ExternalProcessWebMvcConfig.class)
-            .properties("spring.config.name=workflow")
-            .run(args);
+
+        ConfigurableApplicationContext parentContext = parent.run(args);
+        try {
+            // Main application (port 8081)
+            parent.child(WebMvcConfig.class, MyConfiguration.class)
+                .properties("server.port=8081")
+                .run(args);
+
+            // Workflow engine (separate port)
+            parent.child(ExternalProcessWebMvcConfig.class)
+                .properties("spring.config.name=workflow")
+                .run(args);
+        } catch (Throwable e) {
+            parentContext.close();
+            throw e;
+        }
     }
 }
 ----

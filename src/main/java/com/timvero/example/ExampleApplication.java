@@ -8,24 +8,40 @@ import com.timvero.flowable.external.ExternalProcessWebMvcConfig;
 import com.timvero.web.WebMvcConfig;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ConfigurableApplicationContext;
 
+// tag::entry-point[]
 public class ExampleApplication {
 
 	public static void main(String[] args) {
-        SpringApplicationBuilder parentBuilder =
-            new SpringApplicationBuilder(BaseConfiguration.class, CustomConfiguration.class)
-                    .web(WebApplicationType.NONE);
-        parentBuilder.run(args);
-	    parentBuilder.child(WebMvcConfig.class, CustomWebConfiguration.class)
-	    .properties("spring.config.name=main")
-	    .run(args);
-	    parentBuilder.child(PortalWebConfiguration.class)
-	    .properties("spring.config.name=portal")
-	    .run(args);
+		// Parent context — not a web application.
+		// BaseConfiguration is provided by the core.
+		// CustomConfiguration is your project-specific configuration.
+		SpringApplicationBuilder parentBuilder =
+			new SpringApplicationBuilder(BaseConfiguration.class, CustomConfiguration.class)
+					.web(WebApplicationType.NONE);
 
-        parentBuilder.child(ExternalProcessWebMvcConfig.class)
-        .properties("spring.config.name=workflow")
-        .run(args);
+		ConfigurableApplicationContext parentContext = parentBuilder.run(args);
+		try {
+			// Main admin interface
+			parentBuilder.child(WebMvcConfig.class, CustomWebConfiguration.class)
+				.properties("spring.config.name=main")
+				.run(args);
+
+			// REST API (optional)
+			parentBuilder.child(PortalWebConfiguration.class)
+				.properties("spring.config.name=portal")
+				.run(args);
+
+			// Workflow engine (optional)
+			parentBuilder.child(ExternalProcessWebMvcConfig.class)
+				.properties("spring.config.name=workflow")
+				.run(args);
+		} catch (Throwable e) {
+			parentContext.close();
+			throw e;
+		}
 	}
 
 }
+// end::entry-point[]
