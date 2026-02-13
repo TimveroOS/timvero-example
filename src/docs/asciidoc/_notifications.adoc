@@ -2,7 +2,7 @@
 
 :sourcedir: ../../main/java/com/timvero/example/admin
 
-This section covers creating and managing automated notifications for loan applications and credit accounts. The notification system provides multi-channel communication (EMAIL, SMS, VOICE, LETTER) with template-based content.
+This section covers creating and managing automated notifications for loan applications and credit accounts. The notification system provides multi-channel communication (EMAIL, PHONE, LETTER) with template-based content.
 
 == Notification System Overview
 
@@ -11,7 +11,7 @@ The notification system consists of:
 * **`NotificationEvent`** - Defines when notifications are triggered
 * **`NotificationModel`** - Provides data to notification templates
 * **`NotificationTemplate`** - Database-stored templates with dynamic content
-* **Notification Gateways** - Handle delivery via EMAIL, SMS, VOICE, LETTER
+* **Notification Gateways** - Handle delivery via EMAIL, PHONE, LETTER
 
 == Creating Notification Events
 
@@ -59,20 +59,29 @@ EventParameters allow admin users to configure notification behavior:
 * **`daysCount`** - Configurable number of days for payment reminders
 * Used in `entityMatchesTemplate()` to control when notifications are sent
 
+TIP: **EventParameters vs Custom Models**: Use EventParameters when admin users need to configure _when_ notifications send (timing, thresholds). Use Custom Models when templates need additional _data_ not available on the base entity.
+
+Available parameter types:
+
+* **`integerField("name")`** - Days, counts, thresholds
+* **`decimalField("name")`** - Amounts, percentages
+* **`stringField("name")`** - Categories, codes
+* **`enumField("name", values)`** - Predefined choices
+
 == Creating Notification Templates
 
 Templates are created and managed through the admin interface, similar to document templates.
 
 === Accessing Template Management
 
-Navigate to **System → Notification Templates** in the admin interface.
+Navigate to **System -> Notification Templates** in the admin interface.
 
 === Creating New Template
 
 1. **Template Details**:
    - **Name**: Descriptive name (e.g., "Loan Approval - Email")
    - **Event Type**: Select from dropdown (e.g., "LOAN_APPROVED")
-   - **Gateway Type**: EMAIL, SMS, VOICE, or LETTER
+   - **Gateway Type**: EMAIL, PHONE, or LETTER
    - **Recipient Type**: BORROWER, AGENT, etc.
    - **Active**: Check to enable template
 
@@ -95,9 +104,9 @@ Navigate to **System → Notification Templates** in the admin interface.
 
 ```
 {% if reminderType == 'UPCOMING' %}
-Payment due {{ expectedPaymentDate | date('MM/dd') }}. 
+Payment due {{ expectedPaymentDate | date('MM/dd') }}.
 {% else %}
-Payment overdue by {{ daysCount | abs }} days. 
+Payment overdue by {{ daysCount | abs }} days.
 {% endif %}
 Account: {{ credit.id | slice(0, 8) | upper }}
 Pay online or call (555) 123-4567
@@ -167,47 +176,6 @@ Templates have access to:
 {% endfor %}
 ```
 
-== Event Parameters vs Custom Models
-
-**Use EventParameters when**: Admin users need to configure *when* notifications send (timing, thresholds, conditions)
-
-**Use Custom Models when**: Templates need additional *data* not available on the base entity
-
-=== EventParameter Example
-
-Payment reminders need admin-configurable timing:
-
-[source,java]
-----
-public static final EventParameter DAYS_COUNT = EventParameter.integerField("daysCount");
-
-public PaymentReminderEvent() {
-    super(DAYS_COUNT);
-}
-
-@Override
-protected boolean entityMatchesTemplate(ExampleCredit credit, PaymentReminderTemplateModel model,
-                                      Map<String, Object> templateParams) {
-    Integer daysCount = (Integer) templateParams.get("daysCount");
-    model.setDaysCount(daysCount);
-    
-    if (daysCount < 0) {
-        // Overdue reminder: check if credit is exactly |daysCount| days past due
-        return pastDueService.daysPastDue(credit) == -daysCount;
-    } else {
-        // Upcoming reminder: check if payment is exactly daysCount days away
-        return getNextPaymentDate(credit).equals(today.plusDays(daysCount));
-    }
-}
-----
-
-=== Parameter Types
-
-* **`integerField("name")`** - Days, counts, thresholds
-* **`decimalField("name")`** - Amounts, percentages
-* **`stringField("name")`** - Categories, codes
-* **`enumField("name", values)`** - Predefined choices
-
 == Automatic Notifications
 
 === Entity Event Listeners
@@ -216,7 +184,7 @@ Events can implement `EntityEventListener` to automatically trigger on system ev
 
 [source,java]
 ----
-@Component  
+@Component
 public class PaymentReminderEvent extends NotificationEvent<ExampleCredit, PaymentReminderTemplateModel>
     implements EntityEventListener<CreditCalculationDateChangeEvent> {
 
@@ -232,16 +200,8 @@ public class PaymentReminderEvent extends NotificationEvent<ExampleCredit, Payme
     @Override
     protected boolean entityMatchesTemplate(ExampleCredit credit, PaymentReminderTemplateModel model,
                                           Map<String, Object> templateParams) {
-        Integer daysCount = (Integer) templateParams.get("daysCount");
-        model.setDaysCount(daysCount);
-        
-        if (daysCount < 0) {
-            // Overdue: check if exactly |daysCount| days past due
-            return pastDueService.daysPastDue(credit) == -daysCount;
-        } else {
-            // Upcoming: check if payment is exactly daysCount days away
-            return ChronoUnit.DAYS.between(today, nextPaymentDate) == daysCount;
-        }
+        // Use templateParams.get("daysCount") to check if credit matches
+        // this specific template's configured day threshold
     }
 }
 ----
@@ -256,28 +216,28 @@ Notifications can be triggered automatically using EntityCheckers:
 ----
 @Component
 public class ApplicationStatusNotificationChecker extends EntityChecker<UUID, Application> {
-    
+
     @Autowired
     private LoanApprovedEvent loanApprovedEvent;
-    
-    @Autowired 
+
+    @Autowired
     private LoanDeclinedEvent loanDeclinedEvent;
-    
+
     @Override
     protected void registerListeners() {
         register(Application.class, EntityChangeEvent.Operation.UPDATE);
     }
-    
+
     @Override
     protected boolean isAvailable(Application application) {
         return application.getStatus().in(ApplicationStatus.SERVICING, ApplicationStatus.DECLINE);
     }
-    
+
     @Override
     protected void perform(Application application) {
         switch (application.getStatus()) {
             case SERVICING -> loanApprovedEvent.notify(application.getId());
-            case DECLINE -> loanDeclinedEvent.notify(application.getId(), 
+            case DECLINE -> loanDeclinedEvent.notify(application.getId(),
                 application.getDeclineReason(), true);
         }
     }
@@ -286,62 +246,185 @@ public class ApplicationStatusNotificationChecker extends EntityChecker<UUID, Ap
 
 == Notification Gateways
 
-Gateways handle actual delivery of notifications via EMAIL, SMS, VOICE, or LETTER channels.
+Gateways handle actual delivery of notifications. The `NotificationGatewayType` determines which contact information is used — the recipient entity must implement the `Notifiable` interface providing `getNotificationEmail()`, `getMainNotificationPhone()`, and `getNotificationAddress()`.
 
 === Gateway Interface
 
 [source,java]
 ----
 public interface NotificationGateway {
+
     NotificationGatewayType getType();
+
     String send(Notification notification) throws Exception;
+
     Map<String, NotificationStatus> check(Collection<String> messageIds) throws Exception;
+
+    default int batchSize() {
+        return 100;
+    }
+
+    default Duration lifeTime() {
+        return Duration.ofHours(2);
+    }
 }
 ----
 
-=== Custom Implementation
+* **`getType()`** - Returns `EMAIL`, `PHONE`, or `LETTER`
+* **`send()`** - Sends the notification, returns an external message ID for tracking
+* **`check()`** - Checks delivery status for previously sent message IDs. Map provider statuses to `NotificationStatus` values: `SCHEDULED`, `PROCESSED_DELIVERY`, `PERFORMED`, `OPENED`, `ERROR`, `EXPIRED`, `DROPPED`
+* **`batchSize()`** - Maximum messages to check in a single `check()` call (default: 100)
+* **`lifeTime()`** - How long the system keeps checking delivery status (default: 2 hours)
 
-Extend abstract gateways for specific providers:
+=== Abstract Gateway Classes
+
+The SDK provides abstract classes that handle content extraction from `DocumentStorage` automatically.
+
+**`AbstractEmailGateway`** — override two methods:
+
+* `defaultSender()` — returns the default "from" address
+* `sendEmail(String sender, String email, String subject, String body, List<DocumentResource> attachments)` — sends the email, returns external message ID
+
+The base class extracts HTML body from `Document` content, loads attachments, and resolves the sender via `EmailSenderResolver` (if registered), falling back to `defaultSender()`.
+
+TIP: To use different sender addresses for different notification types, implement the `EmailSenderResolver` interface and register it as a Spring bean. It receives the full `Notification` object and returns the appropriate sender address.
+
+**`AbstractSmsGateway`** — override one method:
+
+* `sendSms(String phone, String message)` — sends the SMS, returns external message ID
+
+NOTE: There is no abstract class for LETTER gateways. Implement `NotificationGateway` directly.
+
+=== Built-in Email Gateways
+
+==== JavaMailSender (Spring Mail / SMTP)
+
+The simplest option using standard Spring Mail SMTP. Import `JavaMailSenderConfiguration` and configure:
+
+[source,yaml]
+----
+spring:
+  mail:
+    host: smtp.example.com
+    port: 587
+    username: your-username
+    password: your-password
+    sender: noreply@example.com
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+----
+
+Supports HTML content and file attachments. Works with any SMTP provider (Gmail, Amazon SES via SMTP, etc.).
+
+NOTE: SMTP does not support delivery status tracking. The `check()` method always returns `PERFORMED`.
+
+==== Mailgun
+
+Activated automatically when `mailgun.apiKey` property is set:
+
+[source,yaml]
+----
+mailgun:
+  apiKey: key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  domain: mg.example.com
+  sender: noreply@example.com
+  timeout: 30s    # optional, default 30s
+----
+
+Supports delivery status tracking via Mailgun Events API.
+
+==== Customer.io
+
+Activated when `customerio.apikey` property is set:
+
+[source,yaml]
+----
+customerio:
+  apikey: your-api-key
+  sender: noreply@example.com
+----
+
+NOTE: Customer.io transactional email API does not support file attachments.
+
+=== Built-in SMS Gateways
+
+==== Twilio
+
+Activated when `twilio.sid` property is set and Twilio SDK is on the classpath:
+
+[source,yaml]
+----
+twilio:
+  sid: ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  auth.token: your-auth-token
+  sender: "+15551234567"
+----
+
+Supports full delivery status tracking via Twilio Message API.
+
+==== Infobip
+
+Activated when `infobip.api.key` property is set and Infobip SDK is on the classpath:
+
+[source,yaml]
+----
+infobip:
+  api:
+    key: your-api-key
+    url: https://xxxxx.api.infobip.com
+  sender: InfoSMS    # optional
+----
+
+Supports delivery status tracking.
+
+=== Custom Gateway Implementation
+
+To integrate with a provider not included in the SDK, extend the appropriate abstract class:
 
 [source,java]
 ----
-@Component
-public class TwilioSmsGateway extends AbstractSmsGateway {
-    
+@Service
+@ConditionalOnProperty("myprovider.apiKey")
+public class MyEmailGateway extends AbstractEmailGateway {
+
+    @Value("${myprovider.sender}")
+    private String sender;
+
     @Override
-    protected String sendSms(String phone, String message) throws Exception {
-        // Integrate with Twilio API
-        Message twilioMessage = Message.creator(
-            new PhoneNumber(phone),
-            new PhoneNumber(fromPhoneNumber),
-            message
-        ).create();
-        return twilioMessage.getSid();
+    protected String defaultSender() {
+        return sender;
     }
-    
+
+    @Override
+    protected String sendEmail(String sender, String email, String subject,
+                               String body, List<DocumentResource> attachments) throws Exception {
+        // Call your email provider API, return external message ID
+    }
+
     @Override
     public Map<String, NotificationStatus> check(Collection<String> messageIds) throws Exception {
-        // Check delivery status from Twilio
-        return messageIds.stream().collect(Collectors.toMap(
-            id -> id,
-            id -> getDeliveryStatus(id)
-        ));
+        // Query your provider's delivery status API
     }
 }
 ----
 
-=== Development Gateway
+For SMS, extend `AbstractSmsGateway` and override `sendSms(String phone, String message)` and `check()`.
 
-For testing, use built-in development gateways that log instead of sending:
+=== Development Gateways
 
-[source,java]
+The SDK provides dev gateways that log notifications instead of sending them. Activated with the `development` Spring profile:
+
+[source,yaml]
 ----
-@Bean
-@Profile("dev")
-public NotificationGateway devEmailGateway(DocumentStorage documentStorage) {
-    return new DevEmailGateway(documentStorage);
-}
+spring:
+  profiles:
+    active: development
 ----
+
+This registers `DevEmailGateway`, `DevSmsGateway`, and `DevVoiceGateway` via `DevNotificationGatewayConfiguration`. All dev gateways log at DEBUG level and always report `PERFORMED` status.
+
+TIP: In production, dev gateways are replaced automatically — built-in gateways use `@ConditionalOnProperty` and activate only when their provider properties are configured.
 
 == Internationalization (i18n)
 
@@ -366,7 +449,7 @@ The pattern is: `notification.event.type.{EVENT_TYPE_NAME}=Display Name`
 EventParameter fields are labeled using their parameter names:
 
 ```properties
-# messages.properties  
+# messages.properties
 notification.event.APP_STATUS_CHANGE.status=Status
 notification.event.PAYMENT_REMINDER.daysCount=Days Count
 notification.event.LOAN_DECLINED.declineReason=Decline Reason
@@ -403,7 +486,7 @@ public void testLoanApprovalNotification() {
     // Create test application
     Application application = createTestApplication();
     application.setStatus(ApplicationStatus.SERVICING);
-    
+
     // Test notification
     boolean sent = loanApprovedEvent.notify(application.getId());
     assertTrue(sent);
@@ -418,17 +501,17 @@ public void testLoanApprovalNotification() {
 ----
 @Component
 public class PaymentReminderScheduler {
-    
+
     @Autowired
     private PaymentReminderEvent paymentReminderEvent;
-    
+
     @Scheduled(cron = "0 0 9 * * ?") // Daily at 9 AM
     public void sendPaymentReminders() {
         // PaymentReminderEvent handles the business logic
         // Templates configured with different daysCount values will
         // automatically send appropriate reminders
         List<ExampleCredit> activeCredits = creditRepository.findActiveCredits();
-        
+
         for (ExampleCredit credit : activeCredits) {
             paymentReminderEvent.notify(credit.getId());
         }
@@ -442,10 +525,10 @@ public class PaymentReminderScheduler {
 ----
 @Component
 public class WorkflowCompletionListener implements EntityEventListener<ProcessExecutionFinishedEvent> {
-    
+
     @Autowired
     private LoanApprovedEvent loanApprovedEvent;
-    
+
     @Override
     public void handle(ProcessExecutionFinishedEvent event) {
         if ("LOAN_APPROVAL_PROCESS".equals(event.getProcessDefinitionKey())) {
@@ -457,60 +540,8 @@ public class WorkflowCompletionListener implements EntityEventListener<ProcessEx
 }
 ----
 
-== Common Patterns
+=== Summary
 
-=== Event Design Decisions
-
-```java
-// ✅ Good: Simple event, no custom data needed
-public class LoanApprovedEvent extends NotificationEvent<Application, NotificationModel> {
-    public boolean notify(UUID applicationId) {
-        return super.notify(applicationId, new NotificationModel());
-    }
-}
-
-// ✅ Good: Custom data for template logic
-public class LoanDeclinedEvent extends NotificationEvent<Application, LoanDeclineTemplateModel> {
-    public boolean notify(UUID applicationId, DeclineReason reason, boolean eligible) {
-        LoanDeclineTemplateModel model = new LoanDeclineTemplateModel();
-        model.setDeclineReason(reason);
-        model.setReapplicationEligible(eligible);
-        return super.notify(applicationId, model);
-    }
-}
-
-// ❌ Avoid: EventParameter for static data
-public class BadEvent extends NotificationEvent<Application, NotificationModel> {
-    private static final EventParameter COMPANY_NAME = EventParameter.stringField("companyName");
-    // Use application properties or constants instead
-}
-```
-
-=== Template Patterns
-
-```html
-<!-- ✅ Good: Fallback for missing data -->
-{{ application.client.individualInfo.firstName | default("Valued Customer") }}
-
-<!-- ✅ Good: Safe navigation with conditionals -->
-{% if application.condition %}
-Rate: {{ application.condition.interestRate | numberformat('#,##0.00%') }}
-{% endif %}
-
-<!-- ❌ Avoid: Complex calculations in templates -->
-<!-- Move business logic to NotificationModel methods -->
-```
-
-=== Integration Patterns
-
-**Automatic notifications**: Use EntityChecker for state-driven events
-**Scheduled reminders**: Use EventParameters for admin-configurable timing  
-**Workflow notifications**: Listen to process completion events
-
-=== Performance Notes
-
-* **Batch scheduled notifications** - don't send individually in loops
-* **Use isSuitableTestEntity()** to filter test data accurately
-* **Monitor gateway delivery rates** - EMAIL typically higher success than SMS
-
-This notification system provides flexible, template-based communication that integrates seamlessly with your loan management workflow.
+* **Automatic notifications** - Use EntityChecker for state-driven events
+* **Scheduled reminders** - Use EventParameters for admin-configurable timing
+* **Workflow notifications** - Listen to process completion events
