@@ -55,6 +55,10 @@ This guide is organized into logical parts that build on each other:
 . **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
+. **<<table-resizing>>** - Interactive column resizing with automatic width adjustment and persistence
+. **<<table-sorting>>** - Client-side sorting with support for numbers, strings, and dates
+. **<<table-column-search>>** - Per-column search functionality with visual indicators
+. **<<table-column-pinning>>** - Pin columns to the left side during horizontal scrolling
 . **<<fast-search-system>>** - Unified search across all entities with Hibernate Search and Lucene
 . **<<entity-counters-and-launchpad-integration>>** - Create dashboard counters and workflow statistics with Launchpad integration
 . **<<launchpad-integration>>** - Integrate entities with unified workflow management and pending decisions
@@ -65,7 +69,7 @@ This guide is organized into logical parts that build on each other:
 . **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
 
 === PART III: BUSINESS LOGIC
-[start=24]
+[start=28]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<exception-entity>>** - Exception logging and error tracking with persistent storage
 . **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
@@ -77,14 +81,14 @@ This guide is organized into logical parts that build on each other:
 . **<<docusign-integration>>** - Document signing integration with DocuSign
 
 === PART IV: FINANCIAL OPERATIONS
-[start=33]
+[start=37]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
 === PART V: MONITORING
-[start=36]
+[start=40]
 . **<<user-action-audit>>** - Track and audit all user actions in the back-office application
 
 TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
@@ -104,6 +108,14 @@ include::_forms.adoc[leveloffset=+1]
 include::_form-templates.adoc[leveloffset=+1]
 
 include::_single-entity-layout.adoc[leveloffset=+1]
+
+include::_table-resize.adoc[leveloffset=+1]
+
+include::_table-sorting.adoc[leveloffset=+1]
+
+include::_table-search.adoc[leveloffset=+1]
+
+include::_table-column-pin.adoc[leveloffset=+1]
 
 include::_templates.adoc[leveloffset=+1]
 

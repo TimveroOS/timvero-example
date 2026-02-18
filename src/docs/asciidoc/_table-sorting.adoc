@@ -1,0 +1,413 @@
+=== Table Sorting
+==== Overview
+The `initSortingTable` module provides client-side table sorting functionality with support for multiple data types (numbers, strings, dates). The module enables interactive column sorting with visual indicators and maintains the original row order for reset functionality.
+
+==== Required HTML Structure
+===== Basic Table Structure
+To enable sorting, add the `sorting-table` class to your table:
+
+[source,html]
+----
+<table class="table sorting-table" id="sortableTable">
+    <thead>
+        <tr role="row">
+            <th data-sort-by="number">ID</th>
+            <th data-sort-by="string">Name</th>
+            <th data-sort-by="date">Created Date</th>
+            <th>Actions</th> <!-- Non-sortable column -->
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td data-cell-value="1">1</td>
+            <td data-cell-value="John Doe">John Doe</td>
+            <td data-cell-value="2024-01-15T10:30:00">Jan 15, 2024</td>
+            <td><button>Edit</button></td>
+        </tr>
+    </tbody>
+</table>
+----
+
+===== Column Configuration
+====== data-sort-by Attribute
+The `data-sort-by` attribute on `<th>` elements defines the sorting type for each column. This attribute is **required** to enable sorting for a column.
+
+Supported values:
+
+- `number` - For numeric data (integers, decimals)
+- `string` - For text data (alphabetical sorting)
+- `date` - For date/time data (chronological sorting)
+
+[source,html]
+----
+<th data-sort-by="number">ID</th>        <!-- Numeric sorting -->
+<th data-sort-by="string">Name</th>      <!-- Alphabetical sorting -->
+<th data-sort-by="date">Created</th>     <!-- Date sorting -->
+<th>Actions</th>                         <!-- No sorting (no data-sort-by) -->
+----
+
+====== data-cell-value Attribute
+The `data-cell-value` attribute on `<td>` elements provides the actual value used for sorting, which may differ from the displayed text.
+
+IMPORTANT: Use `data-cell-value` when:
+
+- Displayed value differs from sort value (e.g., formatted dates, formatted numbers)
+- Cell contains HTML elements (links, buttons, icons)
+- Special formatting is applied to the displayed value
+
+[source,html]
+----
+<!-- Date: Display formatted, sort by ISO string -->
+<td data-cell-value="2024-01-15T10:30:00">Jan 15, 2024</td>
+
+<!-- Number: Display formatted, sort by raw number -->
+<td data-cell-value="1500.50">$1,500.50</td>
+
+<!-- Link: Sort by text content -->
+<td data-cell-value="John Doe">
+    <a href="/user/123">John Doe</a>
+</td>
+
+<!-- Simple text: data-cell-value optional -->
+<td>Simple Text</td>
+----
+
+==== Sorting Behavior
+===== Three-State Sorting Cycle
+Each sortable column cycles through three states when clicked:
+
+1. **Unsorted (default)** → Click → **Ascending (asc)**
+2. **Ascending (asc)** → Click → **Descending (desc)**
+3. **Descending (desc)** → Click → **Unsorted (default)**
+
+When returning to the unsorted state, the original row order is restored.
+
+===== Visual Indicators
+The module automatically adds a sorting icon to each sortable column header and updates the `data-sort-direction` attribute:
+
+- `data-sort-direction=""` - Unsorted (default state)
+- `data-sort-direction="asc"` - Sorted ascending
+- `data-sort-direction="desc"` - Sorted descending
+
+===== Single Column Sorting
+Only one column can be sorted at a time. When sorting a new column, any previous sort is cleared.
+
+==== Automatic Enhancements
+===== Column Header Enhancement
+For columns with `data-sort-by` attribute, the module automatically adds a sorting icon.
+
+**If no column-header exists:**
+[source,html]
+----
+<!-- Before -->
+<th data-sort-by="string">Name</th>
+
+<!-- After -->
+<th data-sort-by="string" data-sort-direction="">
+    <div class="column-header">
+        <span>Name</span>
+        <div class="column-actions">
+            <svg class="sorting-icon">...</svg>
+        </div>
+    </div>
+</th>
+----
+
+**If column-header already exists** (e.g., from table-resize module):
+The sorting icon is appended to the existing `.column-actions` div:
+[source,html]
+----
+<!-- Before (from table-resize) -->
+<th data-sort-by="string">
+    <div class="column-header">
+        <span class="text-prompt">Name</span>
+        <div class="column-actions">
+            <svg class="pin-column-icon">...</svg>
+        </div>
+    </div>
+</th>
+
+<!-- After (sorting icon added) -->
+<th data-sort-by="string" data-sort-direction="">
+    <div class="column-header">
+        <span class="text-prompt">Name</span>
+        <div class="column-actions">
+            <svg class="pin-column-icon">...</svg>
+            <svg class="sorting-icon">...</svg>
+        </div>
+    </div>
+</th>
+----
+
+==== Data Type Handling
+===== Number Sorting
+For `data-sort-by="number"`:
+
+- Removes all whitespace from the value
+- Replaces comma with dot for decimal parsing
+- Compares numerically
+
+[source,html]
+----
+<td data-cell-value="1 500,50">1 500,50 EUR</td>  <!-- Parsed as 1500.50 -->
+<td data-cell-value="2500">$2,500.00</td>         <!-- Parsed as 2500 -->
+----
+
+===== String Sorting
+For `data-sort-by="string"`:
+
+- Uses JavaScript's `localeCompare()` for proper alphabetical sorting
+- Handles special characters and different locales
+- Case-sensitive comparison
+
+[source,html]
+----
+<td data-cell-value="Apple">Apple</td>
+<td data-cell-value="Banana">Banana</td>
+<td data-cell-value="Zebra">Zebra</td>
+----
+
+===== Date Sorting
+For `data-sort-by="date"`:
+
+- Parses dates using Moment.js library
+- Supports various date formats
+- Falls back to 0 (epoch start) for invalid dates with console warning
+
+Supported date formats (via Moment.js):
+
+- ISO 8601: `2024-01-15T10:30:00`
+- Common formats: `Jan 15, 2024`, `15/01/2024`, `2024-01-15`
+
+[source,html]
+----
+<td data-cell-value="2024-01-15T10:30:00">Jan 15, 2024</td>
+<td data-cell-value="2024-12-31">Dec 31, 2024</td>
+----
+
+IMPORTANT: Always use `data-cell-value` with date columns to provide a consistent, parseable date format (preferably ISO 8601).
+
+==== Complete Example
+===== Basic Sorting Table
+[source,html]
+----
+<table class="table sorting-table" id="myTable">
+    <thead>
+        <tr role="row">
+            <th data-sort-by="number">ID</th>
+            <th data-sort-by="string">Product Name</th>
+            <th data-sort-by="number">Price</th>
+            <th data-sort-by="date">Release Date</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td data-cell-value="1">1</td>
+            <td data-cell-value="Widget A">Widget A</td>
+            <td data-cell-value="29.99">$29.99</td>
+            <td data-cell-value="2024-01-15">Jan 15, 2024</td>
+            <td><button>Edit</button></td>
+        </tr>
+        <tr>
+            <td data-cell-value="2">2</td>
+            <td data-cell-value="Gadget B">Gadget B</td>
+            <td data-cell-value="49.99">$49.99</td>
+            <td data-cell-value="2024-02-20">Feb 20, 2024</td>
+            <td><button>Edit</button></td>
+        </tr>
+    </tbody>
+</table>
+----
+
+===== Combined with Table Resize
+[source,html]
+----
+<div class="tab-pane" id="executionsTab">
+    <div class="table-resize-container">
+        <table class="table table-resize sorting-table" id="sortableTable">
+            <thead>
+                <tr role="row">
+                    <th data-sort-by="number" th:text="#{symbol.id}">ID</th>
+                    <th data-sort-by="date" th:text="#{marketing.campaign.execution.startDate}">Start Date</th>
+                    <th data-sort-by="string" th:text="#{marketing.campaign.name}">Campaign Name</th>
+                    <th data-sort-by="string" th:text="#{marketing.campaign.execution.status}">Status</th>
+                    <th data-sort-by="string" th:text="#{marketing.campaign.execution.startedBy}">Started By</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr role="row" class="clickable" th:each="execution : ${executions}">
+                    <td th:data-cell-value="${execution.id}" th:text="${execution.id}">1</td>
+                    <td th:data-cell-value="*{execution.createdAt.toString()}"
+                        th:text="*{#ldates.format(execution.createdAt)}">2024-01-15</td>
+                    <td th:data-cell-value="*{execution.campaign.id}">
+                        <a th:href="@{*{'/marketing/' + execution.campaign.id}}"
+                           th:text="*{execution.campaign.id}">Campaign #1</a>
+                    </td>
+                    <td th:data-cell-value="*{#enums.name(execution.status)}"
+                        th:text="*{#enums.name(execution.status)}">COMPLETED</td>
+                    <td th:data-cell-value="${execution.createdBy?.name ?: 'Auto'}">
+                        <a th:if="*{execution.createdBy != null}"
+                           th:text="*{execution.createdBy.name}"
+                           th:href="@{*{'/user/' + execution.createdBy.entity}}">John Doe</a>
+                        <span th:if="*{execution.createdBy == null}">Auto</span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+----
+
+==== CSS Considerations
+The module adds the `sorting-table-ready` class to initialized tables to prevent duplicate initialization.
+
+
+CSS selectors for styling sort states:
+[source,css]
+----
+/* Unsorted state */
+th[data-sort-direction=""] .sorting-icon { }
+
+/* Ascending sort */
+th[data-sort-direction="asc"] .sorting-icon { }
+
+/* Descending sort */
+th[data-sort-direction="desc"] .sorting-icon { }
+----
+
+==== Initialization
+The module initializes automatically on:
+
+1. Page load (when the script is included)
+2. AJAX content load (triggered by `rui-ajax-loaded` event)
+
+Manual initialization:
+[source,javascript]
+----
+window.RootUI.initSortingTable();
+----
+
+==== Technical Details
+
+===== Value Extraction Logic
+The module uses the following priority for extracting cell values:
+
+1. **First priority**: `data-cell-value` attribute on `<td>`
+2. **Fallback**: Text content of `<td>` element (via `.text()`)
+
+===== Sorting Algorithm
+- Uses JavaScript's native `Array.sort()` method
+- Sorts table rows directly in the DOM
+- For numbers and dates: numeric comparison
+- For strings: `localeCompare()` for proper alphabetical ordering
+
+==== Integration with Other Table Features
+===== Combined with table-resize
+When both `table-resize` and `sorting-table` classes are present:
+
+- Resize functionality handles column width
+- Sorting functionality handles data ordering
+- Column headers contain both resize handles and sorting icons
+- Both features share the `.column-header` and `.column-actions` structure
+
+Recommended order:
+[source,html]
+----
+<table class="table table-resize sorting-table" id="myTable">
+----
+
+==== Best Practices
+1. **Always use data-cell-value for formatted data** - Ensures accurate sorting when display differs from sort value
+2. **Use ISO 8601 format for dates** - Provides consistent, unambiguous date parsing
+3. **Provide data-sort-by on all sortable columns** - Omit only for truly non-sortable columns (actions, checkboxes)
+4. **Test with edge cases** - Empty values, null values, special characters
+5. **Consider locale-specific sorting** - The module uses `localeCompare()` which respects browser locale
+6. **Keep tbody clean** - Avoid non-row elements in tbody, as they may interfere with sorting
+7. **Use consistent data types** - Don't mix numbers and text in the same sortable column
+
+==== Common Use Cases
+===== Sortable Product Catalog
+[source,html]
+----
+<table class="table sorting-table">
+    <thead>
+        <tr>
+            <th data-sort-by="string">Product</th>
+            <th data-sort-by="number">Price</th>
+            <th data-sort-by="number">Stock</th>
+            <th data-sort-by="string">Category</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td data-cell-value="Laptop Pro">Laptop Pro</td>
+            <td data-cell-value="1299.99">$1,299.99</td>
+            <td data-cell-value="25">25 units</td>
+            <td data-cell-value="Electronics">Electronics</td>
+        </tr>
+    </tbody>
+</table>
+----
+
+===== Sortable User List with Links
+[source,html]
+----
+<table class="table sorting-table">
+    <thead>
+        <tr>
+            <th data-sort-by="number">ID</th>
+            <th data-sort-by="string">Name</th>
+            <th data-sort-by="date">Joined</th>
+            <th data-sort-by="string">Status</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td data-cell-value="42">42</td>
+            <td data-cell-value="Alice Smith">
+                <a href="/user/42">Alice Smith</a>
+            </td>
+            <td data-cell-value="2024-01-15T09:00:00">Jan 15, 2024</td>
+            <td data-cell-value="Active">
+                <span class="badge badge-success">Active</span>
+            </td>
+        </tr>
+    </tbody>
+</table>
+----
+
+===== Sortable Campaign Executions (Real Example)
+[source,html]
+----
+<table class="table table-resize sorting-table" id="sortableTable">
+    <thead>
+        <tr role="row">
+            <th data-sort-by="number">ID</th>
+            <th data-sort-by="date">Start Date</th>
+            <th data-sort-by="string">Campaign Name</th>
+            <th data-sort-by="string">Status</th>
+            <th data-sort-by="string">Started By</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr th:each="execution : ${executions}">
+            <td th:data-cell-value="${execution.id}" th:text="${execution.id}"></td>
+            <td th:data-cell-value="*{execution.createdAt.toString()}"
+                th:text="*{#ldates.format(execution.createdAt)}"></td>
+            <td th:data-cell-value="*{execution.campaign.id}">
+                <a th:href="@{*{'/marketing/' + execution.campaign.id}}"
+                   th:text="*{execution.campaign.id}"></a>
+            </td>
+            <td th:data-cell-value="*{#enums.name(execution.status)}"
+                th:text="*{#enums.name(execution.status)}"></td>
+            <td th:data-cell-value="${execution.createdBy?.name ?: 'Auto'}">
+                <a th:if="*{execution.createdBy != null}"
+                   th:text="*{execution.createdBy.name}"
+                   th:href="@{*{'/user/' + execution.createdBy.entity}}"></a>
+                <span th:if="*{execution.createdBy == null}">Auto</span>
+            </td>
+        </tr>
+    </tbody>
+</table>
+----

@@ -1,0 +1,365 @@
+=== Table Column Pinning
+==== Overview
+The `TableColumnPinManager` class provides functionality for pinning (freezing) table columns to the left side of the table. Pinned columns remain visible while scrolling horizontally through the table, making it easier to view key columns alongside scrollable data. The pin state and column order are persisted to localStorage and automatically restored on page reload.
+
+==== Integration
+The `TableColumnPinManager` is automatically initialized as part of the `initResizeColumnAdjustTableWidth` module and does not require separate initialization. It works seamlessly with other table features:
+
+- **Column Resizing** - Pinned columns can be resized normally
+- **Column Sorting** - Pinned columns can be sorted like any other column
+- **Column Search** - Search functionality works on pinned columns
+
+==== How Column Pinning Works
+===== User Interaction
+Users can pin/unpin columns by clicking the pin icon in the column header:
+
+1. **Unpinned Column** → Click pin icon → **Column moves to leftmost pinned position**
+2. **Pinned Column** → Click pin icon → **Column returns to its original position**
+
+===== Visual Behavior
+When a column is pinned:
+
+- Column moves to the left side of the table
+- Multiple pinned columns appear in the order they were pinned
+- Column gains `position: sticky` CSS property
+- Column remains visible during horizontal scroll
+- A visual border separates the last pinned column from unpinned columns
+
+==== HTML Structure
+===== Automatic Pin Icon Addition
+The pin icon is automatically added to each column header by the `initResizeColumnAdjustTableWidth` module during the `initHeader()` function:
+
+[source,javascript]
+----
+// From initResizeColumnAdjustTableWidth.js
+function initHeader($table) {
+  const $headers = $table.find('th');
+  $headers.each((index, header) => {
+    header.innerHTML = `
+      <div class="column-header">
+        <span class="text-prompt">${header.innerHTML}</span>
+        <div class="column-actions">
+          ${renderIcon('pin', 'column-move-instant pin-column-icon', 16, 16)}
+          <!-- other icons -->
+        </div>
+      </div>
+    `;
+  });
+}
+----
+
+Result:
+[source,html]
+----
+<th data-default-index="0">
+    <div class="column-header">
+        <span class="text-prompt">Column Name</span>
+        <div class="column-actions">
+            <svg class="column-move-instant pin-column-icon">...</svg>
+            <!-- sorting and search icons -->
+        </div>
+    </div>
+</th>
+----
+
+==== Technical Implementation
+===== Class Constructor
+[source,javascript]
+----
+const pinManager = new TableColumnPinManager(tableElement, storageKey);
+----
+
+Parameters:
+
+- `table` - DOM element reference to the table
+- `storageKey` - localStorage key for persisting state (format: `{tabPaneId}/{tableId}`)
+
+===== Initialization Flow
+When instantiated, the class:
+
+1. Stores references to table and table header
+2. Calls `restoreColumnOrder()` - Restores pinned columns from localStorage
+3. Calls `bindEvents()` - Attaches click event listener to pin icons
+4. Calls `updateStickyPositions()` - Calculates and applies sticky positioning
+
+===== Storage Format
+Column pin state is stored in localStorage alongside column width data:
+
+[source,javascript]
+----
+{
+  columnData: {
+    "0": {
+      width: 150,
+      position: undefined  // Unpinned column
+    },
+    "1": {
+      width: 200,
+      position: 0  // Pinned at position 0 (leftmost)
+    },
+    "2": {
+      width: 180,
+      position: 1  // Pinned at position 1 (second from left)
+    },
+    "3": {
+      width: 250,
+      position: undefined  // Unpinned column
+    }
+  },
+  tableWidth: 780
+}
+----
+
+Key points:
+
+- `position: undefined` - Column is unpinned
+- `position: 0, 1, 2...` - Column is pinned at the specified position
+- Position is relative to the left edge of the table
+
+==== Core Methods
+===== instantMoveAfterTarget(sourceElement)
+Toggles pin state when user clicks the pin icon.
+
+**Unpinning Logic:**
+[source,javascript]
+----
+if (sourceHeader.classList.contains('pinned')) {
+  // Calculate original position considering other pinned columns
+  const currentDefaultIndex = parseInt(sourceHeader.getAttribute('data-default-index'), 10);
+  const indexOffset = pinnedHeaders
+    .filter(header => parseInt(header.getAttribute('data-default-index'), 10) > currentDefaultIndex)
+    .length;
+
+  this.moveColumnToPosition(sourceIndex, currentDefaultIndex + indexOffset);
+  sourceHeader.classList.remove('pinned');
+}
+----
+
+**Pinning Logic:**
+[source,javascript]
+----
+else {
+  // Move to position after last pinned column
+  this.moveColumnToPosition(sourceIndex, pinnedHeaders.length);
+  sourceHeader.classList.add('pinned');
+}
+----
+
+===== moveColumnToPosition(sourceIndex, targetIndex)
+Physically moves a column in the DOM from source position to target position.
+
+Moves both:
+
+- Header cell (`<th>`) in `<thead>`
+- All body cells (`<td>`) in corresponding position across all `<tbody>` rows
+
+[source,javascript]
+----
+// Move header
+const movingHeader = this.tableHeader.children[sourceIndex];
+const targetHeader = this.tableHeader.children[targetIndex];
+if (targetIndex < sourceIndex) {
+  targetHeader.before(movingHeader);  // Insert before target
+} else {
+  targetHeader.after(movingHeader);   // Insert after target
+}
+
+// Move all cells in that column
+rows.forEach((row) => {
+  const movingCell = row.children[sourceIndex];
+  const targetCell = row.children[targetIndex];
+  // Same before/after logic
+});
+----
+
+===== saveColumnOrder()
+Saves the current column order and pin state to localStorage.
+
+For each column:
+
+- If pinned: saves `position` as current index
+- If unpinned: saves `position: undefined`
+
+===== restoreColumnOrder()
+Restores pinned columns on page load/initialization.
+
+Process:
+
+1. Load data from localStorage
+2. Filter columns with `position !== undefined`
+3. Sort by position (ascending)
+4. Move each column to its saved position
+5. Add `pinned` class to restored columns
+6. Update sticky positions
+
+===== updateStickyPositions()
+Calculates and applies CSS `left` offset for sticky positioning.
+
+Algorithm:
+[source,javascript]
+----
+let leftOffset = 0;
+
+headers.forEach((header, index) => {
+  if (header.classList.contains('pinned')) {
+    // Apply sticky position
+    header.style.left = `${leftOffset}px`;
+
+    // Apply to all cells in this column
+    rows.forEach((row) => {
+      const cell = row.children[index];
+      cell.classList.add('pinned-cell');
+      cell.style.left = `${leftOffset}px`;
+    });
+
+    // Accumulate offset for next pinned column
+    leftOffset += header.offsetWidth;
+  }
+});
+----
+
+IMPORTANT: This method must be called after any operation that changes column widths or pin states.
+
+===== bindEvents()
+Attaches click event listener to the table header:
+
+[source,javascript]
+----
+this.tableHeader.addEventListener('click', (e) => {
+  const targetElement = e.target.closest('.column-move-instant');
+  if (targetElement) {
+    this.instantMoveAfterTarget(targetElement);
+  }
+});
+----
+
+Uses event delegation to handle clicks on pin icons.
+
+==== Complete Example
+===== Automatic Initialization
+[source,javascript]
+----
+// From initResizeColumnAdjustTableWidth.js
+function initResizeColumnAdjustTableWidth() {
+  $('.table-resize:not(.table-resize-ready)').each(function () {
+    const $table = $(this);
+    const tableId = $table.attr('id');
+    const tabPaneId = $table.closest('.tab-pane').attr('id');
+    const storageKey = tabPaneId + '/' + tableId;
+
+    initHeader($table);  // Adds pin icons
+
+    // Initialize TableColumnPinManager
+    const pinManager = new TableColumnPinManager(this, storageKey);
+
+    // ... rest of resize initialization
+  });
+}
+----
+
+===== HTML Structure (Executions Table Example)
+[source,html]
+----
+<div class="tab-pane" id="executionsTab">
+    <div class="table-resize-container">
+        <table class="table table-resize sorting-table" id="sortableTable">
+            <thead>
+                <tr role="row">
+                    <!-- After initHeader(), each th will have pin icon -->
+                    <th data-sort-by="number" data-default-index="0">
+                        <div class="column-header">
+                            <span class="text-prompt">ID</span>
+                            <div class="column-actions">
+                                <svg class="column-move-instant pin-column-icon">...</svg>
+                                <svg class="sorting-icon">...</svg>
+                            </div>
+                        </div>
+                    </th>
+                    <th data-sort-by="date" data-default-index="1" class="pinned" style="left: 0px;">
+                        <div class="column-header">
+                            <span class="text-prompt">Start Date</span>
+                            <div class="column-actions">
+                                <svg class="column-move-instant pin-column-icon">...</svg>
+                                <svg class="sorting-icon">...</svg>
+                            </div>
+                        </div>
+                    </th>
+                    <!-- More columns -->
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td data-cell-value="1">1</td>
+                    <td data-cell-value="2024-01-15" class="pinned-cell" style="left: 0px;">
+                        Jan 15, 2024
+                    </td>
+                    <!-- More cells -->
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+----
+
+==== Integration with Other Table Features
+===== Column Resizing Integration
+When a column is resized, the pin manager must update sticky positions:
+
+[source,javascript]
+----
+// From initResizeColumnAdjustTableWidth.js
+const handleMouseUp = function (e) {
+  // ... resize logic ...
+
+  // Update sticky positions after resize
+  pinManager.updateStickyPositions();
+};
+----
+
+===== Storage Integration
+Both column widths and pin positions share the same localStorage structure:
+
+[source,javascript]
+----
+// Load existing data
+const tableData = loadColsWidthFromStorage(storageKey) || {};
+
+// Update column data (width and position)
+tableData.columnData = {
+  "0": { width: 150, position: undefined },
+  "1": { width: 200, position: 0 }
+};
+
+// Save back to storage
+saveColsWidthToStorage(storageKey, tableData);
+----
+
+===== Sorting Integration
+Sorting operates on rows and does not affect column order or pin state. Pinned columns remain pinned during and after sorting operations.
+
+==== User Workflows
+===== Pinning a Column
+1. User clicks pin icon on "Campaign Name" column (currently at position 2)
+2. `instantMoveAfterTarget()` is called
+3. Column is moved to position 1 (after ID column which is at position 0)
+4. `pinned` class is added to the `<th>`
+5. Column order is saved to localStorage
+6. `updateStickyPositions()` calculates left offset
+7. Column becomes sticky and visible during horizontal scroll
+
+===== Unpinning a Column
+1. User clicks pin icon on pinned "Start Date" column
+2. `instantMoveAfterTarget()` is called
+3. Original position (data-default-index) is retrieved
+4. Index offset is calculated based on other pinned columns
+5. Column is moved back to adjusted original position
+6. `pinned` class is removed
+7. State is saved to localStorage
+8. Sticky positioning is recalculated
+
+===== Multiple Pinned Columns
+1. User pins "ID" column → Position 0, left offset: 0px
+2. User pins "Status" column → Position 1, left offset: 150px (ID width)
+3. User pins "Campaign" column → Position 2, left offset: 330px (ID + Status widths)
+
+Result: All three columns remain visible during horizontal scroll, stacked from left to right.
