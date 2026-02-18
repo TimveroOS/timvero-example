@@ -1,0 +1,183 @@
+=== Resizable Tables with Adjustable Width
+==== Overview
+The `initResizeColumnAdjustTableWidth` module provides functionality for interactive table column resizing with automatic width adjustment. This feature allows users to manually resize table columns by dragging, with column widths being saved to localStorage and automatically restored on page reload.
+
+==== Required HTML Structure
+===== Container Structure
+The table must be wrapped in a container with the `table-resize-container` class:
+
+[source,html]
+----
+<div class="table-resize-container">
+    <table class="table table-resize" id="uniqueTableId">
+        <!-- Table content -->
+    </table>
+</div>
+----
+
+===== Table Requirements
+The table element must have:
+
+- `table-resize` class - Enables the resize functionality
+- Unique `id` attribute - Used for storing column widths in localStorage
+- Must be placed inside a `tab-pane` element with an `id` attribute (used as part of the storage key)
+
+===== Table Header Structure
+The table header (`<thead>`) must contain standard `<th>` elements:
+
+[source,html]
+----
+<thead>
+    <tr role="row">
+        <th data-sort-by="number">ID</th>
+        <th data-sort-by="date">Start Date</th>
+        <th data-sort-by="string">Campaign Name</th>
+        <th data-sort-by="string">Status</th>
+    </tr>
+</thead>
+----
+
+IMPORTANT: Each `<th>` element will be automatically enhanced with:
+
+- `data-default-index` attribute - Stores the original column index
+- Nested HTML structure with column header, text wrapper, and action buttons
+- Resize handle element
+
+==== Automatic Enhancements
+===== Column Header Enhancement
+Each table header cell is automatically transformed from:
+[source,html]
+----
+<th>Column Name</th>
+----
+
+To:
+[source,html]
+----
+<th data-default-index="0">
+    <div class="column-header">
+        <span class="text-prompt" title="Column Name">Column Name</span>
+        <div class="column-actions">
+            <!-- Pin icon -->
+            <svg class="column-move-instant pin-column-icon">...</svg>
+            <!-- Search icon -->
+            <span class="column-search-icon">
+                <span class="icon">
+                    <span data-feather="search" class="rui-icon"></span>
+                </span>
+            </span>
+        </div>
+        <div class="resize-handle"></div>
+    </div>
+</th>
+----
+
+===== Resize Line Element
+A visual resize indicator line is automatically created:
+[source,html]
+----
+<div class="resize-line"></div>
+----
+
+This element is positioned absolutely and displayed during column resize operations.
+
+==== Features and Functionality
+===== Column Resizing
+- **Drag to Resize**: Users can drag the resize handle on the right edge of each column header
+- **Minimum Width**: Columns cannot be resized below 120px (configurable via `settings.minWidth`)
+- **Visual Feedback**: A vertical line appears during dragging to show the new column position
+- **Table Width Adjustment**: The entire table width adjusts automatically when columns are resized
+
+===== Width Persistence
+- **localStorage Integration**: Column widths are saved to localStorage using the key format: `{tabPaneId}/{tableId}`
+- **Automatic Restoration**: Saved column widths are restored when the page is reloaded
+- **Per-Column Storage**: Each column's width is stored individually by its `data-default-index`
+
+Storage structure:
+[source,javascript]
+----
+{
+    columnData: {
+        "0": { width: 150 },
+        "1": { width: 200 },
+        "2": { width: 250 }
+    },
+    tableWidth: 600
+}
+----
+
+===== Initial Width Calculation
+When no saved widths exist:
+
+1. Table layout is set to `auto`
+2. Natural content width is calculated for each column
+3. Width is set to the maximum of natural width or minimum width (120px)
+4. Table layout is then changed to `fixed`
+
+==== Complete Example
+[source,html]
+----
+<div class="tab-pane" id="executionsTab">
+    <div class="table-resize-container">
+        <table class="table table-resize sorting-table" id="sortableTable">
+            <thead>
+                <tr role="row">
+                    <th data-sort-by="number" th:text="#{symbol.id}">ID</th>
+                    <th data-sort-by="date" th:text="#{marketing.campaign.execution.startDate}">Start Date</th>
+                    <th data-sort-by="string" th:text="#{marketing.campaign.name}">Campaign Name</th>
+                    <th data-sort-by="string" th:text="#{marketing.campaign.execution.status}">Status</th>
+                    <th data-sort-by="string" th:text="#{marketing.campaign.execution.startedBy}">Started By</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr role="row" class="clickable">
+                    <td th:data-cell-value="${execution.id}" th:text="${execution.id}">1</td>
+                    <td th:data-cell-value="*{execution.createdAt.toString()}">2024-01-15</td>
+                    <td th:data-cell-value="*{execution.campaign.id}">
+                        <a th:href="@{*{'/marketing/' + execution.campaign.id}}">Campaign #1</a>
+                    </td>
+                    <td th:data-cell-value="*{#enums.name(execution.status)}">COMPLETED</td>
+                    <td th:data-cell-value="${execution.createdBy?.name}">John Doe</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+----
+
+==== CSS Considerations
+The module adds several CSS classes dynamically:
+
+- `table-resize-ready` - Added to the table after initialization
+- `resizing-active` - Added to the table during active resize operation
+- `resizing` - Added to the resize handle being dragged
+
+During resize operations, the module also sets:
+- Body cursor to `col-resize`
+- Body user-select to `none`
+
+==== Initialization
+The module initializes automatically on:
+
+1. Page load (when the script is included)
+2. AJAX content load (triggered by `rui-ajax-loaded` event)
+
+Manual initialization:
+[source,javascript]
+----
+window.RootUI.initResizeColumnAdjustTableWidth();
+----
+
+==== Technical Details
+===== Storage Key Format
+The storage key is constructed as: `{tabPaneId}/{tableId}`
+
+Example: `executionsTab/sortableTable`
+
+==== Best Practices
+1. **Always provide a unique table ID** - Required for localStorage persistence
+2. **Wrap table in table-resize-container** - Ensures proper visual feedback during resize
+3. **Place table inside a tab-pane** - Required for generating unique storage keys
+4. **Use consistent data attributes** - Maintain `data-sort-by` and `data-cell-value` attributes for sorting and filtering
+5. **Avoid manual width styling** - Let the module calculate and apply widths automatically
+6. **Test with various content lengths** - Ensure minimum width setting (120px) works for your content

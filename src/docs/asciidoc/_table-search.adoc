@@ -1,0 +1,412 @@
+=== Table Column Search
+==== Overview
+The `initTableSearch` module provides per-column search functionality for tables. Users can search within specific columns by clicking the search icon in the column header, entering a search term, and filtering table rows to show only those that match. The search is case-insensitive and supports partial matching. Multiple search filters are not supported - only one column can be searched at a time.
+
+==== Integration
+The `initTableSearch` function is automatically called as part of the `initResizeColumnAdjustTableWidth` module initialization:
+
+[source,javascript]
+----
+// From initResizeColumnAdjustTableWidth.js
+function initResizeColumnAdjustTableWidth() {
+  $('.table-resize:not(.table-resize-ready)').each(function () {
+    const $table = $(this);
+    const tableId = $table.attr('id');
+
+    initHeader($table);  // Adds search icons to headers
+    const pinManager = new TableColumnPinManager(this, storageKey);
+
+    // Initialize table search
+    initTableSearch(tableId);
+
+    // ... rest of initialization
+  });
+}
+----
+
+IMPORTANT: The search icon is automatically added to each column header during the `initHeader()` process, alongside the pin and sorting icons.
+
+==== HTML Structure
+===== Automatic Search Icon Addition
+Each column header receives a search icon automatically:
+
+[source,javascript]
+----
+// From initResizeColumnAdjustTableWidth.js
+function initHeader($table) {
+  $headers.each((index, header) => {
+    header.innerHTML = `
+      <div class="column-header">
+        <span class="text-prompt" title="${header.innerHTML}">${header.innerHTML}</span>
+        <div class="column-actions">
+          ${renderIcon('pin', 'column-move-instant pin-column-icon', 16, 16)}
+          <span class="column-search-icon">
+            <span class="icon">
+              <span data-feather="search" class="rui-icon"></span>
+            </span>
+          </span>
+        </div>
+      </div>
+    `;
+  });
+}
+----
+
+===== Search Box Container
+The module creates a search box container at the top of the table:
+
+[source,html]
+----
+<div class="table-resize-container">
+    <!-- Automatically created by initTableSearch -->
+    <div class="table-search-container">
+        <div class="column-search-box">
+            <div class="column-search-label">Search by: Column Name</div>
+            <input type="text" class="column-search-input" placeholder="Search...">
+            <div class="column-search-buttons">
+                <button class="column-search-btn btn btn-secondary reset">Reset</button>
+                <button class="column-search-btn btn btn-success search">Find</button>
+                <button class="column-search-btn close">
+                    <span class="icon">
+                        <span data-feather="x" class="rui-icon"></span>
+                    </span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <table class="table table-resize" id="myTable">
+        <!-- Table content -->
+    </table>
+</div>
+----
+
+
+==== User Workflow
+===== Opening Search Box
+1. User clicks search icon in column header
+2. Search box appears at top of table
+3. Label shows: "Search by: [Column Name]"
+4. Input field is focused
+5. If column was previously searched, previous search term is restored
+
+===== Performing Search
+1. User enters search term in input field
+2. User clicks "Find" button (or presses Enter)
+3. Search term is saved for that column
+4. Search icon gains `has-active-search` class (visual indicator)
+5. Table rows are filtered:
+   - Matching rows: visible
+   - Non-matching rows: hidden
+6. Collapsed content (if any) follows row visibility
+
+===== Resetting Search
+1. User clicks "Reset" button
+2. All search terms are cleared
+3. All search icons lose `has-active-search` class
+4. Input field is cleared
+5. All table rows become visible
+
+===== Closing Search Box
+1. User clicks "Close" button (X icon)
+2. Search box is hidden
+3. Current search filters remain active
+4. Rows remain filtered (search is not reset)
+
+===== Switching Columns
+1. User clicks different column's search icon while search box is open
+2. Search box updates to show new column name
+3. Input field shows previous search term for new column (if any)
+4. Previous search filters remain active
+
+==== Search Behavior
+===== Case-Insensitive Matching
+Search is case-insensitive:
+[source,javascript]
+----
+const matches = cellText.toLowerCase().includes(searchValue.toLowerCase());
+----
+
+Examples:
+- Search "apple" matches: "Apple", "APPLE", "apple", "Pineapple"
+- Search "test" matches: "Test", "TEST", "Latest", "testing"
+
+===== Partial Matching
+Search uses substring matching (`.includes()`):
+
+- Search "cam" matches: "Campaign", "camera", "became"
+- Search "123" matches: "123", "Campaign 123", "ABC123XYZ"
+
+===== Text Extraction
+Search uses `innerText` from table cells:
+[source,javascript]
+----
+const cellText = $cell.get(0).innerText;
+----
+
+This means:
+- HTML is stripped (searches visible text only)
+- Links, buttons, etc. - only their text content is searched
+- Hidden elements within cell are excluded
+
+===== Row Visibility
+When a search is active:
+- Matching rows: `.show()` - displayed
+- Non-matching rows: `.hide()` - hidden with `display: none`
+
+===== Collapsed Content Support
+The module supports collapsible row content (Bootstrap collapse):
+
+[source,javascript]
+----
+const getCollapseTarget = function ($element) {
+  return $element.attr('data-toggle') === 'collapse'
+    ? $($element.attr('data-target'))
+    : null;
+};
+----
+
+When a row is hidden/shown, its collapse target is also hidden/shown:
+[source,javascript]
+----
+if (matches) {
+  rowData.$element.show();
+  rowData.$collapseTarget?.show();  // Show collapsed content
+} else {
+  rowData.$element.hide();
+  rowData.$collapseTarget?.hide();  // Hide collapsed content
+}
+----
+
+==== Technical Implementation
+===== Initialization
+[source,javascript]
+----
+initTableSearch(tableId);
+----
+
+Parameters:
+- `tableId` - The ID attribute of the table element
+
+===== Search State Management
+The module maintains a `searchValues` object to track active searches:
+
+[source,javascript]
+----
+const searchValues = {
+  "0": "Campaign",      // Column 0 (data-default-index="0") searching for "Campaign"
+  "2": "John",          // Column 2 searching for "John"
+  // undefined columns have no active search
+};
+----
+
+Key: `data-default-index` of the column
+Value: Current search term for that column
+
+===== Row Data Initialization
+On initialization, the module creates a data structure for efficient row manipulation:
+
+[source,javascript]
+----
+const rowsData = Array.from($table.find('tbody').find('tr[role="row"]')).map(row => ({
+  element: row,                    // Native DOM element
+  $element: $(row),                // jQuery wrapped element
+  $collapseTarget: getCollapseTarget($(row))  // Associated collapse element
+}));
+----
+
+IMPORTANT: Only rows with `role="row"` are included. Other rows (e.g., spacer rows, summary rows) are ignored.
+
+===== Event Handlers
+====== Search Icon Click
+[source,javascript]
+----
+$table.find('.column-search-icon').on('click', function (e) {
+  const $th = $(this).closest('th');
+  const defaultIndex = $th.attr('data-default-index');
+  const columnName = $th.find('.text-prompt').text().trim();
+
+  // Toggle: if clicking same column, close; otherwise open
+  const wasActive = $searchBox.hasClass('active')
+    && $searchBox.attr('data-target-default-index') === defaultIndex;
+
+  if (wasActive) {
+    closeSearchBox();
+  } else {
+    $searchBox.attr('data-target-default-index', defaultIndex);
+    $searchLabel.text(`${searchInputLabel} ${columnName}`);
+    $searchBox.addClass('active');
+    $searchInput.val(searchValues[defaultIndex] || '');
+    $searchInput.focus();
+  }
+});
+----
+
+====== Find Button Click
+[source,javascript]
+----
+$searchBox.find('.column-search-btn.search').on('click', function (e) {
+  const targetDefaultIndex = $searchBox.attr('data-target-default-index');
+  const searchValue = $searchInput.val();
+
+  if (!searchValue) return;  // Empty search is ignored
+
+  searchValues[targetDefaultIndex] = searchValue;
+
+  const $targetTh = $table.find(`th[data-default-index="${targetDefaultIndex}"]`);
+  const currentColumnIndex = $targetTh.index();
+  $targetTh.find('.column-search-icon').addClass('has-active-search');
+
+  rowsData.forEach((rowData) => {
+    const $cell = rowData.$element.find('td').eq(currentColumnIndex);
+    const cellText = $cell.get(0).innerText;
+    const matches = cellText.toLowerCase().includes(searchValue.toLowerCase());
+
+    if (matches) {
+      rowData.$element.show();
+      rowData.$collapseTarget?.show();
+    } else {
+      rowData.$element.hide();
+      rowData.$collapseTarget?.hide();
+    }
+  });
+});
+----
+
+====== Reset Button Click
+[source,javascript]
+----
+$searchBox.find('.column-search-btn.reset').on('click', function (e) {
+  // Clear all search values
+  Object.keys(searchValues).forEach(key => {
+    delete searchValues[key];
+  });
+
+  // Remove visual indicators
+  $table.find('.column-search-icon').removeClass('has-active-search');
+
+  // Clear input
+  $searchInput.val('');
+
+  // Show all rows
+  rowsData.forEach((rowData) => {
+    rowData.$element.show();
+    rowData.$collapseTarget?.show();
+  });
+});
+----
+
+====== Enter Key Support
+[source,javascript]
+----
+$searchInput.on('keypress', function (e) {
+  if (e.key === 'Enter') {
+    $searchBox.find('.column-search-btn.search').click();
+  }
+});
+----
+
+
+==== Complete Example
+===== Basic Usage
+[source,html]
+----
+<div class="tab-pane" id="executionsTab">
+    <div class="table-resize-container">
+        <!-- Search container automatically created here by initTableSearch -->
+
+        <table class="table table-resize sorting-table" id="sortableTable">
+            <thead>
+                <tr role="row">
+                    <th data-sort-by="number">
+                        <div class="column-header">
+                            <span class="text-prompt">ID</span>
+                            <div class="column-actions">
+                                <svg class="pin-column-icon">...</svg>
+                                <span class="column-search-icon">
+                                    <span class="icon">
+                                        <span data-feather="search"></span>
+                                    </span>
+                                </span>
+                                <svg class="sorting-icon">...</svg>
+                            </div>
+                        </div>
+                    </th>
+                    <th data-sort-by="string">
+                        <div class="column-header">
+                            <span class="text-prompt">Campaign Name</span>
+                            <div class="column-actions">
+                                <svg class="pin-column-icon">...</svg>
+                                <span class="column-search-icon has-active-search">
+                                    <span class="icon">
+                                        <span data-feather="search"></span>
+                                    </span>
+                                </span>
+                                <svg class="sorting-icon">...</svg>
+                            </div>
+                        </div>
+                    </th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr role="row">
+                    <td>1</td>
+                    <td>Summer Campaign</td>
+                </tr>
+                <tr role="row" style="display: none;">
+                    <td>2</td>
+                    <td>Winter Sale</td>
+                </tr>
+                <tr role="row">
+                    <td>3</td>
+                    <td>Black Friday Campaign</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+----
+
+===== With Collapsible Rows
+[source,html]
+----
+<tbody>
+    <tr role="row" data-toggle="collapse" data-target="#details-1">
+        <td>1</td>
+        <td>Campaign Name</td>
+        <td><button>Expand</button></td>
+    </tr>
+    <tr id="details-1" class="collapse">
+        <td colspan="3">
+            <div>Detailed information about Campaign 1...</div>
+        </td>
+    </tr>
+</tbody>
+----
+
+When row with ID 1 is hidden by search, the collapse row `#details-1` is also hidden.
+
+==== Limitations
+===== Single Column Search Only
+The current implementation supports only one active search at a time:
+
+- Clicking a new column's search icon switches to that column
+- Previous search terms are remembered but not applied simultaneously
+- Reset button clears all saved search terms
+
+===== Row-Level Filtering Only
+Search shows/hides entire rows:
+- Cannot highlight matching text within cells
+- Cannot show partial row data
+- All columns in matching rows are visible
+
+
+
+==== Best Practices
+1. **Always use role="row"** - Ensures rows are included in search data
+2. **Keep cell text simple** - Search uses `innerText`, complex HTML may affect results
+3. **Use consistent casing** - While search is case-insensitive, consistent data improves UX
+4. **Provide meaningful column names** - Search label displays column name from `.text-prompt`
+5. **Test with special characters** - Ensure data with symbols, numbers searches correctly
+6. **Consider performance** - Large tables (1000+ rows) may have slower search
+7. **Don't rely on search state** - State is not persisted, users need to re-search after reload
