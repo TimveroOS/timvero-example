@@ -48,6 +48,7 @@ This guide is organized into logical parts that build on each other:
 . **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
 . **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example
 . **<<application-setup>>** - Entry point, multi-context architecture, and Actuator configuration
+. **<<password-management>>** - Account lockout, password expiration, and validation rules
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE
@@ -95,6 +96,8 @@ include::_platform-overview.adoc[leveloffset=+1]
 include::_getting-started.adoc[leveloffset=+1]
 
 include::_application-setup.adoc[leveloffset=+1]
+
+include::_password-management.adoc[leveloffset=+1]
 
 include::_data-model.adoc[leveloffset=+1]
 
