@@ -48,10 +48,11 @@ This guide is organized into logical parts that build on each other:
 . **<<platform-overview>>** - Core concepts: Basic, Origination, and Servicing layers
 . **<<getting-started>>** - Master the Entity-Form-Controller pattern with Client example
 . **<<application-setup>>** - Entry point, multi-context architecture, and Actuator configuration
+. **<<password-management>>** - Account lockout, password expiration, and validation rules
 . **<<data-model-setup>>** - SQL autogeneration and Flyway migration workflows
 
 === PART II: USER INTERFACE
-[start=5]
+[start=6]
 . **<<form-classes-setup-and-usage>>** - Form classes, validation, MapStruct mappers, and service layers
 . **<<form-templates>>** - Form structure, layout patterns, and two-column grids for modal forms
 . **<<html-template-integration>>** - Thymeleaf components, validation classes, and UI integration
@@ -69,7 +70,7 @@ This guide is organized into logical parts that build on each other:
 . **<<has-notes>>** - Add notes and comments to any entity with automatic UI integration
 
 === PART III: BUSINESS LOGIC
-[start=28]
+[start=29]
 . **<<entity-actions>>** - Custom business actions as buttons: approve, close, register payment
 . **<<exception-entity>>** - Exception logging and error tracking with persistent storage
 . **<<entity-checkers-setup-usage>>** - Event-driven business rules and automation
@@ -81,14 +82,14 @@ This guide is organized into logical parts that build on each other:
 . **<<docusign-integration>>** - Document signing integration with DocuSign
 
 === PART IV: FINANCIAL OPERATIONS
-[start=37]
+[start=38]
 . **<<credit-management-system>>** - Complete credit lifecycle management
 . **<<credit-operations-framework>>** - Credit operations: charges, payments, accruals, past due processing
 . **<<credit-accruals-tab-integration>>** - Integrate Credit Accruals Tab for viewing accrual history
 . **<<payment-transactions-framework>>** - Real-world payment processing with gateway integration
 
 === PART V: MONITORING
-[start=40]
+[start=41]
 . **<<user-action-audit>>** - Track and audit all user actions in the back-office application
 
 TIP: New to timveroOS? Start with Part I and follow sequentially. Experienced developers can jump to specific parts based on their immediate needs.
@@ -99,6 +100,8 @@ include::_platform-overview.adoc[leveloffset=+1]
 include::_getting-started.adoc[leveloffset=+1]
 
 include::_application-setup.adoc[leveloffset=+1]
+
+include::_password-management.adoc[leveloffset=+1]
 
 include::_data-model.adoc[leveloffset=+1]
 
