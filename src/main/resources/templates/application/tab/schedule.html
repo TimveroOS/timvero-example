@@ -1,27 +1,30 @@
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml"
       xmlns:th="http://www.thymeleaf.org">
-<table class="table">
-    <thead>
-    <tr>
-        <th th:text="#{schedule.date}"></th>
-        <th th:text="#{schedule.interest}"></th>
-        <th th:text="#{schedule.principal}"></th>
-        <th th:text="#{schedule.amount}"></th>
-        <th th:text="#{schedule.remainingPrincipal}"></th>
-    </tr>
-    </thead>
-    <tbody>
-    <tr
-        th:each="payment,iterStat : ${schedule.payments.values()}"
-        th:object="${payment}"
-    >
-        <td th:text="*{#ldates.format(date)}"></td>
-        <td th:text="*{#monetary.format(interest)}"></td>
-        <td th:text="*{#monetary.format(principal)}"></td>
-        <td th:text="*{#monetary.format(amount)}"></td>
-        <td th:text="*{#monetary.format(remainingPrincipal)}"></td>
-    </tr>
-    </tbody>
-</table>
+<div class="table-resize-container">
+    <table class="table table-resize sorting-table" id="preliminary-schedule">
+        <thead>
+        <tr>
+            <th data-sort-by="date" th:text="#{schedule.date}"></th>
+            <th data-sort-by="number" th:text="#{schedule.interest}"></th>
+            <th data-sort-by="number" th:text="#{schedule.principal}"></th>
+            <th data-sort-by="number" th:text="#{schedule.amount}"></th>
+            <th data-sort-by="number" th:text="#{schedule.remainingPrincipal}"></th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr
+            th:each="payment,iterStat : ${schedule.payments.values()}"
+            th:object="${payment}"
+            role="row"
+        >
+            <td th:text="*{#ldates.format(date)}"></td>
+            <td th:data-cell-value="*{interest.number.doubleValue}" th:text="*{#monetary.format(interest)}"></td>
+            <td th:data-cell-value="*{principal.number.doubleValue}" th:text="*{#monetary.format(principal)}"></td>
+            <td th:data-cell-value="*{amount.number.doubleValue}" th:text="*{#monetary.format(amount)}"></td>
+            <td th:data-cell-value="*{remainingPrincipal.number.doubleValue}" th:text="*{#monetary.format(remainingPrincipal)}"></td>
+        </tr>
+        </tbody>
+    </table>
+</div>
 </html>
