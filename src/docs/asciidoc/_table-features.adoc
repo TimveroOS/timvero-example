@@ -1,0 +1,112 @@
+[[table-features]]
+= Table Features
+
+The platform provides a set of client-side table enhancements: resizable columns, sorting, per-column search, and column pinning.
+All features are activated by CSS classes and `data-*` attributes on standard HTML tables. State (column widths, pin order) is persisted to `localStorage`.
+
+== Resizable Columns
+
+Add the `table-resize` class to the table and wrap it in a `table-resize-container` inside a `tab-pane`.
+The table must have a unique `id` — the combination `{tabPaneId}/{tableId}` is used as the storage key.
+
+[source,html]
+----
+<div class="tab-pane" id="executionsTab">
+    <div class="table-resize-container">
+        <table class="table table-resize" id="sortableTable">
+            <thead>
+                <tr role="row">
+                    <th>ID</th>
+                    <th>Start Date</th>
+                    <th>Campaign Name</th>
+                </tr>
+            </thead>
+            <tbody>
+                <!-- rows -->
+            </tbody>
+        </table>
+    </div>
+</div>
+----
+
+* Drag the right edge of a column header to resize it. Minimum width is 120 px.
+* The overall table width adjusts automatically.
+* Column headers are enhanced with a resize handle, pin icon, and search icon.
+
+== Sorting
+
+Add the `sorting-table` class to the table and a `data-sort-by` attribute to each sortable `<th>`.
+
+Supported sort types:
+
+[cols="1,3"]
+|===
+|Type |Description
+
+|`number`
+|Numeric comparison. Whitespace is stripped, commas are treated as decimal separators.
+
+|`string`
+|Alphabetical comparison via `localeCompare()`.
+
+|`date`
+|Chronological comparison via Moment.js. Use ISO 8601 format in `data-cell-value`.
+|===
+
+Columns without `data-sort-by` are not sortable.
+Clicking a column header cycles: unsorted -> ascending -> descending -> unsorted. Only one column can be sorted at a time.
+
+Use `data-cell-value` on `<td>` when the display value differs from the sort value (formatted dates, numbers with currency symbols, cells containing links).
+
+[source,html]
+----
+<table class="table table-resize sorting-table" id="myTable">
+    <thead>
+        <tr role="row">
+            <th data-sort-by="number">ID</th>
+            <th data-sort-by="string">Name</th>
+            <th data-sort-by="date">Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td data-cell-value="1">1</td>
+            <td data-cell-value="Widget A">Widget A</td>
+            <td data-cell-value="2024-01-15T10:30:00">Jan 15, 2024</td>
+            <td><button>Edit</button></td>
+        </tr>
+    </tbody>
+</table>
+----
+
+== Column Search
+
+Search is initialized automatically as part of the `table-resize` setup — no extra configuration is required.
+
+* A search icon appears in every column header.
+* Clicking it opens a search box above the table labeled "Search by: _Column Name_".
+* The search is case-insensitive, uses substring matching against the cell's visible text.
+* Only one column can be searched at a time. The "Reset" button clears the filter.
+* Searchable rows must have `role="row"` on `<tr>`.
+
+== Column Pinning
+
+Pinning is initialized automatically as part of the `table-resize` setup — no extra configuration is required.
+
+* A pin icon appears in every column header.
+* Clicking it pins the column to the left — it becomes sticky during horizontal scrolling.
+* Clicking again unpins it and returns it to its original position.
+* Multiple columns can be pinned; they stack left-to-right in the order they were pinned.
+* Pin state and column order are saved to `localStorage` and restored on page reload.
+
+== Initialization
+
+All table modules initialize automatically on page load and on AJAX content load (`rui-ajax-loaded` event).
+
+Manual call:
+[source,javascript]
+----
+window.RootUI.initResizeColumnAdjustTableWidth();
+window.RootUI.initSortingTable();
+----
