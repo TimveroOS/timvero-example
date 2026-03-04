@@ -54,7 +54,7 @@ Supported sort types:
 |===
 
 Columns without `data-sort-by` are not sortable.
-Clicking a column header cycles: unsorted -> ascending -> descending -> unsorted. Only one column can be sorted at a time.
+Clicking a sort icon cycles: unsorted -> ascending -> descending -> unsorted. Only one column can be sorted at a time.
 
 Use `data-cell-value` on `<td>` when the display value differs from the sort value (formatted dates, numbers with currency symbols, cells containing links).
 
