@@ -1162,6 +1162,7 @@
 
 <!-- Additional initialization fallback -->
 <script>
+(function () {
   // Extra fallback for frameworks that might delay rendering
   if (typeof window.initCreditDataTooltips === 'function') {
     // Try multiple times to ensure initialization
@@ -1170,6 +1171,7 @@
     setTimeout(window.initCreditDataTooltips, 1000);
     setTimeout(window.initCreditDataTooltips, 2000);
   }
+})();
 </script>
 </body>
 </html>
