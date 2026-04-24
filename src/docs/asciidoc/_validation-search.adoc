@@ -1,0 +1,503 @@
+[[validation-search]]
+= Validation Entity Search — picker / autocomplete backend
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The validation search module (`com.timvero.ground.service.validation`) is the SDK layer that powers **entity pickers** — dropdowns and autocompletes where the user types a few characters and the UI shows matching entities. Given a class and a query string, it returns `Map<id, displayName>` ready for rendering. Form fields that reference another entity use this under the hood.
+
+WARNING: **The name "validation" is misleading.** This module is not Bean Validation (`jakarta.validation`) and not the SDK's `ValidationException` framework (that lives in `com.timvero.base.form`). It's called "validation" because it validates that a dropdown-selected id corresponds to a real entity — "does this entity id exist, and if so what's its name?" — as opposed to arbitrary search. Keep the naming confusion in mind when reading the code.
+
+== What You Need to Know
+
+Three cooperating pieces:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |Role |Key types
+
+|**Orchestrator**
+|Single `@Service` front — auto-resolves which engine to use per entity class, caches resolutions
+|`ValidationEntitySearchService`
+
+|**Engines** (strategy pattern)
+|Three ready-made implementations picking between id-lookup, JPA-criteria search, and FastSearch-backed full-text search
+|`EntityByIdSearchEngine`, `EntityByFieldsSearchEngine`, `FastSearchEntitySearchEngine`
+
+|**Abstractions**
+|Interface and base class application code extends for custom engines
+|`ValidationEntitySearchEngine`, `AbstractEntitySearchEngine`
+|===
+
+Key characteristics:
+
+- **Auto-resolution** — `ValidationEntitySearchService` picks the right engine per entity class without configuration, falling back through a priority chain (see below)
+- **Cached per class** — first call looks up the engine; subsequent calls for the same entity reuse the cached instance
+- **Id-aware lookup** — every engine includes "does the query string parse as an id for this entity?" in its results. A user typing `"7f2a..."` gets a direct hit even without `@FullTextField` indexing
+- **Generic-driven** — the service uses `ResolvableType` introspection to match `ValidationEntitySearchEngine<E>` beans to entity classes
+- **No explicit wiring required** — FastSearch-indexed entities get autocomplete for free
+
+== Architecture Overview — Auto-Resolution
+
+When application code calls `validationEntitySearchService.search(Client.class, "john")`, the service resolves the engine in this order:
+
+[source]
+----
+search(Client.class, "john")
+       │
+       ▼
+   engines.computeIfAbsent(Client.class, findEngine)
+       │
+       ▼
+  findEngine(Client.class) {
+       │
+       │ 1. Explicit bean:
+       │    context.getBeanProvider(
+       │        ResolvableType.forClassWithGenerics(
+       │            ValidationEntitySearchEngine.class, Client.class))
+       │    .getIfAvailable();
+       │
+       │    ┌─── found → return the explicit engine
+       │    │        (custom EntityByFieldsSearchEngine<UUID, Client> you wrote)
+       │    ▼
+       │ 2. FastSearch support:
+       │    if (fastSearchService != null
+       │        && fastSearchService.supports(Client.class)) {
+       │        return new FastSearchEntitySearchEngine<>(fastSearchService, Client.class);
+       │    }
+       │
+       │    ┌─── found → full-text search via Hibernate Search
+       │    │
+       │    ▼
+       │ 3. Fallback:
+       │        return new EntityByIdSearchEngine<>(Client.class);
+       │    └─── id-only lookup; search string must parse as UUID / Long / etc.
+   }
+----
+
+This is the **ladder of specificity**:
+
+[cols="1,3,3", options="header"]
+|===
+|Priority |Trigger |What it provides
+
+|1. Explicit bean
+|You registered a `ValidationEntitySearchEngine<Client>` bean
+|Full control — custom JPA criteria, custom display names, custom limits
+
+|2. FastSearch-backed
+|`Client` has an `@Indexed` annotation + registered `SearchEntity` bean
+|Free full-text search, uses the Hibernate Search index, respects all indexed fields
+
+|3. Id-only fallback
+|Nothing else applies
+|User must know the id to find an entity; typing a name gets zero results
+|===
+
+== ValidationEntitySearchService — Public API
+
+[cols="2,3", options="header"]
+|===
+|Method |Behavior
+
+|`search(Class<E>, String query)` → `Map<?, String>`
+|Ordered map of `id → displayName`. `LinkedHashMap` preserves insertion order: id-match first, then search-result order.
+
+|`search(Class<E>, String query, BiFunction<E, String, String> displayFunction)` → `Map<?, String>`
+|Same but lets you transform the display name per entity. Receives the entity and the "standard" name; return whatever string the UI should render.
+
+|`loadEntity(Class<E>, Object id)` → `Optional<E>`
+|Reverse lookup — resolve a picker selection back to the full entity. Typically called when processing a form submission carrying an id.
+|===
+
+=== Typical Usage
+
+From a controller backing an autocomplete:
+
+[source,java]
+----
+@GetMapping("/api/pickers/clients")
+@ResponseBody
+public Map<?, String> clientPicker(@RequestParam String q) {
+    return validationSearchService.search(Client.class, q);
+}
+----
+
+The returned map serializes to JSON as:
+
+[source,json]
+----
+{
+  "7f2a-...": "John Smith",
+  "a3b4-...": "John Doe",
+  "c5d6-...": "Johnny Appleseed"
+}
+----
+
+The UI renders it as dropdown options; the selected id is submitted in the form.
+
+When processing the submitted form:
+
+[source,java]
+----
+@PostMapping("/application")
+public void create(@RequestBody ApplicationForm form) {
+    Client client = validationSearchService.loadEntity(Client.class, form.getClientId())
+        .orElseThrow(() -> new NotFoundException("Client " + form.getClientId()));
+    // ...
+}
+----
+
+=== Custom Display Names
+
+The 3-arg `search(...)` overload gives per-entity control over labels:
+
+[source,java]
+----
+Map<?, String> result = validationSearchService.search(
+    Client.class,
+    query,
+    (client, defaultName) -> {
+        String email = client.getContactInfo().getEmail();
+        return email != null ? defaultName + " — " + email : defaultName;
+    });
+----
+
+The `defaultName` comes from `NamedEntity.getDisplayedName()` (for entities implementing `NamedEntity`) or `entity.toString()` otherwise. Use the defaultName as a base and decorate with additional context.
+
+== Engine 1: EntityByIdSearchEngine — Default Fallback
+
+[source,java]
+----
+public class EntityByIdSearchEngine<E extends Persistable<?>> extends AbstractEntitySearchEngine<E> {
+
+    public EntityByIdSearchEngine(Class<E> entityClass) {
+        setEntityClass(entityClass);
+    }
+
+    @Override
+    protected Stream<E> search(EntityManager entityManager, String search) {
+        return Stream.empty();                    // <1>
+    }
+}
+----
+<1> Zero custom search. Entire behavior comes from the parent class's id-parse logic.
+
+The parent `AbstractEntitySearchEngine.getData()` attempts `loadEntity(entityManager, query)` — if the query string parses as a valid id, the corresponding entity is loaded and returned. Otherwise the result is empty.
+
+**Use when**: the entity isn't indexed in FastSearch and you don't want to write a custom search. Acceptable for entities users rarely pick by name (system-level references, internal IDs).
+
+**Don't rely on it for user-facing forms** — typing "john" will always return nothing because "john" isn't a UUID. Users will think the picker is broken.
+
+== Engine 2: EntityByFieldsSearchEngine — Custom JPA Criteria
+
+The workhorse for entities that need searchable fields but aren't in FastSearch.
+
+[source,java]
+----
+public abstract class EntityByFieldsSearchEngine<ID, E extends Persistable<ID>>
+        extends AbstractEntitySearchEngine<E> {
+
+    @Override
+    public Stream<E> search(EntityManager entityManager, String search) {
+        /* Builds a JPA Criteria query:
+           WHERE (fieldPredicates...)
+              OR (id-matches-parsed-value)
+              AND (test predicate if defined)
+           ORDER BY created_at ASC          (for BaseEntity subclasses)
+           LIMIT 20                          (default; override via getLimit())
+        */
+    }
+
+    protected List<Predicate> getPredicates(String search, Root<E> root,
+                                             CriteriaQuery<E> query,
+                                             CriteriaBuilder builder) {
+        return new ArrayList<>();         // <1>
+    }
+
+    protected Predicate getTestPredicate(Root<E> root, CriteriaQuery<?> query,
+                                          CriteriaBuilder builder) {
+        return null;                      // <2>
+    }
+
+    protected int getLimit() { return 20; }
+}
+----
+<1> Override — return predicates for matching the search string against entity fields. OR-joined together with the id-match predicate.
+<2> Override — return a constraining predicate AND-joined with the whole OR. Use for scoping (soft-delete filter, tenant filter, status filter).
+
+=== Implementation Example
+
+[source,java]
+----
+@Component
+public class ClientSearchEngine extends EntityByFieldsSearchEngine<UUID, Client> {
+
+    @Override
+    protected List<Predicate> getPredicates(String search, Root<Client> root,
+                                             CriteriaQuery<Client> query,
+                                             CriteriaBuilder cb) {
+        String like = "%" + search.toLowerCase() + "%";
+        return List.of(
+            cb.like(cb.lower(root.get(Client_.INDIVIDUAL_INFO)
+                                 .get(IndividualInfo_.FULL_NAME)), like),
+            cb.like(cb.lower(root.get(Client_.CONTACT_INFO)
+                                 .get(ContactInfo_.EMAIL)), like),
+            cb.equal(root.get(Client_.INDIVIDUAL_INFO)
+                         .get(IndividualInfo_.NATIONAL_ID), search.trim())
+        );
+    }
+
+    @Override
+    protected Predicate getTestPredicate(Root<Client> root, CriteriaQuery<?> query,
+                                          CriteriaBuilder cb) {
+        // Only return clients of active tenants
+        return cb.isTrue(root.get(Client_.ACTIVE));
+    }
+
+    @Override
+    protected int getLimit() { return 30; }
+}
+----
+
+The service auto-discovers this bean because its generic type matches — no further registration needed.
+
+=== Key Behavior: Combined Predicate
+
+The final `WHERE` clause is:
+
+[source]
+----
+WHERE (field_predicate_1 OR field_predicate_2 OR ... OR id_match)
+  AND (test_predicate_if_present)
+----
+
+- **Field predicates** and id-match form a single OR (any of them matches)
+- **Test predicate** AND-joined to the whole OR (scopes the result set)
+
+If the user types a UUID: the id-match branch fires AND the field predicates run too — both paths contribute. Merge by id in `AbstractEntitySearchEngine.getData()` deduplicates them.
+
+=== Ordering and Limit
+
+- If `E extends BaseEntity<?>`, results sort by `created_at ASC` (oldest first). Otherwise, no explicit order.
+- Default limit: 20. Override `getLimit()` for heavier pickers.
+
+== Engine 3: FastSearchEntitySearchEngine — Auto-Resolved
+
+When an entity has both `@Indexed` and a registered `SearchEntity` bean, `ValidationEntitySearchService` wraps `FastSearchService` for you:
+
+[source,java]
+----
+public class FastSearchEntitySearchEngine<E extends Persistable<?>> extends AbstractEntitySearchEngine<E> {
+
+    public FastSearchEntitySearchEngine(FastSearchService searchService, Class<E> entityClass) {
+        setEntityClass(entityClass);
+        this.searchService = searchService;
+        this.nameProvider = searchService.nameProvider(entityClass);    // <1>
+    }
+
+    @Override
+    protected String getName(E entity) {
+        return nameProvider.apply(entity);                               // <2>
+    }
+
+    @Override
+    protected Stream<E> search(EntityManager em, String search) {
+        return searchService.searchEntity(getEntityClass(), search, getLimit()).stream();
+    }
+
+    protected int getLimit() { return 20; }
+}
+----
+<1> Reuses the `nameProvider` you already declared in `SearchEntity.builder(...)` — one source of truth for "how to display this entity"
+<2> Overrides the default (which uses `NamedEntity.getDisplayedName`) to honor the search-entity-specific provider
+
+**Zero configuration.** Add `@Indexed` + `SearchEntity` bean → picker works. See <<fast-search-system>> for the full FastSearch setup.
+
+**Cannot override** — if you need custom `getTestPredicate` or extra field search on top of FastSearch, you have to write a custom engine (see below).
+
+== Writing a Custom Engine
+
+Most custom needs map onto `EntityByFieldsSearchEngine`. For unusual backing stores (Elasticsearch directly, SolrJ, an external REST API), implement `ValidationEntitySearchEngine<E>` from scratch:
+
+[source,java]
+----
+@Component
+public class CrmClientSearchEngine implements ValidationEntitySearchEngine<Client> {
+
+    @Autowired private CrmApiClient crmClient;
+    @Autowired private ClientRepository clientRepository;
+
+    @Override
+    public Map<Object, String> getData(EntityManager em, String search,
+                                        BiFunction<Client, String, String> displayFunction) {
+        return crmClient.search(search).stream()
+            .map(result -> clientRepository.findById(result.localId()).orElse(null))
+            .filter(Objects::nonNull)
+            .collect(Collectors.toMap(
+                Client::getId,
+                c -> displayFunction.apply(c, c.getDisplayedName()),
+                (e1, e2) -> e1,
+                LinkedHashMap::new
+            ));
+    }
+
+    @Override
+    public Optional<Client> loadEntity(EntityManager em, Object id) {
+        if (id instanceof UUID uuid) {
+            return Optional.ofNullable(em.find(Client.class, uuid));
+        }
+        return Optional.empty();
+    }
+}
+----
+
+The service auto-discovers via generic-type match. If you want `EntityByIdSearchEngine`-like fallback behavior (id-parse), extend `AbstractEntitySearchEngine` instead — it provides `parseId(Object)` with UUID / `TypeConverter` support.
+
+=== Overriding Display Name Logic
+
+In `AbstractEntitySearchEngine`, override `getName(E entity)` to produce the base name seen by `displayFunction`:
+
+[source,java]
+----
+@Override
+protected String getName(Client entity) {
+    IndividualInfo info = entity.getIndividualInfo();
+    return info.getFullName() + " (" + info.getNationalId() + ")";
+}
+----
+
+Default implementation returns `getDisplayedName()` for `NamedEntity` or `toString()` otherwise.
+
+=== Id Parsing
+
+`AbstractEntitySearchEngine.parseId(Object)`:
+
+- **UUID-typed id**: tries `UUID.fromString(str)` — returns `Optional.empty()` on `IllegalArgumentException` rather than throwing
+- **Other types**: delegates to Spring's `SimpleTypeConverter` — handles `Long`, `Integer`, `String`, `Enum`, etc.
+
+You rarely need to override this. The resolution is generic-driven — `ResolvableType.forClass(Persistable.class, entityClass).getGeneric(0)` determines the id type at class setup.
+
+== Advanced Patterns
+
+=== Scoping Results By Current User
+
+When the picker should only show entities the current user is authorized to see, override `getTestPredicate`:
+
+[source,java]
+----
+@Component
+public class MyClientSearchEngine extends EntityByFieldsSearchEngine<UUID, Client> {
+
+    @Autowired private SecurityContextHolder securityContext;
+
+    @Override
+    protected Predicate getTestPredicate(Root<Client> root, CriteriaQuery<?> query,
+                                          CriteriaBuilder cb) {
+        UserAccount user = currentUser();
+        if (user.getRole().isAdmin()) {
+            return null;    // no scoping
+        }
+        return cb.equal(root.get(Client_.ASSIGNED_USER), user);
+    }
+}
+----
+
+The predicate participates in the final query — admin users see everything, regular users see only assigned clients.
+
+=== Pre-Populated Dropdowns
+
+For small fixed lists where the "search" is just "give me everything", use `ValidationEntitySearchService.search(class, "")` — all engines handle empty queries gracefully:
+
+- `EntityByFieldsSearchEngine.search` returns empty stream for empty query
+- `FastSearchEntitySearchEngine` similarly returns empty
+- `EntityByIdSearchEngine` loads by empty id (nothing)
+
+For genuine "all entities" dropdowns (e.g., country list), write a custom engine:
+
+[source,java]
+----
+@Component
+public class CountrySearchEngine extends AbstractEntitySearchEngine<Country> {
+
+    public CountrySearchEngine() { setEntityClass(Country.class); }
+
+    @Override
+    protected Stream<Country> search(EntityManager em, String search) {
+        String pattern = "%" + search.toLowerCase() + "%";
+        return em.createQuery("SELECT c FROM Country c " +
+                              "WHERE lower(c.name) LIKE :p OR :p = '%%'", Country.class)
+            .setParameter("p", pattern)
+            .getResultStream();
+    }
+}
+----
+
+Empty query → pattern is `%%` → matches everything. Cheap for tables up to a few thousand rows.
+
+=== Caching Engine Instances
+
+`ValidationEntitySearchService` caches resolved engines per entity class in a `ConcurrentHashMap`. No action needed — the cache is unbounded but bounded by the number of entity classes, which is small.
+
+If you add a new `EntityByFieldsSearchEngine` bean after application startup (unusual — would require dynamic Spring refresh), the cache needs invalidation. The SDK doesn't currently expose a clear-cache method; restart the application.
+
+=== Loading Multiple Entities at Once
+
+`ValidationEntitySearchService.loadEntity` returns a single `Optional<E>`. For picker fields carrying multiple ids:
+
+[source,java]
+----
+List<UUID> selectedIds = List.of(uuid1, uuid2, uuid3);
+List<Client> clients = selectedIds.stream()
+    .map(id -> validationSearchService.loadEntity(Client.class, id))
+    .flatMap(Optional::stream)
+    .toList();
+----
+
+Each call is a separate `entityManager.find` — fine for small lists (up to ~50). For larger multi-selects, use a dedicated repository method with `WHERE id IN (...)`.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `ValidationEntitySearchService` for all entity pickers** — consistency across the app, plus free features as the SDK evolves
+* {ok} **Add a `SearchEntity` bean** for any entity that appears in pickers — the fast-search-backed engine works without writing criteria
+* {ok} **Write a custom `EntityByFieldsSearchEngine`** when you need scoping via `getTestPredicate` — FastSearch doesn't support it
+* {ok} **Include id-match via the parent class's default** — don't rewrite it in your own `getPredicates`; the id branch is added automatically
+* {ok} **Use the 3-arg `search(...)` overload to decorate display names** — cleaner than returning custom DTOs from dedicated endpoints
+* {ok} **Set `getLimit()` to match UI affordance** — typeahead usually shows 5-10; default 20 is for power-user pickers
+* {ok} **Use `NamedEntity` for the entity** — automatic display name via `getDisplayedName()`, no override needed
+* {ok} **Log when the fallback `EntityByIdSearchEngine` is picked** — indicates missing search setup; surface during development, silence in prod
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Naming a Bean Validation class "ValidationEntitySearch..."** — the module name already collides with standard validation vocabulary; don't compound it
+* {bad} **Mutating entity state inside `getPredicates` / `getTestPredicate`** — they run inside a read-only query, any writes are a bug
+* {bad} **Rebuilding `CriteriaBuilder.like` manually for case-insensitive search** — use `cb.like(cb.lower(path), pattern.toLowerCase())`; a missing `cb.lower` makes searches case-sensitive silently
+* {bad} **Returning all entities on empty query in field-based engines** — a dropdown with 10 000 items kills the browser; use pagination or prefix-match
+* {bad} **Calling `loadEntity` without `orElseThrow`** — a nullable return surfaces as NPE downstream; always handle the empty case
+* {bad} **Depending on `EntityByIdSearchEngine` for user-facing pickers** — typing a name returns empty, typing an id returns one entity; neither UX works for most users
+* {bad} **Writing a custom engine when a custom `SearchEntity` bean would suffice** — FastSearch covers most cases with one bean; reserve custom engines for security-scoped or non-JPA-backed searches
+* {bad} **Overriding `getName` AND `displayFunction`** at the same call site — display-function wins; getName becomes dead code. Pick one level of customization
+* {bad} **Skipping the `@Component` annotation on your custom engine** — the service uses Spring context lookup; beans without `@Component` aren't discoverable
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every entity appearing in a form picker has either a `SearchEntity` bean (FastSearch) OR a custom `EntityByFieldsSearchEngine`
+* {todo} Fallback `EntityByIdSearchEngine` is only used for entities where users legitimately know the id
+* {todo} Custom engines use `@Component` for auto-discovery
+* {todo} Custom `getTestPredicate` covers soft-delete, multi-tenant, and role-based scoping
+* {todo} Case-insensitive search uses `cb.lower(...)` on both sides
+* {todo} `getLimit()` tuned to UI expectations (typeahead: 5-10; power-user pickers: 20-50)
+* {todo} Empty-query behavior defined (return empty / return all / return recent) — no ambiguous UX
+* {todo} Picker endpoints gated by permissions (user can't pick entities they can't read)
+* {todo} `loadEntity` call sites handle `Optional.empty()` — form submits with stale ids fail gracefully
+* {todo} Integration tests cover: id input returns exact match, text input returns fuzzy matches, empty input behaves as designed
+* {todo} FastSearch indexes populated (see <<fast-search-system>> production checklist) — stale indexes break pickers silently
+* {todo} Monitoring: alert on picker endpoints returning zero results at abnormally high rates — indicates broken search
+
+---
+
+**Related:** <<fast-search-system>>, <<form-classes-setup-and-usage>>, <<list-filters-annotation-driven-jpa-query-dsl>>, <<entity-module-sdk-reference-hierarchy>>
+
+**Next:** <<fast-search-system>>, <<form-classes-setup-and-usage>>

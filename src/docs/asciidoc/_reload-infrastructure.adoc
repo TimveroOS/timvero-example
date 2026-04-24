@@ -1,0 +1,727 @@
+[[reload-infrastructure]]
+= Reload Infrastructure — live UI updates on entity changes
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The reload infrastructure (`com.timvero.ground.entity.event` + `com.timvero.ground.entity.reload`) is the SDK plumbing that lets an open page refresh automatically when an entity shown on it changes — without polling, without the user pressing F5. Two Hibernate `Integrator`s hook into every post-commit event; a transport layer publishes reload notifications; a browser-side component subscribes and triggers DOM updates.
+
+== What You Need to Know
+
+The subsystem has **two independent but collaborating pieces**:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |What it does |Key types
+
+|**Entity change event bus**
+|Publishes an in-process `EntityChangeEvent<E>` via the SDK's `EventService` on every INSERT / UPDATE / DELETE post-commit. Domain code subscribes via `@EventListener`.
+|`EntityChangeEvent<E>`, `EntityChangeListener`, `EntityChangeIntegrator`
+
+|**Reload page mechanism**
+|Tracks which entities were loaded during a page render, then — when any of those entities later change — sends a `ReloadEvent` via a pluggable transport to the browser.
+|`ReloadPageService`, `ReloadPageIntegrator`, `ReloadPageInterceptor`, `ReloadPageHelper`, `ReloadEvent` + transports
+|===
+
+Both pieces share the Hibernate post-commit listener infrastructure but serve different consumers: one is for **server-side domain logic**, the other for **browser-side page refresh**.
+
+Key characteristics:
+
+- **Post-commit only** — events fire after the transaction committed, so side-effect code never sees uncommitted state
+- **Opt-out via `@NotTrackable`** — annotate entities that should not produce reload events (audit log rows, heavy infrastructure entities)
+- **Audit entities auto-excluded** — the listener skips entity names starting with `DataSourceConfig.AUD_PRFIX` (Envers revision tables)
+- **Pluggable transport** — single-node deployments use `SelfReloadEventTransport` (in-JVM); multi-node uses `RedissonReloadEventTransport` (Redis pub/sub)
+
+== Architecture Overview
+
+[source]
+----
+                    User action
+                         │
+                         ▼
+             ┌──────────────────────────┐
+             │   @Transactional write    │
+             │   (entity.save / update)  │
+             └─────────────┬─────────────┘
+                           │ post-commit
+                           ▼
+  ┌──────────────────────────────────────────────────────┐
+  │  Hibernate event infrastructure                       │
+  │                                                       │
+  │  POST_COMMIT_INSERT / UPDATE / DELETE dispatched to:  │
+  │                                                       │
+  │   ┌──────────────────────────┐                        │
+  │   │  EntityChangeListener    │──▶ EventService.fire  │
+  │   │  (domain-level bus)      │    → @EventListener   │
+  │   └──────────────────────────┘    subscribers        │
+  │                                                       │
+  │   ┌──────────────────────────┐                        │
+  │   │  ReloadPageService       │──▶ ReloadEventTransport│
+  │   │  (page tracker)          │    └─ SelfTransport    │
+  │   │                          │    └─ RedissonTransport│
+  │   └──────────────────────────┘                        │
+  └──────────────────────────────┬────────────────────────┘
+                                 │ EntityReloadEvent
+                                 ▼
+                  ┌──────────────────────────┐
+                  │  ReloadPageService       │
+                  │  .changeConsumers        │  (per-node subscribers,
+                  │                          │   e.g., SSE publisher)
+                  └────────────┬─────────────┘
+                               │ "EntityName:id" key
+                               ▼
+                  ┌──────────────────────────┐
+                  │  Browser page that had   │
+                  │  loaded this entity      │
+                  │  triggers fragment       │
+                  │  reload                  │
+                  └──────────────────────────┘
+----
+
+== Entity Change Event Bus
+
+=== EntityChangeEvent<E>
+
+[source,java]
+----
+public class EntityChangeEvent<E> extends EntityEvent {
+
+    public enum Operation { INSERT, UPDATE, DELETE }
+
+    private final Operation operation;
+    private final Object id;
+    private final E entity;
+    private final Class<?> entityClass;
+    private final transient AbstractEvent nativeEvent;              // <1>
+
+    public boolean isPropertyUpdated(String propertyName) {         // <2>
+        /* for UPDATE: consults Hibernate's dirty properties;
+           for INSERT/DELETE: returns true */
+    }
+}
+----
+<1> The raw Hibernate event (not serialized — `transient`). Used by `isPropertyUpdated` to read dirty-flags on the persister. Don't rely on it from remote subscribers.
+<2> **The most useful method for domain listeners** — ask "did field X change?" without manually diffing old and new state. Returns `true` for INSERT/DELETE (all properties are "new"), checks the dirty-properties bitmap for UPDATE.
+
+=== Subscribing to EntityChangeEvent
+
+Use Spring's standard `@EventListener` with the generic event type:
+
+[source,java]
+----
+@Component
+public class ParticipantStatusLogger {
+
+    @EventListener
+    public void onParticipantChange(EntityChangeEvent<Participant> event) {    // <1>
+        if (event.getOperation() == Operation.UPDATE
+                && event.isPropertyUpdated("status")) {                         // <2>
+            log.info("Participant {} status changed", event.getId());
+        }
+    }
+}
+----
+<1> Spring resolves the generic type via `ResolvableType` — only fires for `EntityChangeEvent<Participant>`, not other entity types. This is possible because `EntityChangeListener.fireEvent` calls `eventService.fire(event, ResolvableType.forClassWithGenerics(EntityChangeEvent.class, mappedClass))`.
+<2> Domain-specific filtering — act only on `status` field changes, ignore anything else.
+
+[NOTE]
+====
+**Map and AuditorAction are silently skipped** — `EntityChangeListener` returns early if the entity is a `Map` (Hibernate dynamic model) or an `AuditorAction` (audit infrastructure row). Keeps the bus free of framework chatter.
+====
+
+=== EntityChangeListener & Integrator
+
+`EntityChangeListener` implements three Hibernate post-commit listener interfaces. `EntityChangeIntegrator` registers the listener via the Hibernate `Integrator` SPI:
+
+[source,java]
+----
+@Component
+public class EntityChangeIntegrator implements Integrator {
+
+    @Autowired private EntityChangeListener entityChangeListener;
+
+    @Override
+    public void integrate(Metadata metadata, BootstrapContext ctx,
+                          SessionFactoryImplementor sessionFactory) {
+        EventListenerRegistry registry = sessionFactory.getServiceRegistry()
+            .getService(EventListenerRegistry.class);
+        registry.appendListeners(EventType.POST_COMMIT_INSERT, entityChangeListener);
+        registry.appendListeners(EventType.POST_COMMIT_UPDATE, entityChangeListener);
+        registry.appendListeners(EventType.POST_COMMIT_DELETE, entityChangeListener);
+    }
+}
+----
+
+Wired automatically when the `com.timvero.ground.entity.event` package is on the classpath and `@ComponentScan` reaches it. No application-level configuration needed.
+
+== EventService — The SDK Event Bus
+
+Underneath `EntityChangeListener.fireEvent(...)` sits `com.timvero.ground.event.EventService` — the SDK's application-level event bus used by many SDK subsystems (entity change, counters via `EntityCounterService`, notifications, scoring). Understanding it is useful for anyone publishing or subscribing to domain events.
+
+=== Why Not Spring's ApplicationEventPublisher?
+
+`EventService` exists alongside Spring's `ApplicationEventPublisher` / `@EventListener` with two distinct properties:
+
+[cols="1,3", options="header"]
+|===
+|Property |What EventService adds
+
+|**After-commit firing by default**
+|`EventService.fire(event)` wraps dispatch in `TransactionUtils.afterTransaction(...)` — listeners always see committed state. With Spring's bus, you opt in via `@TransactionalEventListener` per-listener.
+
+|**Generic-aware dispatch**
+|A listener declaring `EntityEventListener<EntityChangeEvent<Participant>>` only receives events fired with that specific `ResolvableType` — not every `EntityChangeEvent<T>`. Spring's `@EventListener` also supports this but requires careful generic declaration; `EventService` uses `ResolvableType` introspection uniformly.
+
+|**Per-listener timing warnings**
+|Configurable `entity.event.execution.warn.limit` property — logs a WARN when a listener takes longer than the threshold. Handy for catching runaway handlers without adding custom instrumentation.
+
+|**Exception isolation**
+|Listener exceptions are caught, logged, and the next listener still runs. Spring also does this by default, but `EventService` explicitly chooses continue-on-error so one bad subscriber can't silently suppress others.
+|===
+
+Spring's bus is still the right choice for most cross-cutting application events — `EventService` is best used when you're already consuming SDK events (`EntityChangeEvent`, scoring finish, counters) and want consistency.
+
+=== EntityEvent — The Marker
+
+[source,java]
+----
+public abstract class EntityEvent {
+    // empty marker — just scopes what EventService can dispatch
+}
+----
+
+Every payload published through `EventService` must extend `EntityEvent`. SDK examples: `EntityChangeEvent<E>`, `FinishedScoringEvent<E>`, `CreditCalculationDateChangeEvent`, `CounterReloadEvent` (indirectly via transport). For your own events, just subclass and add fields.
+
+=== EntityEventListener<E> — Subscriber Contract
+
+[source,java]
+----
+public interface EntityEventListener<E extends EntityEvent> {
+
+    default ResolvableType getEventType() {                              // <1>
+        return ResolvableType.forClass(EntityEventListener.class, this.getClass())
+            .getGeneric(0);
+    }
+
+    void handle(E event);                                                // <2>
+}
+----
+<1> Default implementation uses `ResolvableType` to extract the generic parameter from the concrete listener class. This is how `EntityEventListener<EntityChangeEvent<Participant>>` registers itself specifically for `EntityChangeEvent` parameterized by `Participant`.
+<2> Business logic. Runs on the committing thread (after commit) — any work here blocks further commits on that connection. For heavy work, dispatch to `@Async` or a queue.
+
+Real listener from `timvero-example` — reacts to a scoring flow completion:
+
+[source,java]
+----
+include::{sourcedir}/process/FinishedScoringListener.java[lines=16..32]
+----
+
+Two points to note:
+
+- **`@Transactional(propagation = REQUIRES_NEW)`** — starts its own transaction, independent of the committing one. Critical when the listener modifies state: without `REQUIRES_NEW` it would try to enlist into the (already committed) parent transaction and fail.
+- **`getSync(participantId)`** — pessimistic lock the entity before touching it (see <<entity-module-sdk-reference-hierarchy>>).
+
+=== EventService API
+
+[source,java]
+----
+@Service
+public class EventService {
+
+    public void addListener(EntityEventListener<? extends EntityEvent> listener);    // <1>
+
+    public void fire(EntityEvent event);                                             // <2>
+
+    public void fire(EntityEvent event, ResolvableType eventType);                   // <3>
+}
+----
+<1> Manually register a listener. Rarely needed — `AutowiredListenerRegistrar` auto-registers every `EntityEventListener` bean at startup (see below). Use for dynamically constructed listeners only.
+<2> Fire an event. Dispatches to every listener registered for `event.getClass()`. Listeners run **after the current transaction commits** — `TransactionUtils.afterTransaction(...)` is invoked internally.
+<3> Fire with explicit `ResolvableType` — used when the event class alone is ambiguous due to generics. Example: `EntityChangeListener` fires via `ResolvableType.forClassWithGenerics(EntityChangeEvent.class, mappedClass)` so only listeners for the right entity type receive it.
+
+=== AutowiredListenerRegistrar — Auto-Registration
+
+[source,java]
+----
+@Component
+public class AutowiredListenerRegistrar {
+
+    @Autowired private EventService eventService;
+
+    @Autowired(required = false)
+    public void addListeners(Collection<EntityEventListener<? extends EntityEvent>> listeners) {
+        listeners.forEach(eventService::addListener);
+    }
+}
+----
+
+Every Spring bean implementing `EntityEventListener<E>` is registered automatically at startup. No manual wiring. Implication: just annotate your listener with `@Component` and it starts receiving events — no `@EventListener` on `handle`, no registration call.
+
+=== Configuration
+
+[source,properties]
+----
+# Log WARN when a listener takes longer than this (milliseconds). 0 disables.
+entity.event.execution.warn.limit=500
+----
+
+Without a configured value, `@Value` fails to inject and the bean can't start. Set a reasonable threshold during startup (500ms is a good default for most listeners; business-heavy listeners doing DB work may need 2000-5000).
+
+=== Subscribing Patterns
+
+**Subscribe to SDK-provided event type:**
+
+[source,java]
+----
+@Component
+public class OnCreditDateChange implements EntityEventListener<CreditCalculationDateChangeEvent> {
+    @Override
+    public void handle(CreditCalculationDateChangeEvent event) {
+        /* ... */
+    }
+}
+----
+
+**Subscribe to generic event type (by entity class):**
+
+[source,java]
+----
+@Component
+public class OnParticipantScoringFinish
+        implements EntityEventListener<FinishedScoringEvent<Participant>> {
+    @Override
+    public void handle(FinishedScoringEvent<Participant> event) {
+        /* only fires for Participant-scoped scoring events */
+    }
+}
+----
+
+The generic resolution happens at registration time via `ResolvableType`. A listener for `FinishedScoringEvent<Application>` would **not** receive events fired with `Participant` type.
+
+**Publish a custom event:**
+
+[source,java]
+----
+public class LoanIssuedEvent extends EntityEvent {
+    private final UUID creditId;
+    /* ... */
+}
+
+@Service
+public class CreditIssuance {
+    @Autowired private EventService eventService;
+
+    @Transactional
+    public void issue(ExampleCredit credit) {
+        creditRepository.save(credit);
+        eventService.fire(new LoanIssuedEvent(credit.getId()));
+        // fires AFTER the transaction commits; listeners see saved state
+    }
+}
+----
+
+=== Gotchas
+
+- **`fire()` outside a transaction silently skips** — `TransactionUtils.afterTransaction` has no transaction to wait for; the event is dropped. If you need immediate dispatch outside a transaction, you have to call `EventService.addListener`-registered listeners directly (atypical).
+- **Listener exceptions don't propagate** — `EventService` catches and logs. If you need transactional rollback based on listener result, use Spring's `@TransactionalEventListener(phase = BEFORE_COMMIT)` instead — wrong tool for the job here.
+- **Long listeners block the commit pipeline** — they run synchronously on the committing thread. Always `@Async` or queue heavy work.
+
+== Reload Page Mechanism
+
+=== Per-Request Entity Tracking
+
+When a page is rendered, the interceptor marks the request as "tracking":
+
+[source,java]
+----
+public class ReloadPageInterceptor implements WebRequestInterceptor {
+
+    public static final String CURRENT_PAGE_HEADER = "Current-Page";           // <1>
+
+    @Override
+    public void preHandle(WebRequest request) {
+        if (StringUtils.hasLength(request.getHeader(CURRENT_PAGE_HEADER))) {
+            reloadPageService.setCurrentPage();                                // <2>
+        }
+    }
+
+    @Override
+    public void afterCompletion(WebRequest request, Exception ex) {
+        String page = request.getHeader(CURRENT_PAGE_HEADER);
+        if (StringUtils.hasLength(page)) {
+            reloadPageService.removeCurrentPage(page, principal.getName());    // <3>
+        }
+    }
+}
+----
+<1> The browser sends a `Current-Page` header identifying the page template. Requests without this header aren't tracked.
+<2> Sets a `ThreadLocal<Set<String>>` that collects entity keys as they're loaded.
+<3> On completion, the set is handed to page consumers (typically an SSE publisher) so the frontend knows which entities the page "cares about".
+
+=== ReloadPageService — The Core Tracker
+
+`ReloadPageService` implements multiple Hibernate listener interfaces simultaneously:
+
+[cols="2,3", options="header"]
+|===
+|Listener |Action
+
+|`PostLoadEventListener.onPostLoad`
+|Entity was loaded for the current page → add `"EntityName:id"` key to the thread-local tracking set
+
+|`InitializeCollectionEventListener.onInitializeCollection`
+|Collection was loaded (`@OneToMany`, `@ManyToMany`) → add the `role:ownerId` key (one-to-many only; many-to-many not tracked)
+
+|`PostCommitInsertEventListener.onPostInsert`
+|New entity committed → check if any tracked collections reference it → fire `EntityReloadEvent`
+
+|`PostCommitUpdateEventListener.onPostUpdate`
+|Entity updated → check dirty collection-owning fields + always fire `EntityReloadEvent` for the entity itself
+
+|`PostCommitDeleteEventListener.onPostDelete`
+|Entity deleted → same as update
+|===
+
+The `fire()` method runs **asynchronously** on `supportExecutor` and publishes an `EntityReloadEvent` through the configured transport.
+
+=== @NotTrackable — Opt Out
+
+Annotate an entity class to exclude it from reload tracking:
+
+[source,java]
+----
+@Entity
+@NotTrackable                   // e.g., high-churn infra entity
+public class SomeAuditLog extends AbstractOwnable {
+    /* ... */
+}
+----
+
+`ReloadPageService.isTrackable()` checks the annotation; events for these entities don't fire. Use when:
+
+- The entity is written tens of thousands of times per minute and flooding the event bus would overwhelm subscribers
+- The entity has no UI representation — tracking it wastes CPU
+- Infrastructure entities (audit revision rows, token caches, etc.) — the SDK already marks `AuditRevisionEntity`, `Auditor`, etc.
+
+Envers `_AUD` tables are auto-excluded via the `DataSourceConfig.AUD_PRFIX` check, so you don't need to annotate them.
+
+=== ReloadPageHelper — Programmatic Triggers
+
+Use when you change an entity **outside** the Hibernate flow (native SQL, batch update, cache invalidation) and still want the UI to refresh:
+
+[source,java]
+----
+@Service
+public class BatchUpdateService {
+
+    @Autowired private ReloadPageHelper reloadHelper;
+
+    @Transactional
+    public void bulkMarkInactive(Collection<UUID> participantIds) {
+        entityManager.createQuery("update Participant p set p.active = false where p.id in :ids")
+            .setParameter("ids", participantIds)
+            .executeUpdate();
+
+        participantIds.forEach(id -> reloadHelper.reload(Participant.class, id));   // <1>
+    }
+}
+----
+<1> Fires an `EntityReloadEvent` after the transaction commits (via `TransactionUtils.afterTransaction`). Safe to call inside the transaction — the fire is deferred.
+
+Methods:
+
+- `reload(Persistable<?>)` — reload by entity instance
+- `reload(Class<?>, Serializable)` — reload by class + id
+- `reloadFragment(String path)` — reload a named UI fragment (uses sentinel entity name `"fragment"`)
+
+=== ReloadablePageContent
+
+The tracked content handed to page consumers on request completion:
+
+[source,java]
+----
+public class ReloadablePageContent {
+    private final String page;                  // page identifier from Current-Page header
+    private final Collection<String> entites;   // "EntityName:id" keys loaded during render
+}
+----
+
+A page consumer (typically the SSE publisher) uses this to register an interest: "session X is watching these entities on page Y — notify me when any of them change."
+
+== Reload Event Transport
+
+=== The Abstraction
+
+[source,java]
+----
+public interface ReloadEventTransport {
+    <C extends ReloadEvent> void addConsumer(Class<C> eventClass, Consumer<C> consumer);
+    void send(ReloadEvent event);
+}
+----
+
+A pluggable publish-subscribe bus. The SDK ships two implementations chosen automatically at startup based on classpath:
+
+[cols="2,2,3", options="header"]
+|===
+|Implementation |Activation |Use
+
+|`SelfReloadEventTransport`
+|Default — in-process `ConcurrentHashMap`
+|Single-node deployments. Zero infrastructure. Events never leave the JVM.
+
+|`RedissonReloadEventTransport`
+|`@ConditionalOnBean(RedissonClient.class)` — activates when Redisson client is configured
+|Multi-node clusters. Events propagate via Redis pub/sub on topics `<prefix><EventClassName>`.
+|===
+
+If Redisson is on the classpath and configured, both transports may be present — Spring picks the one annotated for your profile. For cluster deployments, always use Redisson so a write on node A triggers UI reloads for sessions attached to node B.
+
+=== Event Types
+
+[source,java]
+----
+public interface ReloadEvent {}                          // marker
+
+public class EntityReloadEvent implements ReloadEvent {  // fired by ReloadPageService
+    private Object id;
+    private String entityName;
+}
+
+public class CounterReloadEvent implements ReloadEvent { // separate counter-refresh channel
+    private String counterName;
+}
+----
+
+`CounterReloadEvent` is used by the counters subsystem (entity badge counts, dashboard tiles) to push incremental updates — see <<counters>> for the full picture.
+
+=== Redisson Transport Details
+
+[source,java]
+----
+@Service
+@ConditionalOnBean(RedissonClient.class)
+public class RedissonReloadEventTransport implements ReloadEventTransport {
+
+    @Value("${reload.redisson.topic.prefix:}") private String prefix;
+    private final Codec codec = new JsonJacksonCodec();
+    @Autowired private RedissonClient redisson;
+
+    @Override
+    public <C extends ReloadEvent> void addConsumer(Class<C> eventClass, Consumer<C> consumer) {
+        redisson.getTopic(prefix + eventClass.getSimpleName(), codec)
+            .addListener(eventClass, (ch, msg) -> consumer.accept(msg));
+    }
+
+    @Override
+    public void send(ReloadEvent event) {
+        redisson.getTopic(prefix + event.getClass().getSimpleName(), codec)
+            .publish(event);
+    }
+}
+----
+
+Characteristics:
+
+- **Topic naming**: `<prefix><EventClassName>` — e.g., `EntityReloadEvent`, `CounterReloadEvent`. The `reload.redisson.topic.prefix` property lets you separate environments (prod vs staging) sharing a Redis cluster.
+- **JSON codec**: `JsonJacksonCodec` — events are human-readable on the wire and debuggable from `redis-cli`.
+- **No delivery guarantees**: Redis pub/sub is fire-and-forget. If a subscriber is down, it misses the event. Acceptable for UI reload (next page load refetches anyway).
+
+== Browser Delivery — ReloadPageSubscription
+
+The server-side reload pipeline ends at `ReloadPageService.changeConsumers` / `pageConsumers`. `ReloadPageSubscription` (from `com.timvero.web.common.reload`) is the **STOMP/WebSocket bridge** that turns those consumers into browser-delivered messages.
+
+[source,java]
+----
+@Component
+@ConditionalOnBean(ReloadPageService.class)                     // <1>
+public class ReloadPageSubscription {
+
+    public static final String PAGE_OBJECT_SUBSCRIPTION  = "/queue/page/objects";   // <2>
+    public static final String PAGE_CONTENT_SUBSCRIPTION = "/queue/page/content";
+
+    @Autowired private ReloadPageService service;
+    @Autowired private SimpMessagingTemplate template;
+
+    @PostConstruct
+    protected void init() {
+        service.addChangeConsumer(key ->
+            template.convertAndSend(PAGE_OBJECT_SUBSCRIPTION, key));                // <3>
+        service.addPageConsumer((user, content) ->
+            template.convertAndSendToUser(user, PAGE_CONTENT_SUBSCRIPTION, content));  // <4>
+    }
+}
+----
+<1> Activates only when `ReloadPageService` is present — absent in non-reload profiles (CLI jobs, batch workers)
+<2> Two dedicated STOMP destinations — the browser subscribes to both via its `@SubscribeMapping` handler or `stompClient.subscribe(...)` call
+<3> **Broadcast channel** (`convertAndSend`) — every `EntityReloadEvent` with a key like `"Participant:7f2a..."` fans out to ALL connected sessions that subscribed to `/queue/page/objects`. Sessions filter locally: "am I currently showing this entity?"
+<4> **Per-user channel** (`convertAndSendToUser`) — `ReloadablePageContent` (the per-request tracked entity set, see `ReloadPageInterceptor`) is delivered only to the user who made the request, on their session's `/user/queue/page/content`. Used to tell the browser "your open session is still tracking these entities — subscribe to their events."
+
+=== Flow Summary
+
+[source]
+----
+@Transactional write on node A
+         │
+         ▼
+   Hibernate post-commit listener (ReloadPageService)
+         │
+         │  EntityReloadEvent
+         ▼
+   ReloadEventTransport.send(event)           ← SelfTransport / Redisson
+         │
+         ▼
+   (all nodes) ReloadPageService.listen(event)
+         │                                    = fires changeConsumers
+         │
+         ▼
+   ReloadPageSubscription.addChangeConsumer lambda
+         │
+         ▼
+   SimpMessagingTemplate → STOMP
+         │                                    "Participant:7f2a..."
+         ▼
+   Browser's WebSocket client
+         │
+         │  JS: if (currentPageObjects.contains(key)) reload()
+         ▼
+   DOM refresh / SSE-like UI update
+----
+
+The per-user channel (`pageConsumers` → `convertAndSendToUser`) completes the loop — at page render the interceptor told the server "this user sees entities X, Y, Z"; the subscription tells the browser the same list back so the JS client knows which keys to listen for.
+
+=== STOMP Destination Conventions
+
+[cols="2,3", options="header"]
+|===
+|Destination |Carries
+
+|`/queue/page/objects`
+|Broadcast — one message per entity change, keyed `"EntityName:id"`. Every user gets every message; filtering is client-side.
+
+|`/user/queue/page/content`
+|Per-user — a `ReloadablePageContent` snapshot sent on page render, telling the client which keys to watch.
+|===
+
+Browser-side listens for both; server-side emits both. No Spring configuration beyond this component is required — `SimpMessagingTemplate` is auto-configured by `spring-boot-starter-websocket` (or equivalent STOMP broker config).
+
+NOTE: If your deployment doesn't use STOMP/WebSocket (headless / batch-only), the `@ConditionalOnBean(ReloadPageService.class)` guard keeps this component inert — `ReloadPageService` still fires its consumers but none publish to STOMP. For SSE-based UIs, register a competing `ReloadPageSubscription`-style component that publishes to SSE emitters instead.
+
+== Configuration
+
+[cols="2,2,3", options="header"]
+|===
+|Property |Default |Effect
+
+|`reload.redisson.topic.prefix`
+|`""`
+|Prefix prepended to every Redisson topic name. Use to separate tenants / environments sharing the same Redis cluster.
+
+|(auto — Redisson classpath presence)
+|N/A
+|Activates `RedissonReloadEventTransport` instead of `SelfReloadEventTransport`
+|===
+
+The `Current-Page` HTTP header is set by the frontend framework (Launchpad) on every navigation; no server-side configuration.
+
+== Advanced Patterns
+
+=== Triggering Reload After a Bulk SQL Update
+
+Bulk `UPDATE`/`DELETE` queries don't fire Hibernate's entity listeners. Use `ReloadPageHelper.reload()` explicitly:
+
+[source,java]
+----
+@Transactional
+public void disableAll(ParticipantStatus status) {
+    int count = entityManager.createQuery(
+        "update Participant set active = false where status = :status")
+        .setParameter("status", status)
+        .executeUpdate();
+
+    // Entity listeners didn't fire — trigger reloads manually
+    entityManager.createQuery(
+        "select id from Participant where status = :status", UUID.class)
+        .setParameter("status", status)
+        .getResultList()
+        .forEach(id -> reloadHelper.reload(Participant.class, id));
+}
+----
+
+=== Subscribing to Domain Events
+
+Use `EntityChangeEvent<T>` for cross-cutting concerns (notifications, integrations, cache invalidation):
+
+[source,java]
+----
+@Component
+public class CrmSync {
+
+    @EventListener
+    public void onClientChange(EntityChangeEvent<Client> event) {
+        if (event.getOperation() == Operation.UPDATE &&
+            (event.isPropertyUpdated("email") || event.isPropertyUpdated("phone"))) {
+            crmClient.syncContactInfo(event.getEntity());
+        }
+    }
+}
+----
+
+`@EventListener` with the parameterized event type — Spring resolves generics at listener registration.
+
+=== Using @NotTrackable Judiciously
+
+Every tracked entity adds a thread-local set entry per page load + a post-commit event dispatch. For very high-churn entities (audit logs, metrics, queue messages), `@NotTrackable` measurably reduces overhead:
+
+[source,java]
+----
+@Entity
+@NotTrackable
+public class MetricsSample extends AbstractOwnable { /* ... */ }
+----
+
+TIP: Measure before optimizing. The per-event cost is microseconds; `@NotTrackable` is worth it only for tables written 1000+/sec.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `@EventListener` with parameterized `EntityChangeEvent<T>`** — type-safe, fires only for your entity
+* {ok} **Check `isPropertyUpdated("fieldName")`** before reacting to UPDATE events — avoids spurious triggers
+* {ok} **Use `ReloadPageHelper.reload()` after bulk JPQL** — bulk operations bypass Hibernate listeners
+* {ok} **Annotate high-volume infra entities with `@NotTrackable`** — reduces tracking overhead
+* {ok} **Use `RedissonReloadEventTransport` in multi-node deployments** — otherwise a write on node A doesn't refresh pages on node B
+* {ok} **Set `reload.redisson.topic.prefix` for shared Redis clusters** — prevents cross-environment leakage
+* {ok} **Trust post-commit timing** — domain listeners always see committed state, no risk of reading rollback-bound data
+* {ok} **Subscribe to counter updates via `CounterReloadEvent`** — don't poll counters from the frontend
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Running long work inside `@EventListener`** — post-commit listeners run on the transaction-executor thread; long work blocks other commits. Dispatch to `@Async` or a queue.
+* {bad} **Reading the `nativeEvent` field from a remote subscriber** — it's `transient` and `null` on the remote side; only use in in-process listeners
+* {bad} **Firing `ReloadPageHelper.reload()` outside a transaction** — `TransactionUtils.afterTransaction` silently drops the callback when there's no active transaction
+* {bad} **Using `SelfReloadEventTransport` in a multi-node cluster** — pages on other nodes never refresh; users think the app is broken
+* {bad} **Annotating business entities with `@NotTrackable`** — the UI stops reacting to changes; users see stale data
+* {bad} **Relying on `EntityReloadEvent` delivery** — Redis pub/sub is at-most-once; missed events are expected and the next user action refreshes state anyway. Don't use reload events as a consistency mechanism.
+* {bad} **Creating dynamic `ReloadEvent` subclasses at runtime** — Redisson topics are keyed by `getClass().getSimpleName()`; duplicate names across modules silently merge channels
+* {bad} **Touching `ReloadPageService.currentPage` directly** — it's an internal `ThreadLocal` managed by the interceptor; bypassing leaks state across requests
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `@ComponentScan` reaches `com.timvero.ground.entity.event` and `com.timvero.ground.entity.reload` packages
+* {todo} For multi-node deployments: Redisson configured (`spring.redisson.*` properties) and `RedissonClient` bean present
+* {todo} `reload.redisson.topic.prefix` set per environment when sharing a Redis cluster
+* {todo} `ReloadPageInterceptor` registered in `WebMvcConfigurer.addInterceptors(...)` (usually by SDK web config, verify in your profile)
+* {todo} Frontend sends `Current-Page` header on every page render
+* {todo} High-churn entities annotated with `@NotTrackable` to reduce overhead
+* {todo} Bulk JPQL update/delete paths call `ReloadPageHelper.reload()` explicitly
+* {todo} `@EventListener` methods are fast or delegate to `@Async` — don't block post-commit thread
+* {todo} Integration test covers: entity write on node A triggers reload event on node B (with Redisson)
+* {todo} Monitoring on Redis topics (e.g., MONITOR sample during load test) — no runaway event storms
+* {todo} `supportExecutor` bean exists and is sized appropriately (`ReloadPageService.fire` runs asynchronously on it)
+
+---
+
+**Related:** <<entity-history>>, <<audit-module-sdk-reference-internals>>, <<counters>>, <<entity-module-sdk-reference-hierarchy>>
+
+**Next:** <<counters>>, <<launchpad>>

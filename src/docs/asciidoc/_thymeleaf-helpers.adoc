@@ -1,0 +1,703 @@
+= Thymeleaf Helpers — expression objects & lazy unwrapping
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:templatedir: ../../main/resources/templates
+
+The Thymeleaf helper module (`com.timvero.ground.thymeleaf`) extends Thymeleaf with two things every template in the SDK relies on: (1) a set of **expression objects** (`#monetary`, `#enums`, `#phones`, `#ldates`, etc.) that format and transform domain values; (2) a **lazy unwrapping layer** that silently resolves Hibernate proxies and `Supplier<?>` values as they're read from the template context. Template authors use both constantly; they're rarely documented together.
+
+== What You Need to Know
+
+The module has **two distinct subsystems**:
+
+[cols="1,3,2", options="header"]
+|===
+|Subsystem |Role |Key types
+
+|**Expression objects**
+|Custom functions callable from templates as `${#name.method(...)}` — domain-aware formatting that Thymeleaf's built-ins don't cover (MonetaryAmount, libphonenumber, `CustomEnum` localization, ISO dates with zone awareness)
+|`ThymeleafCustomDialect`, `ThymeleafExpressionObjectFactory`, 9 objects in `object/`
+
+|**Lazy unwrapping**
+|AOP layer over Thymeleaf's SpEL evaluation that auto-unwraps `HibernateProxy` and `Supplier<?>` values. Makes `${entity.lazyAssociation.field}` "just work" without manual initialization and lets controllers put `Supplier<T>` into models for deferred evaluation
+|`LazyUnwrapper`, `HibernateProxyUnwrapper`, `SupplierUnwrapper`, `InitializingDelegateTemplateEngine`
+|===
+
+Key characteristics:
+
+- **`#ldates` is zone-aware** — reads the TimeZone from `RequestContext` per-request, falling back to JVM default
+- **`#enums` handles both `Enum` and `CustomEnum`** uniformly — the same method localizes both
+- **`#monetary` honors application properties** — `application.monetary.format.locale`, `application.monetary.format.pattern`, `application.monetary.currency.style`
+- **Lazy unwrappers are extensible** — implement `LazyUnwrapper` + `@Component` + `@Order` and your type joins the chain
+- **Unwrapping happens at template read time** — before the template sees the value. Your template code doesn't know the difference between a real entity and a `HibernateProxy`
+
+== Expression Objects Reference
+
+Registered via `ThymeleafCustomDialect`. All are accessed in templates as `${#name.method(...)}`:
+
+[cols="1,3", options="header"]
+|===
+|Name |Provides
+
+|`#monetary` |`MonetaryAmount` and `BigDecimal` formatting; list of available currencies
+|`#enums` |Enum / `CustomEnum` localization and comparison helpers
+|`#phones` |libphonenumber-based phone formatting
+|`#ldates` |Date/time formatting and arithmetic (zone-aware)
+|`#collections` |Set/list membership helpers
+|`#plural` |Naive singular/plural concatenation
+|`#digits` |BigDecimal rounding
+|`#print` |Universal "render any value as a string" (delegates to audit-module `ObjectPrintUtils`)
+|`#web` |Request metadata (currently just `isAjax()`)
+|`#request` / `#session` |Raw Thymeleaf `IWebRequest` / `IWebSession` (fallback for edge cases)
+|===
+
+=== #monetary — MonetaryObject
+
+[source,java]
+----
+public class MonetaryObject {
+    public String format(MonetaryAmount amount);               // <1>
+    public String format(BigDecimal bigDecimal);               // <2>
+    public BigDecimal value(MonetaryAmount amount);            // <3>
+    public CurrencyUnit[] getAvailableCurrencies();            // <4>
+}
+----
+<1> Formats a `MonetaryAmount` per `application.monetary.format.*` properties — `locale`, `pattern` (default `¤ #,##0.00`), `currency.style` (default `CODE`). Returns `""` for null.
+<2> Formats a `BigDecimal` via `NumberFormat` for the configured locale. Returns `""` for null.
+<3> Extract the `BigDecimal` number value (drops currency).
+<4> List of currencies from `application.available.currency` property.
+
+Template usage:
+
+[source,html]
+----
+<td th:text="${#monetary.format(credit.amount)}">$10,000.00 USD</td>
+<td th:text="${#monetary.format(credit.rate)}">0.085</td>
+
+<select th:field="*{currency}">
+    <option th:each="c : ${#monetary.availableCurrencies}"
+            th:value="${c.currencyCode}" th:text="${c.currencyCode}">USD</option>
+</select>
+----
+
+Application properties that drive the formatting:
+
+[source,properties]
+----
+application.monetary.format.locale=en-US
+application.monetary.format.pattern=¤ #,##0.00
+application.monetary.currency.style=CODE
+application.available.currency=USD,EUR,GBP
+----
+
+Missing properties fall back to: request locale (from Thymeleaf context), default pattern `¤ #,##0.00`, style `CODE`.
+
+=== #enums — EnumsObject
+
+The workhorse for enum display in templates:
+
+[source,java]
+----
+public class EnumsObject {
+    public String name(Object object);                                 // <1>
+    public String name(String group, Object object);                   // <2>
+    public String name(String group, Object object, String def);      // <3>
+    public String raw(Enum<?> enumObject);                             // <4>
+
+    public boolean equals(Object x, Object y);                         // <5>
+    public boolean in(Object x, Object[] ys);
+    public boolean notIn(Object x, Object[] ys);
+
+    public Map<?, String> withNames(Collection<?> objects);            // <6>
+    public Map<?, String> withNames(String group, Collection<?> objects);
+
+    public String join(Collection<?> objects, String separator);
+}
+----
+<1> Localized display. `NamedEntity` → `getDisplayedName()`; otherwise `EnumUtils.getLocalizedValue` (i18n key: simple class name + `.` + value)
+<2> Same but with explicit message-key group prefix — use when the same enum is rendered differently in different contexts
+<3> With fallback string for missing keys
+<4> Technical name (`.name()`) — useful for HTML `value` attributes, CSS classes, data-attributes
+<5> String-based comparison that tolerates `Enum` vs `String` mismatches (common when form values arrive as strings but model holds enums)
+<6> Pairs keys with localized labels — convenient for `<select>` option rendering
+
+Template usage:
+
+[source,html]
+----
+<!-- Display a single value -->
+<span th:text="${#enums.name(participant.status)}">Approved</span>
+
+<!-- Filter dropdown (localized) -->
+<select th:field="*{status}">
+    <option th:each="s, stat : ${#enums.withNames(T(ParticipantStatus).values())}"
+            th:value="${s.key}" th:text="${s.value}">New</option>
+</select>
+
+<!-- Conditional by value (handles string/enum mix) -->
+<span th:if="${#enums.in(status, {'APPROVED', 'ACTIVE'})}" class="badge-success">Live</span>
+
+<!-- Technical name for CSS class -->
+<tr th:class="'status-' + ${#enums.raw(status).toLowerCase()}">...</tr>
+----
+
+==== EnumUtils — The Java API Behind #enums
+
+`#enums.name(value)` delegates to `com.timvero.ground.tools.EnumUtils.getLocalizedValue(...)`. The same Java API is used directly in services and controllers where Thymeleaf isn't available (JSON DTOs, Excel export, logging):
+
+[source,java]
+----
+public class EnumUtils {
+
+    public static String getLocalizedValue(Object object, Locale locale);                    // <1>
+    public static String getLocalizedValue(String group, Object object, Locale locale);      // <2>
+    public static String getLocalizedValue(String group, Object object, String def, Locale);
+    public static String getLocalizedValue(String group, Object object, Object[] args,
+                                           String def, Locale locale);                        // <3>
+
+    public static String getDefaultGroup(Enum<?> e);                                          // <4>
+    public static String getDefaultGroup(Class<?> clazz);
+    public static String getDefaultGroup(String name);
+
+    public static <T extends Enum<T>> T[] withEmpty(Class<T> en);                             // <5>
+    public static LinkedHashMap<Object, String> getLocalizedEnum(Object[] en, Locale locale); // <6>
+    public static <T extends Enum<T>> boolean isIn(T v, T... values);                         // <7>
+}
+----
+<1> Basic localization — handles `Enum`, `CustomEnum`, `NamedParameter`, and `String` uniformly. Resolves i18n key as `<defaultGroup>.<name>`.
+<2> With explicit group prefix — use when the same enum renders differently in different UI contexts (e.g., `filter.participant.status` vs `participant.status`).
+<3> Full form — with MessageFormat args (for `{0}` placeholders) and fallback string.
+<4> Converts class names to i18n key groups: `ParticipantStatus` → `participant.status`, `CreditProductState` → `credit.product.state`. The inverse of Pascal-case → dotted lowercase.
+<5> Prepends a `null` slot at index 0 — used for "no selection" dropdown entries.
+<6> Builds a `LinkedHashMap<Enum, LocalizedLabel>` — convenient for `FilterValues.add` and manual DTO construction.
+<7> Varargs membership check — identity-based, safe for enum singletons.
+
+A `MessageSource` is wired into `EnumUtils` at startup via `EnumUtils.setMessageSource(...)` — the SDK does this automatically. If you unit-test code that calls `EnumUtils` in isolation, mock the static field.
+
+i18n key convention examples:
+
+[cols="2,2,3", options="header"]
+|===
+|Java expression |Resolved key |Pattern
+
+|`EnumUtils.getLocalizedValue(ParticipantStatus.NEW, locale)`
+|`participant.status.NEW`
+|`<defaultGroup>.<name>`
+
+|`EnumUtils.getLocalizedValue("filter.participant", ParticipantStatus.NEW, locale)`
+|`filter.participant.NEW`
+|`<explicit group>.<name>`
+
+|`EnumUtils.getDefaultGroup(ParticipantStatus.class)`
+|`"participant.status"`
+|CamelCase → dotted lowercase
+|===
+
+=== #phones — PhoneObject
+
+[source,java]
+----
+public class PhoneObject {
+    public String format(String input);                      // <1>
+    public String format(String input, Object format);       // <2>
+    public String last4(String input);                       // <3>
+}
+----
+<1> Default format: `PhoneNumberFormat.INTERNATIONAL` (`+44 20 7946 0958`). Default region comes from the request locale's country, falling back to `null` (libphonenumber's E.164-requires-leading-`+` mode).
+<2> Explicit format — accepts a `PhoneNumberFormat` enum or its name as string (`"E164"`, `"NATIONAL"`, `"RFC3966"`, `"INTERNATIONAL"`)
+<3> Last 4 characters — use for masked display like `**** **** 6789`
+
+Template usage:
+
+[source,html]
+----
+<td th:text="${#phones.format(client.contactInfo.phone)}">+44 20 7946 0958</td>
+<td th:text="${#phones.format(client.phone, 'NATIONAL')}">020 7946 0958</td>
+<span th:text="'****' + ${#phones.last4(client.phone)}">****6789</span>
+----
+
+If parsing fails (invalid phone), the method returns the input unchanged — templates never blow up on bad data.
+
+=== #ldates — LocalDatesObject
+
+The largest API — zone-aware date/time formatting plus arithmetic helpers.
+
+==== Formatting
+
+[source,java]
+----
+// Default (locale-driven style)
+public String format(TemporalAccessor target);
+public String formatDate(TemporalAccessor target);
+public String formatTime(TemporalAccessor target);
+
+// With pattern
+public String format(TemporalAccessor target, String pattern);
+public String formatDate(TemporalAccessor target, String pattern);
+public String formatTime(TemporalAccessor target, String pattern);
+
+// With null-fallback message
+public String formatOrMessage(TemporalAccessor target, String emptyMessage);
+public String formatDateOrMessage(TemporalAccessor target, String emptyMessage);
+public String formatTimeOrMessage(TemporalAccessor target, String emptyMessage);
+----
+
+Supported input types: `LocalDate`, `LocalTime`, `LocalDateTime`, `ZonedDateTime`, `Instant`. `Instant` is converted to the request's zone (from Spring's `RequestContextUtils.getTimeZone`, falling back to JVM default).
+
+The `OrMessage` variants return the supplied empty-message string when target is null — avoids `th:text="${foo} ?: '-'"` noise.
+
+==== Arithmetic
+
+[source,java]
+----
+public LocalDate addDay(LocalDate date, int days);
+public long daysToMonths(Integer days);
+public <T extends Temporal> long daysBetween(T start, T end);
+public <T extends Temporal> long yearsBetween(T start, T end);
+public long yearsUntilNow(LocalDateTime start);
+public long yearsUntilNow(LocalDate start);
+public long daysBetweenNow(LocalDate date);
+public long daysAgo(Temporal from);
+public boolean isBefore(LocalDate date);
+public boolean isBeforeOrToday(LocalDate date);
+public boolean isAfter(LocalDate date);
+public LocalDate createLocalDateNow();
+public LocalDate nowDate();
+----
+
+`daysAgo` auto-detects the input type (`Instant`/`LocalDateTime`/`LocalDate`) and computes against `now()` of the same type.
+
+==== Parsing
+
+[source,java]
+----
+public LocalDateTime parseDateTime(String string, String pattern);
+public LocalDate parseDate(String string, String pattern);
+public LocalTime parseTime(String string, String pattern);
+----
+
+Useful when templates read string values (e.g., from `data-*` attributes) and need to compute on them.
+
+Template usage:
+
+[source,html]
+----
+<td th:text="${#ldates.formatDate(credit.disbursementDate)}">15 Mar 2026</td>
+<td th:text="${#ldates.format(credit.createdAt, 'dd/MM/yyyy HH:mm')}">15/03/2026 09:30</td>
+<td th:text="${#ldates.formatDateOrMessage(credit.closedAt, 'Still active')}">Still active</td>
+
+<!-- Age calculation -->
+<span th:text="${#ldates.yearsUntilNow(client.dateOfBirth)} + ' years'">35 years</span>
+
+<!-- Overdue styling -->
+<td th:class="${#ldates.isBefore(payment.dueDate)} ? 'overdue' : 'on-time'">
+    <span th:text="${#ldates.daysBetweenNow(payment.dueDate)} + ' days'">15 days</span>
+</td>
+----
+
+=== #collections — CollectionsObject
+
+[source,java]
+----
+public class CollectionsObject {
+    public boolean containsAny(Object[] target, Object[] elements);
+    public boolean containsAny(Object[] target, Collection<?> elements);
+    public boolean containsAny(Collection<?> target, Object[] elements);
+    public boolean containsAny(Collection<?> target, Collection<?> elements);
+}
+----
+
+Just `containsAny` in four forms — check if any element of `elements` is in `target`. Thymeleaf's built-in `#arrays` / `#lists` has `contains(single)` but no `containsAny(many)`.
+
+[source,html]
+----
+<tr th:if="${#collections.containsAny(participant.roles, {'BORROWER', 'GUARANTOR'})}">
+    ...
+</tr>
+----
+
+=== #plural — PluralObject
+
+[source,java]
+----
+public String count(long amount, String one, String many);
+----
+
+Trivial — concatenates the number with one of two strings. Not i18n-aware (no Russian plural-three-form, Arabic plural-six-form etc.) — for proper pluralization use `#messages.msg(...)` with ICU-style keys.
+
+[source,html]
+----
+<span th:text="${#plural.count(notesCount, 'note', 'notes')}">3 notes</span>
+----
+
+=== #digits — DigitsObject
+
+[source,java]
+----
+public BigDecimal round(BigDecimal digit, int scale);     // HALF_UP, null → ZERO
+----
+
+One-method helper — `scale` is the number of decimal places. Uses `RoundingMode.HALF_UP` (not banker's rounding).
+
+[source,html]
+----
+<td th:text="${#digits.round(rate, 4)}">0.0850</td>
+----
+
+=== #print — PrintObject
+
+[source,java]
+----
+public String name(Object value);   // delegates to ObjectPrintUtils.name(value, locale)
+----
+
+Universal "render any value" for templates that don't know the specific type — handles collections, enums, `Temporal`, `NamedEntity`, `Persistable<?>`, strings. See <<audit-module-sdk-reference-internals>> (ObjectPrintUtils) for details.
+
+Useful in generic fragments like the history timeline:
+
+[source,html]
+----
+<td th:text="${#print.name(change.value.oldValue)}">Old value</td>
+<td th:text="${#print.name(change.value.newValue)}">New value</td>
+----
+
+=== #web — WebObject
+
+[source,java]
+----
+public boolean isAjax();    // true when X-Requested-With == XMLHttpRequest
+----
+
+Distinguish AJAX fragment requests from full page loads — useful when the same Thymeleaf template needs different layout wrappers:
+
+[source,html]
+----
+<th:block th:if="${#web.isAjax()}">
+    <!-- fragment only: no <html>, no layout -->
+    <div th:fragment="content">...</div>
+</th:block>
+<th:block th:unless="${#web.isAjax()}">
+    <!-- full page with layout -->
+    <html layout:decorate="~{layout/main}">
+    <body><div layout:fragment="content">...</div></body>
+    </html>
+</th:block>
+----
+
+=== #request / #session — Thymeleaf Primitives
+
+Direct access to `IWebRequest` and `IWebSession` from non-servlet web contexts. Typical apps use `#httpServletRequest` / `#session` from Spring's standard dialect; these two are provided as fallback for edge cases (non-servlet environments, framework integrations).
+
+Rarely used in template code. Documented here for completeness.
+
+== Lazy Unwrapping Subsystem
+
+=== The Problem
+
+Thymeleaf evaluates expressions via SpEL against the template context. Two common scenarios break naïvely:
+
+1. **Hibernate lazy proxies** — `entity.getLazyAssociation()` returns a `HibernateProxy`. Reading `.name` on it triggers initialization, which can throw `LazyInitializationException` if the session closed. Template authors end up writing `${#staticUtil.initialize(entity.association).name}` or adding `JOIN FETCH` everywhere.
+
+2. **Deferred computation** — sometimes the controller can't afford to load a heavy calculation eagerly, but the template might not use it. Passing a `Supplier<T>` into the model is the idiomatic fix, but Thymeleaf can't read `.value.get()` — template code has to know it's a supplier.
+
+=== The Solution — InitializingDelegateTemplateEngine
+
+`InitializingDelegateTemplateEngine` wraps the standard `SpringTemplateEngine` and, on first render of each context, replaces Thymeleaf's `PropertyAccessor`s and `MethodResolver`s with AOP proxies. The proxies run every returned value through a chain of `LazyUnwrapper` beans **before** Thymeleaf sees it.
+
+[source]
+----
+Template expression evaluation
+          │
+          │  ${entity.association.name}
+          ▼
+    SpEL property access
+          │
+          ▼
+    PropertyAccessor (AOP-proxied)
+          │
+          │  returns TypedValue
+          ▼
+    UnwrapInterceptor.intercept
+          │
+          │  unwrapObject(value)
+          ▼
+    LazyUnwrapper chain
+     ┌────┴─────┐
+     │          │
+  @Order(1000) SupplierUnwrapper
+     │  if (target instanceof Supplier) return ((Supplier) target).get();
+     │
+  @Order(5000) HibernateProxyUnwrapper
+     │  if (target instanceof HibernateProxy) return ((HibernateProxy) target).getHibernateLazyInitializer().getImplementation();
+     │
+     └─── unwrapped value → Thymeleaf
+----
+
+The interception is transparent. Template code reads `${entity.association.name}`; behind the scenes:
+
+- If `association` is a `HibernateProxy` → unwrapped to the real entity
+- If `name` is a `Supplier<String>` → resolved to the string
+- If neither applies → value passes through unchanged
+
+=== LazyUnwrapper — The SPI
+
+[source,java]
+----
+public interface LazyUnwrapper {
+    Object unwrap(Object target);
+}
+----
+
+One method. Implementations are `@Component`-discovered and ordered via `@Order`. Two ship with the SDK:
+
+[cols="2,1,3", options="header"]
+|===
+|Unwrapper |Order |Behavior
+
+|`SupplierUnwrapper`
+|1000
+|`if (target instanceof Supplier) return ((Supplier) target).get();`
+
+|`HibernateProxyUnwrapper`
+|5000
+|`if (target instanceof HibernateProxy) return ((HibernateProxy) target).getHibernateLazyInitializer().getImplementation();`
+|===
+
+Lower order runs first. The chain is iterative — each unwrapper sees the output of the previous one, so a `Supplier<HibernateProxy>` gets fully unwrapped in one pass.
+
+=== Writing a Custom Unwrapper
+
+[source,java]
+----
+@Component
+@Order(3000)
+public class OptionalUnwrapper implements LazyUnwrapper {
+
+    @Override
+    public Object unwrap(Object target) {
+        if (target instanceof Optional<?> optional) {
+            return optional.orElse(null);
+        }
+        return target;
+    }
+}
+----
+
+With this bean registered, templates can do `${model.optionalValue.field}` where `optionalValue` is `Optional<MyEntity>` — `null`-safe navigation without the template author knowing.
+
+Order matters — place your unwrapper where the chain makes sense. Between `SupplierUnwrapper` (1000) and `HibernateProxyUnwrapper` (5000) is typical for most custom types.
+
+=== Deferred Computation via Supplier
+
+Pattern for expensive work the template might not use:
+
+[source,java]
+----
+// Controller / form service
+@Override
+protected void assembleEditModel(Credit entity, CreditForm form, Map<String, Object> model) {
+    model.put("credit", entity);
+    model.put("paymentSchedule",
+        Lazy.of(() -> scheduleService.compute(entity)));        // <1>
+}
+----
+<1> `Lazy.of(...)` from Spring Data creates a `Supplier<T>` with caching. Template reads `${model.paymentSchedule.rows}` — if the template omits this reference, the computation never runs.
+
+In the template:
+
+[source,html]
+----
+<th:block th:if="${showSchedule}">
+    <table th:each="row : ${paymentSchedule.rows}">
+        <td th:text="${row.date}">...</td>
+    </table>
+</th:block>
+----
+
+Without the unwrapping layer, the template would need `${paymentSchedule.get().rows}` explicitly. With it, the `Supplier` is invisible.
+
+[NOTE]
+====
+**Caching matters for iterated access.** Thymeleaf may evaluate the same expression multiple times (e.g., within nested iterations). `Lazy.of(...)` caches the result; a raw `Supplier` that always recomputes would blow performance. Prefer `Lazy` for anything non-trivial.
+====
+
+=== Wiring the Engine
+
+`InitializingDelegateTemplateEngine` needs to replace Spring Boot's auto-configured `SpringTemplateEngine`. Pattern in SDK configuration:
+
+[source,java]
+----
+@Configuration
+public class ThymeleafConfig {
+
+    @Bean
+    @Primary
+    public ISpringTemplateEngine primaryTemplateEngine(SpringTemplateEngine standard,
+                                                        List<LazyUnwrapper> unwrappers) {
+        InitializingDelegateTemplateEngine engine = new InitializingDelegateTemplateEngine(standard);
+        // unwrappers auto-injected by Spring
+        return engine;
+    }
+}
+----
+
+The SDK provides this wiring out of the box — application code doesn't usually touch it. Override only when substituting a different engine entirely.
+
+== Registering Custom Expression Objects
+
+To add your own `${#myObject.method(...)}`:
+
+[source,java]
+----
+@Configuration
+public class CustomDialectConfig {
+
+    @Bean
+    public IDialect customDialect() {
+        Map<String, Function<IExpressionContext, ?>> objects = new HashMap<>();
+        objects.put("taxes", context -> new TaxesObject(context.getLocale()));
+        objects.put("credit", context -> new CreditDisplayObject());
+        return new ThymeleafCustomDialect(objects);
+    }
+}
+
+public class TaxesObject {
+    private final Locale locale;
+    public TaxesObject(Locale locale) { this.locale = locale; }
+
+    public String format(BigDecimal pretax, BigDecimal rate) {
+        BigDecimal withTax = pretax.multiply(BigDecimal.ONE.add(rate));
+        return NumberFormat.getCurrencyInstance(locale).format(withTax);
+    }
+}
+----
+
+Template:
+
+[source,html]
+----
+<td th:text="${#taxes.format(price, taxRate)}">€119.00</td>
+----
+
+Your dialect's objects merge with the SDK's defaults — both available in the same template. Avoid name collisions with SDK names (`monetary`, `enums`, `phones`, etc.) — later registrations win silently, which leads to hard-to-diagnose overrides.
+
+== Advanced Patterns
+
+=== Zone-Aware Rendering
+
+The `#ldates` object reads timezone from `RequestContextUtils.getTimeZone(request)` — which in turn reads from `LocaleContextHolder` / Spring's LocaleResolver. For timezone-sensitive rendering:
+
+1. Configure a `LocaleResolver` that returns the user's timezone (session-based, cookie-based, or derived from user preferences)
+2. Set it via `LocaleContextHolder.setLocaleContext(new SimpleTimeZoneAwareLocaleContext(locale, zone))` in a filter / interceptor
+3. `#ldates.format(instant)` now renders `Instant` values in the user's zone
+
+Without step 1-2, everything renders in JVM default zone (usually UTC or the server's local zone — neither is what most users want).
+
+=== Conditional AJAX Layouts
+
+Avoid re-sending the full page layout for AJAX refreshes:
+
+[source,html]
+----
+<!DOCTYPE html>
+<html th:if="${not #web.isAjax()}" layout:decorate="~{layout/main}">
+<body>
+    <div layout:fragment="content">
+        <th:block th:include="::content-body"></th:block>
+    </div>
+</body>
+</html>
+
+<div th:fragment="content-body">
+    <!-- the actual content — shared between full and AJAX -->
+    <table>...</table>
+</div>
+----
+
+AJAX requests render only `content-body` (even though the browser sees the whole page definition, the fragment selector strips it). Full page loads add the layout wrapper.
+
+=== Lazy Supplier Pitfall — Reevaluation
+
+Raw `Supplier<T>` (not `Lazy.of`) recomputes on each template access:
+
+[source,java]
+----
+model.put("items", (Supplier<List<Item>>) () -> repository.findAll());     // <1>
+----
+<1> Every `${items.someField}` or `${items[0]}` in the template may call `findAll` again, depending on expression-tree evaluation
+
+Always wrap in `Lazy.of(...)` for non-trivial computations:
+
+[source,java]
+----
+model.put("items", Lazy.of(() -> repository.findAll()));                   // <1>
+----
+<1> First access computes; subsequent ones use the cached value
+
+=== Null Handling in #ldates
+
+`#ldates.format(null)` returns `""`, not `"null"`. `#ldates.formatDateOrMessage(null, "-")` returns `"-"`. Use the `OrMessage` variants when templates should show explicit placeholders for missing dates — more self-documenting than `th:text="${date != null ? #ldates.format(date) : '-'}"`.
+
+=== Combining Helpers
+
+Templates often chain multiple helpers:
+
+[source,html]
+----
+<td th:text="${#enums.name('statusLabel', credit.status)} + ' — ' +
+             ${#monetary.format(credit.outstanding)} + ' (' +
+             ${#plural.count(credit.overdueDays, 'day', 'days')} + ' overdue)'">
+    Active — $5,000.00 USD (15 days overdue)
+</td>
+----
+
+Readable if short; factor into reusable fragments (`<th:block th:fragment="credit-status(credit)">`) when the composition repeats.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `#monetary.format` for all money rendering** — consistent symbol / separator / precision across the app
+* {ok} **Use `#enums.name(value)` — never `value.toString()`** — toString may expose internals; `#enums` routes through i18n
+* {ok} **Use `#ldates.formatDate` / `formatTime` / `format` by type** — avoids showing time when only the date matters
+* {ok} **Prefer `formatOrMessage` over ternary nulls** — `${#ldates.formatOrMessage(date, '-')}` reads cleaner
+* {ok} **Wrap expensive computations in `Lazy.of(...)`** before adding to the model — avoids work for templates that don't use the value
+* {ok} **Implement a custom `LazyUnwrapper` for project-specific wrappers** (Optional, Result, DTOs with lazy fields) — once added, templates benefit everywhere
+* {ok} **Register a custom dialect via `new ThymeleafCustomDialect(Map)`** rather than subclassing — additive, doesn't conflict with SDK defaults
+* {ok} **Use `#web.isAjax()` to branch layouts** — full-page vs fragment rendering from the same template
+* {ok} **Configure `application.monetary.*` properties** in production — defaults work but may not match your locale's conventions
+* {ok} **Use `#enums.withNames(values)` for dropdowns** — one line produces a localized label map ready for `<option>` iteration
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Using Thymeleaf's `#temporals` / `#dates`** where `#ldates` exists — the SDK's version is zone-aware (reads from `RequestContext`) and handles all `Temporal` subtypes uniformly
+* {bad} **Calling `entity.toString()` for display** — leaks internal representations, not localized, differs between proxy and real entity
+* {bad} **Manual `.get()` on a `Supplier` in a template** — unnecessary since `SupplierUnwrapper` resolves automatically; `.get()` on an already-unwrapped value throws
+* {bad} **Passing raw `Supplier<T>` (not `Lazy`) for expensive work** — recomputes on every template read; use `Lazy.of(...)`
+* {bad} **Registering a custom expression object named like an SDK one** (`monetary`, `enums`, etc.) — silently overrides, breaking the rest of the app's templates
+* {bad} **Relying on `#ldates.formatDate(instant)` without zone configuration** — renders in JVM default zone; configure a timezone-aware `LocaleResolver`
+* {bad} **Using `#plural.count` for real i18n** — no support for plural forms beyond "1 / other"; use message keys with ICU MessageFormat for production-quality pluralization
+* {bad} **Putting business logic in expression objects** — they're presentation helpers. Domain computations belong in services
+* {bad} **Calling `#phones.format` on already-formatted input** — idempotent for valid input, but wasteful; format once in the controller if it's for display only
+* {bad} **Writing a `LazyUnwrapper` with side effects** — it runs on every property access; logging or metrics inside the unwrapper floods output and skews performance
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `InitializingDelegateTemplateEngine` is the primary `ISpringTemplateEngine` bean (SDK provides this by default; verify in your config)
+* {todo} `SupplierUnwrapper` and `HibernateProxyUnwrapper` beans are present (SDK `@Component`s — verify they're picked up by component scan)
+* {todo} Custom `LazyUnwrapper` implementations have stable `@Order` — avoid collisions with SDK's 1000 / 5000
+* {todo} `application.monetary.*` properties configured for production locale
+* {todo} `application.available.currency` set if using `#monetary.availableCurrencies` in templates
+* {todo} Timezone-aware `LocaleResolver` configured if the app serves users across zones
+* {todo} Custom expression objects use `Locale` from `IExpressionContext.getLocale()` — not hardcoded
+* {todo} No custom expression object name collides with SDK names (`monetary`, `enums`, `phones`, `ldates`, `collections`, `plural`, `digits`, `print`, `web`, `request`, `session`)
+* {todo} Expensive controller-supplied model values wrapped in `Lazy.of(...)` — not raw `Supplier`
+* {todo} i18n keys exist for all `#enums.name(...)` call sites (enum-class-simple-name + `.` + value)
+* {todo} `#phones` tested with internationally-formatted numbers for the deployment's primary regions
+* {todo} Template integration tests exercise: lazy-proxy unwrapping, `Supplier` unwrapping, zone-based `#ldates.format(instant)` output
+
+---
+
+**Related:** <<audit-module-sdk-reference-internals>>, <<form-templates-html-template-integration>>, <<entity-module-sdk-reference-hierarchy>>, <<form-classes-setup-and-usage>>
+
+**Next:** <<form-templates-html-template-integration>>, <<forms>>

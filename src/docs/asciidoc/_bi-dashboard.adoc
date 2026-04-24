@@ -1,3 +1,5 @@
+[[bi-dashboard]]
+[[bi-dashboard-embedding]]
 = BI Dashboard Embedding
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -365,6 +367,44 @@ Returns a Superset guest token for iframe authentication:
 ----
 
 NOTE: Guest tokens expire. The frontend automatically refreshes them using the callback mechanism.
+
+=== Controller Class Signature — SDK Reference
+
+Unlike most admin pages, `BiController` is a **plain `@Controller`** — not a `ViewableFilterController` or `CatalogController` — because it serves a single embedded dashboard rather than a filterable list:
+
+[source,java]
+----
+@Controller
+@RequestMapping(PATH)
+@PreAuthorize("hasRole('" + BI_VIEW + "')")
+@ConditionalOnBean(BiDashboardProperties.class)
+@MenuItem(order = 1_100, name = "bi")
+public class BiController {
+
+    public static final String PATH = "/bi";
+
+    @GetMapping
+    public String view(Principal principal, Model model) { /* resolves role → dashboard */ }
+
+    @GetMapping("/api/{id}/embed")   @ResponseBody
+    public BiDashboardEmbedInfo apiGetEmbed(@PathVariable UUID id, Principal principal) { /* ... */ }
+
+    @PostMapping("/api/{id}/guest-token")   @ResponseBody
+    public ResponseEntity<Map<String, String>> getGuestToken(@PathVariable UUID id, Principal p) { /* ... */ }
+
+    @PostMapping("/api/{id}/refresh")   @ResponseBody
+    public ResponseEntity<?> apiRefresh(@PathVariable UUID id) { /* ... */ }
+}
+----
+
+Key points:
+
+* **`@ConditionalOnBean(BiDashboardProperties.class)`** — the controller disappears entirely if no BI configuration bean is registered. No BI module → no `/bi` URL, no menu entry, no role check noise.
+* **`@PreAuthorize("hasRole('BI_VIEW')")`** at the class level gates every endpoint uniformly — see <<user-roles>>.
+* **`@MenuItem(order = 1_100, name = "bi")`** places BI as a top-level menu entry (no `group`), very early in the menu ordering — matches the "dashboard first" convention.
+* **`view()` returns a Thymeleaf template path `/bi/view`** in *all* code branches including errors — the page renders the error banner inline rather than redirecting, so the user sees context.
+
+The JSON API endpoints (`/api/**`) are all `@ResponseBody` with explicit `produces = MediaType.APPLICATION_JSON_VALUE`. Error responses use `ResponseEntity.badRequest().body(Map.of(...))` with user-friendly `userMessage` keys translated through `RequestMessages` (see <<web-infrastructure-request-messages-entity-class-translation-common-message>>).
 
 === Dashboard Refresh API
 

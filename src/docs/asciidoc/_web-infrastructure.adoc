@@ -1,0 +1,1427 @@
+[[web-infrastructure]]
+[[admin-mvc]]
+= Admin Web Infrastructure — root, login, errors, catalog & element patterns
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The `com.timvero.web.common` package is the SDK's **admin-MVC foundation** — the server-rendered Thymeleaf back office that bank operators, underwriters, and support staff actually work in. It is distinct from `<<api-module>>` (REST/JSON for external callers) and from BI dashboards: this is the Spring MVC plumbing that turns catalog-typed reference data, entity tabs, and role-guarded fragments into a working admin UI.
+
+When you add this package to your `@ComponentScan`, you get:
+
+* **Root and login routing** — `/`, `/layout`, `/login`, `/oauth2`, password-change, session-expired, and OAuth2 client discovery
+* **HTML error pages and JSON exception handling** — a generic `/error` endpoint plus a `@RestControllerAdvice` that translates binding, validation, `AccessDenied`, and `NotFound` into structured responses
+* **Generic catalog admin UI** — an abstract `CatalogController<E, F>` that renders list/create/edit/enable/disable views for any `<<catalog>>`-typed entity, plus an auto-registry showing all catalogs in the side menu
+* **Entity-element pattern** — a shared base for tab/panel/fragment controllers attached to an entity page, with role derivation and a reusable Spring-Security pre-check predicate
+
+This doc mirrors `<<api-module>>`, which documents the REST side. Use both: REST-only projects can ignore this file, but any project with a Thymeleaf back office relies on every piece below.
+
+== What You Need to Know
+
+The module has three cooperating pieces — each independent, combine as needed:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |Role |Key types
+
+|**Admin MVC controllers**
+|Root-page routing, login page with OAuth2 client discovery, password-change, `/error` endpoint with Boot's `AbstractErrorController`, and a `@RestControllerAdvice` that serialises exceptions as JSON.
+|`RootController` +
+`LoginController` +
+`CommonErrorController` +
+`ExceptionControllerAdvice`
+
+|**Catalog admin pattern**
+|Generic admin-UI endpoints for `CatalogEntity` subclasses — list, new, edit, enable, disable — with role derivation from the controller's `@RequestMapping` path. `AllCatalogController` + `CatalogMapping` render a filtered index of every catalog the current user may view.
+|`CatalogController<E, F>` +
+`AllCatalogController` +
+`CatalogMapping`
+
+|**Entity element pattern**
+|URL-prefix-based base class for controllers that render sub-elements of an entity (tabs, panels, fragments, inline partial updates). Generates the element name and Spring Security role deterministically; `EntityElementSecurityChecker` exposes the `@PreAuthorize` engine as a reusable `Predicate` so menus and registries can filter by permission.
+|`EntityElementController<E>` +
+`PrefixedController` +
+`EntityElementSecurityChecker`
+|===
+
+== Admin MVC Controllers (common.controller)
+
+Four classes handle the cross-cutting HTTP surface every admin deployment needs.
+
+=== RootController
+
+`RootController` is the entry point for the admin servlet. It serves five paths, all `GET`:
+
+[cols="2,3,2", options="header"]
+|===
+|Path |Purpose |Returns
+
+|`/` (or empty)
+|Redirects the authenticated user to their role's start page via `user.getRole().getStartPage()`.
+|JSON `Redirect` body
+
+|`/layout`
+|Renders the Thymeleaf shell template. Exposes `main_path` (servlet prefix) and `maxFilesize` (megabytes, resolved from Spring's `MultipartConfigElement` if present) to the view.
+|`/templates/layout`
+
+|`/header`
+|Returns only the `header` fragment of `/templates/header` — used by fragment refreshes.
+|Thymeleaf fragment
+
+|`/menu` and `/settings-menu`
+|Render the left-nav and settings-menu fragments.
+|Thymeleaf fragments
+
+|`/oauth2`
+|Bootstrap page for OAuth2 logins (the post-redirect landing when the back office is behind an identity provider).
+|`/templates/oauth2`
+|===
+
+[source,java]
+----
+@GetMapping(value = {"", ROOT_PATH}, produces = MediaType.APPLICATION_JSON_VALUE)
+@ResponseBody
+public Redirect root(UserAccount user) {
+    return new Redirect(user.getRole().getStartPage());
+}
+----
+
+The `UserAccount` parameter is resolved by the SDK's `UserWebArgumentResolver` (see `<<api-module>>`) — no `SecurityContext` lookup needed. The JSON `Redirect` object is deserialised by the admin front end, which then navigates the browser.
+
+=== LoginController
+
+Bound to `SecurityConfig.LOGIN_PATH`. Handles four flows:
+
+. `GET /login` — if already authenticated, forwards to `/`. Otherwise renders the login page and enumerates OAuth2 client registrations (so each federated IdP appears as an icon tile).
+. `POST /login/failure` — the failure handler registered by `SecurityConfig`. Reads `WebAttributes.AUTHENTICATION_EXCEPTION`, maps it to a `FailureReason` (`BAD_CREDENTIALS`, `LOCKED`, `CREDENTIALS_EXPIRED`), and returns `403` with a localised JSON message.
+. `GET /login?expired` — session-expired landing page.
+. `POST /login/change-password` — validates the `PasswordForm` (old/new/confirm), rejects it if:
+  * new != confirm — `error.password.not.matches`
+  * new == old — `error.password.equal.previous`
+  * new fails `BackOfficeUserDetailsService.checkPasswordPatten()` — `error.password.pattern`
+  * new is in the user's password history (`UserAccountService.checkPasswordHistory`) — `error.password.used`
+  * current password is wrong — `login.bad.credentials`
+
+[source,java]
+----
+if (!userAccountService.changePassword(passwordForm.username, passwordForm.passwordNew, passwordForm.password)) {
+    errors.rejectValue("password", "login.bad.credentials");
+    throw new BindException(errors);
+}
+----
+
+Errors are thrown as `BindException` so `ExceptionControllerAdvice` (below) serialises them as field-keyed JSON. On success the controller returns `{"location": LOGIN_PATH}` and the browser posts its fresh credentials there.
+
+See `<<user-management>>` for `UserAccount` / `UserAccountService` / `BackOfficeUserDetailsService`.
+
+The `AttemptContainer` dependency is non-obvious: it tracks the last-N failed attempts per username. If `attempts <= 3`, the response shows `login.bad.attempts` (a counter); after that the message silently switches to `login.bad.credentials` so an attacker cannot distinguish "wrong password" from "account locked".
+
+=== CommonErrorController
+
+A minimal `AbstractErrorController` subclass mapped to `${server.error.path:${error.path:/error}}`. Every servlet-container or Spring MVC error (dispatcher forwards to `/error`) lands here.
+
+[source,java]
+----
+@RequestMapping(method = {RequestMethod.GET, RequestMethod.POST})
+@ResponseBody
+public ResponseEntity<String> error(HttpServletRequest request) {
+    HttpStatus status = getStatus(request);
+    if (status == HttpStatus.NO_CONTENT) {
+        return new ResponseEntity<>(status);
+    }
+    Object message = request.getAttribute(RequestDispatcher.ERROR_MESSAGE);
+    if (message != null) {
+        return new ResponseEntity<>(message.toString(), status);
+    }
+    Map<String, Object> body = getErrorAttributes(request, ErrorAttributeOptions.defaults());
+    return new ResponseEntity<>(body.toString(), status);
+}
+----
+
+Behaviour:
+
+* `204 No Content` — return an empty body (some browsers choke on `204` with a body).
+* An explicit `RequestDispatcher.ERROR_MESSAGE` attribute — return its `toString()`. Handlers elsewhere can set this via `response.sendError(status, message)`.
+* Otherwise — return the default `ErrorAttributes` map as a string.
+
+This is deliberately thin: the admin UI expects HTTP status codes and short text, and most exceptions are already serialised by `ExceptionControllerAdvice` before they ever reach `/error`.
+
+=== ExceptionControllerAdvice
+
+Registered at `@Order(900_000)` as a `@RestControllerAdvice`, so it returns JSON — not HTML error pages. The admin front end is a single-page app that posts to admin controllers and expects JSON back. This is the admin-MVC counterpart to `ApiExceptionControllerAdvice` (REST, order `950_000`) and the two co-exist without conflict: the admin advice loads first and handles admin paths; the REST advice handles anything it misses.
+
+[cols="2,1,3", options="header"]
+|===
+|Exception |HTTP Status |Response Body
+
+|`NoHandlerFoundException`, `NoResourceFoundException`, `NotFoundException`, `MethodArgumentTypeMismatchException`
+|404
+|`{"message": "no resource found"}`
+
+|`AccessDeniedException`
+|403
+|`{"message": "<exception message>"}`
+
+|`BindException`
+|400
+|`{"field1": ["<localised msg>"], "field2": [...]}` — grouped by `FieldError::getField`, resolved through `RequestMessages.fieldErrorMessages(...)`
+
+|`ValidationException` (SDK form / checker rejection)
+|400
+|Same structure as `BindException`, sourced from `Rejection` objects
+
+|`ActionNotAvailableException` (entity action runtime guard)
+|409 Conflict
+|`{"message": "<exception message>"}`
+
+|`MissingServletRequestParameterException`
+|400
+|`{"<paramName>": "This field requires value"}`
+|===
+
+Contrast with `ApiExceptionControllerAdvice` in `<<api-module>>`:
+
+[cols="2,2,2", options="header"]
+|===
+|Concern |Admin MVC (`ExceptionControllerAdvice`) |REST (`ApiExceptionControllerAdvice`)
+
+|Annotation
+|`@RestControllerAdvice` at order `900_000`
+|`@RestControllerAdvice` at order `950_000`
+
+|`AccessDenied`
+|Handled — `403` with message
+|Not handled (delegated to Spring Security)
+
+|`ActionNotAvailable`
+|Handled — `409` (entity actions are admin-only)
+|Not handled
+
+|`NotFound` aggregation
+|Includes `NoResourceFoundException`, `MethodArgumentTypeMismatchException`
+|Narrower set
+|===
+
+Both advisers delegate field-level message resolution to `RequestMessages` so `messages.properties` files drive both admin and REST error text.
+
+[[web-infrastructure-catalog-admin-pattern-common-catalog]]
+== Catalog Admin Pattern (common.catalog)
+
+`<<catalog>>` documents the persistence side (`CatalogEntity`, `CatalogService`, `CatalogEntityToDtoMapper`). The `common.catalog` package is the admin-UI counterpart — three classes that turn any catalog entity into a fully-wired CRUD page.
+
+=== CatalogController<E, F>
+
+Abstract base class. The two generics are:
+
+* `E extends CatalogEntity` — the JPA entity
+* `F` — the edit form / DTO (typically `@Valid`-annotated)
+
+In the constructor it resolves `entityClass`, `formClass`, and `elementPath` (from the subclass's `@RequestMapping` via `EntityActionPathRegistry.getClassMapping`). From `elementPath` it derives:
+
+* `elementName` = `"catalog" + "." + <path-with-dots>` — used for role descriptions and front-end fragment IDs
+* `viewRole` = `<ELEMENT_NAME_UPPER>_VIEW`
+* `editRole` = `<ELEMENT_NAME_UPPER>_EDIT`
+
+If the derived role happens to start with `ROLE_`, the constructor prepends `ENTITY_` — Spring Security strips the `ROLE_` prefix when evaluating `hasRole(...)`, so without this guard the check would silently pass.
+
+Each endpoint uses `@PreAuthorize("hasRole(this.viewRole)")` or `editRole`:
+
+[cols="2,2,3", options="header"]
+|===
+|Endpoint |Role |Behaviour
+
+|`GET /` → `list`
+|viewRole
+|Loads `catalogService.listAll(entityClass)`, renders `/catalog/list` with the subclass's `getTableTemplate(model)` as the table fragment.
+
+|`GET /new` → `create`
+|editRole
+|Instantiates `formClass` via `BeanUtils`, renders `/catalog/edit` with the subclass's `getFieldsTemplate(null, model)`.
+
+|`GET /{id}/edit` → `edit`
+|editRole
+|Loads the entity, runs `mapper.toForm(entity)`, renders `/catalog/edit` with `isActive` from the entity's `active` flag.
+
+|`POST /new`
+|editRole
+|`catalogService.persist(mapper.createEntity(form))`. On `DataIntegrityViolationException` / `ConstraintViolationException` calls the subclass's `validateConstraint(constraint, binding)` hook. Triggers `reloadPageHelper.reloadFragment(elementPath)` so open browsers refresh their table.
+
+|`POST /{id}/edit`
+|editRole
+|`catalogService.merge(entityClass, id, e -> mapper.toEntity(form, e))`. Same constraint-handling hook.
+
+|`POST /{id}/enable` / `POST /{id}/disable`
+|editRole
+|Toggles the `active` flag via `catalogService.enable/disable(entityClass, id)`. Returns `new Redirect(null)` (no navigation, just close the form).
+|===
+
+Two abstract methods the subclass implements:
+
+[source,java]
+----
+protected abstract String getTableTemplate(Model model) throws Exception;
+protected abstract String getFieldsTemplate(E entity, Model model) throws Exception;
+----
+
+Both return a Thymeleaf fragment reference. This lets each catalog supply its own column layout and form layout while the outer `/catalog/list` and `/catalog/edit` pages handle the chrome (buttons, modals, role-driven UI state).
+
+The `validateConstraint(constraint, binding)` hook lets subclasses translate database constraint names into field errors — for example mapping a unique-key violation on `code` to a field-level message. If the hook does not bind anything, the original exception rethrows.
+
+=== AllCatalogController
+
+A single `@Controller` at `/catalog`, registered in the left menu under the "setting" group (`@MenuItem(order = 900_140, name = "catalog", group = "setting")`). Its sole endpoint renders `/catalog/view` with a list of every catalog the current user may access — obtained from `CatalogMapping.getAvailableCatalogs(user)`.
+
+`saveNew` in `CatalogController` redirects here on success (`new Redirect(AllCatalogController.PATH)`), so creating a new row lands the user back on the catalog index.
+
+=== CatalogMapping
+
+A `@Service` that:
+
+. Injects `List<CatalogController<?, ?>>` — every `CatalogController` bean in the context.
+. In `@PostConstruct`, builds an `EntityRoleDetails("catalogs")` aggregating each controller's `getRoleDescriptions()` and registers it with `UserRoleRegister` — so catalog roles show up in the role-management UI (see `<<user-roles>>`).
+. Exposes `getAvailableCatalogs(UserAccount)` which iterates every controller and returns a `CatalogInfo` record for each one whose `list` method the current user is allowed to invoke.
+
+The security filter uses `EntityElementSecurityChecker.securityFilter(...)` (documented below) twice — once with `CatalogController.list(...)` to decide visibility, once with `CatalogController.create(...)` to decide whether the "new" button is enabled. Both `Method` handles are pre-resolved in fields — not per request — so the filter is a straight `@PreAuthorize` evaluation per controller.
+
+[source,java]
+----
+Predicate<CatalogController> viewSecurityFilter = securityChecker.securityFilter(authentication, viewMethod, model, user);
+Predicate<CatalogController> editSecurityFilter = securityChecker.securityFilter(authentication, editMethod, model, user);
+
+for (CatalogController controller : catalogs) {
+    if (viewSecurityFilter.test(controller)) {
+        boolean isEdit = editSecurityFilter.test(controller);
+        infos.add(new CatalogInfo(controller.getElementPath().substring(1), controller.getElementName(),
+            controller.getElementPath(), isEdit));
+    }
+}
+----
+
+`CatalogInfo` is a record of `(key, name, path, edit)` — `key` is the path without the leading `/`, used as the fragment anchor on the catalog-index page.
+
+== Entity Element Pattern (common.element)
+
+An "entity element" is anything rendered inside another entity's page: a tab, a side panel, an inline partial-update form, a fragment loaded on demand. The pattern gives every such element a stable URL, a predictable role, and a single place for security evaluation.
+
+=== PrefixedController
+
+A single-method interface:
+
+[source,java]
+----
+public interface PrefixedController {
+    String getPrefix();
+}
+----
+
+The prefix is a URL segment (for example `/client/{id}/tabs/documents`) composed of the parent entity's path and the element's own path. Consumers that route fragment requests use this prefix to find the right controller.
+
+=== EntityElementController<E>
+
+Abstract base for element controllers, implements `PrefixedController` and `ApplicationContextAware`. In the constructor — or in the default no-arg constructor via `ResolvableType` — it resolves:
+
+* `entityClass` from the generic `<E>`
+* `elementPath` from `@RequestMapping` on the subclass (via `EntityActionPathRegistry.getClassMapping`)
+
+On first call `getEntityPath()` looks up the parent entity's path in `EntityActionPathRegistry` (configured in your `@Configuration` — see `CustomWebConfiguration` in the example project), and `buildElementName()` produces:
+
+[source,java]
+----
+<entity-path-dots> + "." + getElementType() + <element-path-dots>
+// e.g. "client.tab.documents"
+----
+
+`getElementType()` is abstract — each concrete element supplies a category like `"tab"`, `"panel"`, `"action"`, `"view"`. Role derivation then mirrors `CatalogController`:
+
+[source,java]
+----
+String role = buildElementName().replace('.', '_').toUpperCase();
+if (role.startsWith("ROLE_")) {
+    role = "ENTITY_" + role;
+}
+----
+
+Same `ROLE_` guard as `CatalogController`. `getRoleDescriptions()` returns a one-element list that registry services aggregate into the role-management UI.
+
+The controller has access to `ApplicationContext` (via `ApplicationContextAware`) so element subclasses can resolve collaborators dynamically without `@Autowired` on the base — useful when different element types share the base but depend on different services.
+
+[NOTE]
+====
+`EntityElementController` does not define any `@GetMapping`/`@PostMapping` endpoints itself. The abstraction is: "here is the name, role, entity binding, and prefix — the subclass declares the endpoints." That is why elements can look so different (tab vs panel vs form) while sharing all the security and registry plumbing.
+
+`<<entity-actions>>` is one concrete specialisation — entity actions are one kind of entity element.
+====
+
+=== EntityElementSecurityChecker
+
+Exposes Spring Security's `@PreAuthorize` machinery as a reusable `Predicate`. Without this service you cannot ask "would the current user be allowed to call `list()` on this specific controller instance?" without actually invoking it.
+
+[source,java]
+----
+@PostConstruct
+protected void init() {
+    PreAuthorizeAuthorizationManager manager = new PreAuthorizeAuthorizationManager();
+    manager.setExpressionHandler(expressionHandlerProvider.getIfAvailable(() -> defaultExpressionHandler()));
+    this.manager = manager;
+}
+
+public <T> Predicate<T> securityFilter(Authentication authentication, Method method, Object... arguments) {
+    return target -> {
+        SimpleMethodInvocation invocation = new SimpleMethodInvocation(target, method, arguments);
+        return Optional.ofNullable(manager.check(() -> authentication, invocation))
+            .map(AuthorizationDecision::isGranted).orElse(true);
+    };
+}
+----
+
+Key points:
+
+* It builds a `SimpleMethodInvocation(target, method, arguments)` — a synthetic invocation that never actually calls the method. The authorization manager only *evaluates* the `@PreAuthorize` expression against it.
+* If the manager returns `null` (no expression on the method), the predicate defaults to `true` — i.e. methods without `@PreAuthorize` are treated as open.
+* The `MethodSecurityExpressionHandler` is looked up from the context; if absent, `EntityElementSecurityChecker` builds a `DefaultMethodSecurityExpressionHandler` and applies the project's `GrantedAuthorityDefaults` (role prefix).
+
+This is what makes `CatalogMapping` — and any menu/registry that filters by permission — a one-liner:
+
+[source,java]
+----
+Predicate<MyController> canView = securityChecker.securityFilter(auth, viewMethod, model, user);
+controllers.stream().filter(canView).forEach(...);
+----
+
+See `<<user-roles>>` for how the derived roles map to permission assignments.
+
+== Menu System (common.menu)
+
+Three classes turn the admin's left-nav menu into a zero-configuration discovery mechanism: a class-level annotation marks a controller as a menu entry, a `@Service` scans the Spring MVC handler map at startup, and a `@SessionScope` bean filters the result per authenticated user.
+
+=== MenuItem — the annotation
+
+`@MenuItem` is a `TYPE`-level annotation. Any `@Controller` (or `@RestController`) that carries it shows up in the menu:
+
+[source,java]
+----
+@MenuItem(order = 900_140, name = "catalog", group = "setting")
+@Controller
+@RequestMapping(AllCatalogController.PATH)
+public class AllCatalogController {
+    // ...
+}
+----
+
+Fields:
+
+* `order()` — sort key. The SDK uses large numbers (`900_140`) so you can slot project-specific entries in between without editing SDK code
+* `name()` — i18n key; resolves via `RequestMessages` when the template renders the menu
+* `group()` — optional group key (e.g. `"setting"`). Empty string = top-level entry
+
+Menu entries you register manually — `@MenuItem` on a custom `@Controller` — appear alongside the SDK's `AllCatalogController` entry with no further wiring.
+
+=== MenuMapping — discovery at startup
+
+`MenuMapping` is a `@Service` that runs once at `@PostConstruct`. It iterates every `RequestMappingInfo` in the `RequestMappingHandlerMapping` and keeps only `GET` handlers whose bean class is annotated with `@MenuItem`:
+
+[source,java]
+----
+for (Entry<RequestMappingInfo, HandlerMethod> entry : handlerMapping.getHandlerMethods().entrySet()) {
+    if (!entry.getKey().getMethodsCondition().getMethods().contains(RequestMethod.GET)) continue;
+    Class<?> beanType = entry.getValue().getBeanType();
+    if (beanType.isAnnotationPresent(MenuItem.class)) {
+        // ... collect as candidate
+    }
+}
+----
+
+For each candidate bean it picks the **shortest direct path** (if a controller has `/foo`, `/foo/list`, `/foo/view`, the menu entry links to `/foo`) and stores the corresponding `Method` — so `Menu` can later run `@PreAuthorize` evaluation against the exact handler.
+
+Two operational levers:
+
+* `menu.items.exclude` property — comma-separated set of `@MenuItem.name()` values to hide from the menu without removing the annotation. Useful for white-label deployments that disable features rather than recompiling
+* Assertion guard: if two beans claim the same `@MenuItem.name()`, startup fails with `Same menu item name 'X' for beans A and B` — no silent overrides
+
+=== Menu — the per-session registry
+
+`Menu` is `@SessionScope`. It's built once per HTTP session from `MenuMapping.getElements()` and the current `Authentication`. For each element it runs `EntityElementSecurityChecker.securityFilter(authentication, method)` against the resolved handler bean; entries the user cannot call are dropped, entries with a `group()` are collected into a `Group`.
+
+[source,java]
+----
+if (securityChecker.securityFilter(authentication, element.method())
+        .test(applicationContext.getBean(element.target()))) {
+    List<Item> items = StringUtils.hasLength(element.group())
+        ? groups.computeIfAbsent(element.group(), n -> new ArrayList<>())
+        : this.items;
+    items.add(new Item(element.name(), element.path()));
+}
+----
+
+The template binds to `Menu#getItems()` (top-level) and `Menu#getGroups()` (grouped). Because the bean is session-scoped, role changes require a logout/login to reflect — or invalidate the session bean explicitly if your project supports in-session role edits.
+
+See `<<user-roles>>` for how the underlying `@PreAuthorize` expressions hook into permissions; `<<catalog>>` and `<<entity-actions>>` are the two most common `@MenuItem` targets.
+
+[[web-infrastructure-request-messages-entity-class-translation-common-message]]
+== Request Messages & Entity Class Translation (common.message)
+
+Two tiny `@RequestScope` components that front the Spring `MessageSource` for admin views. Both construct a fresh `RequestContext` per request and delegate to it — so any contextual locale, theme, or `LocaleResolver` strategy configured elsewhere applies automatically.
+
+=== RequestMessages
+
+`RequestMessages` is the admin-side i18n facade. `ExceptionControllerAdvice` uses it to resolve field errors to strings; Thymeleaf templates inject it to format user-facing messages without calling `MessageSource` directly.
+
+[source,java]
+----
+@Component
+@RequestScope
+public class RequestMessages {
+    public String getMessage(String code, Object... args) { ... }
+    public String getMessageWithDefault(String code, String defaultMessage, Object... args) { ... }
+    public String message(String code, Object... args) { ... }
+    public Map<String, ?> fieldErrorMessages(Map<String, ? extends Collection<? extends MessageSourceResolvable>> fieldErrors) { ... }
+}
+----
+
+Two behaviours worth calling out:
+
+* **Bean-validation-style codes**: `message("{my.code}", args)` strips the surrounding braces before lookup. This lets you pass raw constraint descriptors straight from `ConstraintViolation.getMessageTemplate()` without splitting or trimming
+* **Field error flattening**: `fieldErrorMessages(Map<String, Collection<MessageSourceResolvable>>)` resolves every `MessageSourceResolvable` to a string under the current locale, returning `Map<String, Object>` — the exact shape `ExceptionControllerAdvice` serialises as JSON for the admin front end
+
+Note the **scope**: `@RequestScope`, not Spring MVC `FlashAttribute` / `RedirectAttributes`. `RequestMessages` is *not* a flash-message store — each request builds a fresh instance. If you need post-redirect-get flash messages, use Spring's `RedirectAttributes.addFlashAttribute` and read them back via `Model`; `RequestMessages` handles only the current-request lookup.
+
+=== EntityClassTranslator
+
+A minimal translator that maps an entity `Class<?>` to its localised human label:
+
+[source,java]
+----
+private String _translate(Class<?> entityClass) {
+    String translationKey = EnumUtils.getDefaultGroup(entityClass);
+    return context.getMessage(translationKey, new Object[]{}, translationKey);
+}
+
+public Map<String, String> translate(Map<String, Class<?>> entityClasses) {
+    return Lang.convertMap(entityClasses, this::_translate);
+}
+----
+
+`EnumUtils.getDefaultGroup(Class)` derives the translation key from the class name (e.g. `com.timvero.example.credit.Credit` → `"credit"`); if `messages.properties` has `credit=Credit`, the translator returns `"Credit"`; otherwise it falls back to the key itself. `translate(Map<String, Class<?>>)` converts a whole `(key → class)` map to `(key → label)` in one call — useful for populating filter dropdowns where the values are entity types.
+
+== OAuth2 (common.oauth2)
+
+`GoogleOauth2Configuration` is a one-bean `@Configuration` gated on the presence of a Google client id. It registers a `ClientRegistration` built from Spring Security's `CommonOAuth2Provider.GOOGLE`:
+
+[source,java]
+----
+@Configuration
+@ConditionalOnProperty("oauth2.client.registration.google.client-id")
+public class GoogleOauth2Configuration {
+
+    @Bean
+    ClientRegistration googleClientRegistration() {
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put(LoginController.OAUTH2_ICON, GOOGLE_ICON);
+        return CommonOAuth2Provider.GOOGLE.getBuilder("google")
+            .redirectUri(SecurityConfig.OAUTH2_REDIRECT_URI.replace("{mainPath}", mainPath))
+            .clientId(clientId)
+            .clientSecret(clientSecret)
+            .providerConfigurationMetadata(metadata)
+            .build();
+    }
+}
+----
+
+Three things make this more than a stock Spring Security registration:
+
+* **Conditional bean** — `@ConditionalOnProperty` means the bean does not exist when Google credentials are absent, so the login page does not render a dead tile
+* **Servlet-path-aware redirect** — `SecurityConfig.OAUTH2_REDIRECT_URI` is a template containing `{mainPath}` that gets replaced with `spring.mvc.servlet.path`. This keeps the redirect URL correct when the admin runs under a non-root servlet prefix
+* **Icon metadata** — `providerConfigurationMetadata(Map.of(LoginController.OAUTH2_ICON, "/assets/img/icon/google.png"))` is what `LoginController` picks up to render the tile. See the "OAuth2 Client Discovery" pattern below
+
+Configuration is via two properties:
+
+[source,properties]
+----
+oauth2.client.registration.google.client-id=...
+oauth2.client.registration.google.client-secret=...
+----
+
+On successful Google login, Spring Security hands control to the SDK's `OAuth2UserService` (outside this package) which maps the authenticated principal to a `UserAccount` — see `<<user-management>>`. The parallel REST/API-side OAuth2 flow is documented in `<<api-integration>>`.
+
+To add another IdP, copy this class: swap `CommonOAuth2Provider.GOOGLE` for `OKTA` / `GITHUB` / `FACEBOOK`, update the `@ConditionalOnProperty` key, point to a different icon asset. `LoginController` enumerates *every* `ClientRegistration` bean, so no further wiring is needed.
+
+== Static Resource Versioning (common.resource_version)
+
+Two small classes wire cache-busting for static assets: a Thymeleaf `LinkBuilder` that rewrites `/css/app.css` to `/css/app-<version>.css`, and a Spring `VersionStrategy` that computes the version from the file's last-modified timestamp.
+
+=== VersioningLinkBuilder
+
+Registered as a Thymeleaf `ILinkBuilder`. It extends `AbstractLinkBuilder` and delegates to a `StandardLinkBuilder` after resolving the base path through Spring MVC's `ResourceUrlProvider`:
+
+[source,java]
+----
+public class VersioningLinkBuilder extends AbstractLinkBuilder {
+    private final StandardLinkBuilder standardLinkBuilder = new StandardLinkBuilder();
+    private final ResourceUrlProvider urlProvider;
+
+    @Override
+    public String buildLink(IExpressionContext context, String base, Map<String, Object> parameters) {
+        String lookedUpLink = urlProvider.getForLookupPath(base);
+        return standardLinkBuilder.buildLink(context, lookedUpLink != null ? lookedUpLink : base, parameters);
+    }
+}
+----
+
+The effect: `@{/css/app.css}` in a Thymeleaf template renders as `/css/app-1a2b3c.css` (where `1a2b3c` is the version) when the resource is under a handler with a version strategy; otherwise it falls back to the original path unchanged. That fall-back is important — third-party absolute URLs and runtime-resolved paths keep working.
+
+=== LastModifiedVersionStrategy
+
+A `ContentVersionStrategy` subclass that uses the resource's `lastModified` timestamp, hex-encoded:
+
+[source,java]
+----
+public class LastModifiedVersionStrategy extends ContentVersionStrategy {
+    @Override
+    public String getResourceVersion(Resource resource) {
+        try {
+            long lastModified = resource.lastModified();
+            return Long.toHexString(lastModified);
+        } catch (IOException ex) {
+            throw new IllegalStateException("Failed to extract lastModified for " + resource, ex);
+        }
+    }
+}
+----
+
+Why `lastModified` and not `ContentVersionStrategy`'s default (MD5 of contents)?
+
+* **Cheaper** — no read of the file contents per build; a `File.lastModified()` syscall is enough
+* **Stable across rebuilds of unchanged files** — as long as the build preserves timestamps, two identical builds produce identical URLs (helpful for CDN cache reuse)
+* **Granular enough** — millisecond precision beats any practical cache TTL
+
+The trade-off: if you rewrite a file but somehow preserve its `lastModified` (`touch -t`, rsync without `-t`), the URL does not change and clients keep the stale version. Let your build pipeline handle timestamps naturally; do not `touch` generated assets.
+
+=== Wiring it together
+
+Register the strategy on the resource handler and expose the link builder to Thymeleaf:
+
+[source,java]
+----
+@Override
+public void addResourceHandlers(ResourceHandlerRegistry registry) {
+    registry.addResourceHandler("/css/**", "/js/**", "/assets/**")
+        .addResourceLocations("classpath:/static/")
+        .resourceChain(true)
+        .addResolver(new VersionResourceResolver()
+            .addVersionStrategy(new LastModifiedVersionStrategy(), "/**"));
+}
+
+@Bean
+VersioningLinkBuilder versioningLinkBuilder(ResourceUrlProvider urlProvider) {
+    return new VersioningLinkBuilder(urlProvider);
+}
+----
+
+In Thymeleaf the standard `@{...}` syntax picks up the link builder automatically:
+
+[source,html]
+----
+<link rel="stylesheet" th:href="@{/css/app.css}" />
+<script th:src="@{/js/app.js}"></script>
+----
+
+Both `<<thymeleaf-helpers-expression-objects-lazy-unwrapping>>` templates and `<<pebble-filters>>` equivalents should route asset URLs through this pipeline — never hardcode query-string versions (`?v=123`) in templates. Run the version strategy on every static handler and let the infrastructure do the work.
+
+[[web-infrastructure-entity-view-controllers]]
+== Entity View Controllers
+
+`WebFilterController<E, LF>` and `ViewableFilterController<ID, E, LF>` are the two bases that every entity page in the admin UI extends. They share a URL-derived role/name convention, delegate list/filter/export to `FilterListService`, and expose the same `@PreAuthorize("hasRole(this.viewRole)")` contract — but they differ in one crucial dimension: **does the entity have a dedicated per-id view page?**
+
+[cols="1,2,2", options="header"]
+|===
+|Aspect |`WebFilterController<E, LF>` |`ViewableFilterController<ID, E, LF>`
+
+|Generics
+|`E extends Persistable<?>`, `LF extends ListFilter`
+|`ID`, `E extends Persistable<ID>`, `LF extends ListFilter`
+
+|Endpoints it owns
+|`GET /` (filter page), `GET /table` (list), `GET /excel/{reportName}` (export)
+|Inherits all of the above, plus `GET /{id}` (view page) and the five `/{id}/comment*` note endpoints when `E implements HasNotes`
+
+|What the subclass must supply
+|`@RequestMapping("/path")`, the `E`/`LF` generics
+|Same, plus `ID` generic; optionally `getViewPage()`, `getHeaderPage()`, `assembleViewModel(entity, model)`
+
+|Role derivation
+|`<PATH>_VIEW` (plus per-report roles from `ExcelExportProcessor.getRole()`)
+|Same, plus `<PATH>_NOTES` when the entity implements `HasNotes` — see `<<has-notes>>`
+
+|Fits when
+|The entity has a filterable list but no standalone detail page — for example a read-only audit log browsed by filter only
+|The entity has both a list and a clickable detail page with tabs, actions, labels, notes
+|===
+
+In the SDK today almost every concrete admin entity extends `ViewableFilterController` — the plain `WebFilterController` base exists because `ViewableFilterController extends WebFilterController` and needs somewhere to put the list/filter machinery without coupling it to a view page.
+
+=== WebFilterController — the list/filter foundation
+
+The constructor performs the entire naming/role derivation from the class's `@RequestMapping`:
+
+[source,java]
+----
+this.rootPath = EntityControllerMapping.getClassMapping(this.getClass())
+    .orElseThrow(() -> new NoSuchElementException("No entity mapping for controller: " + this.getClass()));
+
+String role = rootPath.substring(1).replace('/', '_').toUpperCase() + "_VIEW";
+if (role.startsWith("ROLE_")) { // spring security prefix guard
+    role = "ENTITY_" + role;
+}
+this.viewRole = role;
+this.entityName = rootPath.substring(1).replace('/', '.');
+----
+
+From a `@RequestMapping("/credit")` annotation on the subclass you therefore get:
+
+[cols="2,3", options="header"]
+|===
+|Derived value |Example
+
+|`rootPath`
+|`/credit`
+
+|`viewRole`
+|`CREDIT_VIEW`
+
+|`entityName`
+|`credit`
+
+|`tablePage` (Thymeleaf)
+|`/credit/list`
+
+|`filterPage` (Thymeleaf)
+|`/form/list`
+|===
+
+Three endpoints are inherited:
+
+[source,java]
+----
+@PreAuthorize("hasRole(this.viewRole)")
+@GetMapping
+public String filter(Model model, Locale locale, BackOfficeUserDetails user) { ... }   // <1>
+
+@PreAuthorize("hasRole(this.viewRole)")
+@GetMapping("table")
+public String list(Model model, @Valid @ModelAttribute(FILTER_MODEL_ATTR) LF filter, ...) { ... }  // <2>
+
+@PreAuthorize("hasRole(this.getReportRole(#reportName))")
+@GetMapping("/excel/{reportName}")
+public ResponseEntity<InputStreamResource> excelDoc(...) { ... }                         // <3>
+----
+<1> Renders `/form/list` with `FilterDescriptor` (elements + current values), the `Restriction` enum for operator dropdowns, and one `ExcelProcessorModel` per permitted Excel export. See `<<list-filters-annotation-driven-jpa-query-dsl>>` for `FilterDescriptor` and `Restriction`.
+<2> The table-fragment endpoint. Binds `?` query params to a fresh `LF` instance via `@ModelAttribute`, persists the raw query string in session under `filterBuffer#<ClassSimpleName>`, and renders `<rootPath>/list` with the `Page<E>` result.
+<3> Export dispatcher. One endpoint covers any number of `ExcelExportProcessor<E>` beans the context holds for the entity class; each processor brings its own `getRole()`.
+
+Three plug-in points give subclasses control without overriding the `@GetMapping` methods:
+
+* `filterModel(Model)` — add extra attributes to the filter page (lookup lists, catalog dropdowns, feature flags). `ViewableFilterController` overrides this to inject `listActions`.
+* `saveFilter(HttpServletRequest)` / `getLastFilter(HttpServletRequest)` — the "remember last filter" feature. The UI uses these to restore the previous query string when a user re-enters the list page.
+* `getRoleDescriptions()` — return the list of roles this controller wants published to the role-management UI. The default returns only `viewRole`; subclasses append per-feature roles.
+
+The `FilterListService<E, LF>` is resolved lazily per instance — the subclass does not inject it. `getFilterListService()` looks for a typed bean in the context (e.g. a custom `FilterListService<ExampleCredit, ExampleCreditFilter>`) and otherwise falls back to a `DefaultFilterListService` that uses the SDK's `FilterSupport` with zero configuration. This is why a minimal list page needs **exactly** the controller plus `@RequestMapping` — no service wiring.
+
+[source,java]
+----
+// minimal WebFilterController usage — no view page
+@Controller
+@RequestMapping("/audit-log")
+public class AuditLogListController extends WebFilterController<AuditLog, AuditLogFilter> {
+    // No more code needed. /audit-log and /audit-log/table work out of the box.
+}
+----
+
+[NOTE]
+====
+`WebFilterController` relies on `EntityControllerMapping.getClassMapping(...)` to discover the `@RequestMapping` path at construction time. If you forget the annotation — or spell the path with missing leading slash — the constructor throws `NoSuchElementException: No entity mapping for controller: ...` at bean creation. Catch this in your boot log; the message points directly at the class that needs `@RequestMapping`.
+====
+
+=== ViewableFilterController — adding the view page + notes
+
+`ViewableFilterController` adds one primary endpoint and a family of note-management endpoints. The view page is straightforward:
+
+[source,java]
+----
+@PreAuthorize("hasRole(this.viewRole)")
+@GetMapping("/{id}")
+public String view(@PathVariable ID id, Model model, UserAccount user) {
+    E entity = loadEntity(id);
+    try {
+        Hibernate.initialize(entity);
+    } catch (EntityNotFoundException e) {
+        throw new NotFoundException("Entity not found: " + id, e);
+    }
+    model.addAttribute("entity", entity);
+    model.addAttribute("notesEnabled", notesEnabled(user));
+    model.addAttribute("actions", Lazy.of(() -> entityActionMapping.getAvailableActions(entity, getEntityClass())));
+    model.addAttribute("labels", Lazy.of(() -> entityLabelService.getLabelsForEntity(entity, getEntityClass())));
+    model.addAttribute("tabs",   Lazy.of(() -> entityTabService.getTabsForEntity(entity, getEntityClass())));
+
+    assembleViewModel(entity, model);
+    return viewPage;
+}
+----
+
+Three Spring Data `Lazy<...>` wrappers defer work that Thymeleaf may or may not need:
+
+* `actions` — pulls available `<<entity-actions>>` for this entity. Expensive: each action runs its availability check.
+* `labels` — resolves entity-label providers (the coloured pills in the top-right of a view page).
+* `tabs` — resolves the list of `EntityTabController` beans registered for this entity type, filtered by the current user's permissions.
+
+If the template does not reference `${actions}`, the action list is never computed. This matters when you render the same view under a reduced-feature role.
+
+Three override points let each entity customise the chrome without touching the handler method:
+
+[cols="1,2,2", options="header"]
+|===
+|Override |Default |Typical override
+
+|`getViewPage()`
+|`/common/view`
+|`/application/view`, `/client/view` — when the generic view shell is not enough
+
+|`getHeaderPage()`
+|`null` (no header)
+|`/credit/header`, `/client/header` — per-entity KPI band above the tabs
+
+|`assembleViewModel(entity, model)`
+|no-op
+|Add precomputed derived attributes for the header (e.g. next payment date, outstanding balance) so the template doesn't re-query
+|===
+
+Concrete example from this project:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/credit")
+@MenuItem(order = 5_300, name = "credit")
+public class ExampleCreditController extends ViewableFilterController<UUID, ExampleCredit, ExampleCreditFilter> {
+    public static final String PATH = "/credit";
+
+    @Override
+    protected String getHeaderPage() {
+        return "/credit/header";
+    }
+}
+----
+
+That's the complete controller. Twenty-two lines earn:
+
+* `GET /credit` — filter page with Excel exports
+* `GET /credit/table` — filtered list (session-persisted query string)
+* `GET /credit/{id}` — detail page with header, tabs, actions, labels
+* `GET /credit/excel/{reportName}` — one per `ExcelExportProcessor<ExampleCredit>` bean
+* Five note endpoints (see next subsection)
+
+Roles derived: `CREDIT_VIEW`, plus `CREDIT_NOTES` because `ExampleCredit` implements `HasNotes`.
+
+=== HasNotes auto-detection
+
+In `@PostConstruct` `ViewableFilterController.initNotes()` checks whether the entity class implements `HasNotes`:
+
+[source,java]
+----
+@PostConstruct
+protected void initNotes() {
+    if (HasNotes.class.isAssignableFrom(this.getEntityClass())) {
+        String role = getRootPath().substring(1).replace('/', '_').toUpperCase() + "_NOTES";
+        if (role.startsWith("ROLE_")) { role = "ENTITY_" + role; }
+        this.notesRole = role;
+    }
+}
+----
+
+When `notesRole` is non-null, five `@PreAuthorize("hasRole(this.notesRole)")` endpoints become part of the controller's URL map:
+
+[cols="2,3", options="header"]
+|===
+|Endpoint |Purpose
+
+|`GET /{id}/count_comments`
+|Badge count on the tab — returns `{"total": N}`
+
+|`GET /{id}/comment?pageNumber=&pageSize=`
+|Paged list of `Note(id, created, author, text, important, edited, canEdit)` records
+
+|`POST /{id}/comment` (text, important)
+|Add a new note
+
+|`GET /{id}/comment/{commentId}/history`
+|Return the edit history as `NoteChange(changed, text)` records
+
+|`POST /{id}/comment/{commentId}/edit` (text)
+|Edit the note; throws `AccessDeniedException` if the caller is not the original author
+
+|`POST /{id}/comment/{commentId}/pin` (important)
+|Toggle the "important" pin
+|===
+
+`canEdit` on the `Note` record is computed per-viewer: only the original author (matched through `UserAccountAuditor`) can edit. Other users see `canEdit=false` and the UI hides the pencil icon. This is also enforced server-side in `editComment` — the flag is advisory to the UI, authoritative in the handler.
+
+See `<<has-notes>>` for the entity-side contract (`HasNotes`, `EntityNote`, `EntityNoteService`, `EntityNoteChange`) and for how `NotesAvailabilityController` (below) uses the same auto-detection to answer cross-page "is notes enabled here?" queries.
+
+=== Quick decision guide
+
+[cols="2,3", options="header"]
+|===
+|Scenario |Base to extend
+
+|Entity with a list page only (no detail), e.g. an audit/event log
+|`WebFilterController<E, LF>`
+
+|Entity with list + detail + tabs (the default admin pattern)
+|`ViewableFilterController<ID, E, LF>`
+
+|Entity with list + detail + tabs + comments/notes
+|`ViewableFilterController<ID, E, LF>` — add `implements HasNotes` to `E`; the `*_NOTES` role appears automatically
+
+|Non-entity admin page (login, dashboard, menu)
+|Plain `@Controller` — the filter bases require `@RequestMapping` and an entity class
+|===
+
+== Entity URL Registry — EntityControllerMapping
+
+`EntityControllerMapping` is the admin-MVC answer to "given a `Class<? extends Persistable<?>>`, where do I link to its detail page?" Without it, the SDK would have to hardcode URL patterns or force every caller to inject the target controller directly — both fragile.
+
+The component is a `@Component` with two responsibilities:
+
+1. **Static helper** — `EntityControllerMapping.getClassMapping(Class<?> controllerType)` reads a controller class's `@RequestMapping` annotation (merged via `AnnotatedElementUtils`, so meta-annotations compose) and returns the first path, normalised to start with `/`. This is what `WebFilterController`, `ViewableFilterController`, `CatalogController`, and `EntityElementController` all call in their constructors.
+2. **Runtime registry** — at `@PostConstruct` it injects `Collection<WebFilterController<?, ?>>` (every filter controller bean), builds a `Map<Class<?>, Pair<String, Boolean>>` keyed by entity class, and remembers whether each controller is a `ViewableFilterController` (thus has a `/{id}` endpoint) or plain `WebFilterController` (list only).
+
+[source,java]
+----
+@PostConstruct
+protected void init() {
+    entities = new ConcurrentHashMap<>();
+    pathControllers = new ConcurrentHashMap<>();
+    for (WebFilterController<?, ?> controller : controllers) {
+        String path = getClassMapping(controller.getClass()).orElseThrow(...);
+        Class<?> entityClass = controller.getEntityClass();
+        boolean viewable = controller instanceof ViewableFilterController;
+        entities.put(entityClass, Optional.of(Pair.of(path, viewable)));
+        pathControllers.put(path, controller);
+    }
+}
+----
+
+=== Public API
+
+[cols="2,3", options="header"]
+|===
+|Method |Use
+
+|`getPath(Class<?>)`
+|`/credit` for `ExampleCredit.class`
+
+|`getLink(Class<?>, Object id)`
+|`/credit/<uuid>` — uses Spring MVC's `ConversionService` so non-string IDs (UUID, Long, enum) format the same way the URL binder would parse them
+
+|`isViewable(Class<?>)`
+|`true` if the registered controller is a `ViewableFilterController`. Used as a guard in `<<entity-actions>>` and `<<fast-search-system>>`: a plain `WebFilterController` has no `/{id}` to link to, so UI code must render the entity label as text rather than a link.
+
+|`getEntityClass(String path)`
+|Reverse lookup — "who owns `/credit`?" Returns a list because multiple entity subclasses can share one controller's path through the superclass fallback below.
+
+|`getController(String path)`
+|The controller bean itself — used by `NotesAvailabilityController` to reach `ViewableFilterController.notesEnabled(user)` across controllers without injecting each one.
+|===
+
+=== Superclass-chain fallback
+
+`getPathAndViewable(Class<?>)` caches misses through the superclass:
+
+[source,java]
+----
+private Optional<Pair<String, Boolean>> getPathRecursively(Class<?> entityClass) {
+    if (entityClass.equals(Object.class)) return Optional.empty();
+    Optional<Pair<String, Boolean>> pair = entities.get(entityClass);
+    if (pair == null) return getPathRecursively(entityClass.getSuperclass());
+    return pair;
+}
+----
+
+Consequence: if you register `CreditController extends ViewableFilterController<UUID, Credit, ...>` but some caller passes a proxy subclass (`Credit$$HibernateProxy` or a JPA inheritance subtype like `MortgageCredit extends Credit`), the registry still returns the `Credit` mapping. This is why `<<fast-search-system>>` can link to detail pages for polymorphic entities without every subclass registering its own controller.
+
+=== Consumers in the SDK
+
+* `EntityActionMapping` (see `<<entity-actions>>`) uses `getLink(entityClass, id)` when an action's `.onSuccess` redirects back to the entity's detail page.
+* `SearchController` (`<<fast-search-system>>`) uses `getLink(...)` as the fallback URL when an entity has no dedicated searchable URL builder.
+* `NotesAvailabilityController` (below) uses `getController(path)` + `instanceof ViewableFilterController`.
+* Every `WebFilterController` / `ViewableFilterController` constructor calls the *static* `getClassMapping(this.getClass())` to discover its own `rootPath`.
+
+[NOTE]
+====
+The static helper and the instance registry serve different callers by design: the static helper runs at *constructor time* (before Spring has injected collaborators) and has no access to sibling beans; the instance registry runs at `@PostConstruct` and can see the whole controller graph. Do not merge them — classes that extend `WebFilterController` must be able to derive their own `rootPath` without requiring any other bean.
+====
+
+[[web-infrastructure-exception-handling-commonexceptionhandler]]
+== Exception Handling — CommonExceptionHandler
+
+The SDK ships **two** `@ControllerAdvice` classes for the admin side. Understanding the split matters because they sit at different `@Order` values and overlap only partially.
+
+[cols="1,2,2", options="header"]
+|===
+|Aspect |`ExceptionControllerAdvice` |`CommonExceptionHandler`
+
+|Annotation
+|`@RestControllerAdvice`
+|`@ControllerAdvice`
+
+|Order
+|`900_000`
+|`CommonExceptionHandler.LOAD_ORDER = 1_000_000`
+
+|Runs when
+|First — catches the structured errors the admin front end expects (binding, validation, access-denied, not-found, action-not-available) and emits typed JSON responses
+|Last — catches everything the structured handler missed (`Exception` catch-all), including unknown runtime exceptions, external-service failures, upload size limits, and client aborts
+
+|Body shape
+|Field-keyed map: `{"field1": [...], "field2": [...]}` or `{"message": "..."}`
+|`{"noReport": boolean, "errorMessages": [...], "sentryEventId": "..."}`
+
+|Side effects
+|None beyond serialisation
+|`exceptionEntityService.saveException(...)` for external-service failures, `Sentry.setExtra(...)`, structured logger calls
+|===
+
+`CommonExceptionHandler` is the fallback-of-last-resort. Its `@ExceptionHandler(value = Exception.class)` handler walks a chain of instanceof checks:
+
+[source,java]
+----
+if (exception instanceof UndeclaredThrowableException) {
+    // licence.invalid → 402 Payment Required
+} else if (exception instanceof AccessDeniedException
+        || exception instanceof AuthenticationCredentialsNotFoundException) {
+    // 403 with messages[403]
+} else if (exception instanceof MaxUploadSizeExceededException) {
+    // 413 with human-readable size (KB/MB/GB)
+} else if (exception instanceof ExternalServiceUnavailableException extExc) {
+    // 503 — save exception entity, emit Sentry event, log at error or info level
+} else if (isClientAbortException(exception)) {
+    // 500 but only a WARN log — do not spam Sentry for client disconnects
+} else {
+    // 500 — show-code UUID, Sentry event, full error log
+}
+----
+
+Three behaviours worth calling out:
+
+* **Client abort filtering.** `isClientAbortException` walks the cause chain and matches Tomcat's `ClientAbortException`, Spring MVC's `AsyncRequestNotUsableException`, and `IOException: Broken pipe`. These are classified as client-side failures and logged at WARN — no Sentry, no error-entity, no show-code. Without this filter Sentry drowns in noise from users closing tabs mid-request.
+* **External service exception with two logging tiers.** If `exceptionEntityService.isLogExternalServiceException()` is true the failure logs at ERROR, otherwise at INFO. The distinction lets ops dial down noise from a deliberately flaky third-party without losing the persisted `ExternalServiceException` record.
+* **Sentry event correlation.** On a generic 500, if Sentry is enabled and captured an event, the response body carries `sentryEventId` and `noReport=true` — suppressing the generic "paste this code to support" prompt because support can look up the Sentry event directly.
+
+The `LOAD_ORDER = 1_000_000` is a public constant so project-specific advice can position itself above or below:
+
+[source,java]
+----
+@RestControllerAdvice
+@Order(CommonExceptionHandler.LOAD_ORDER - 1)   // run before the catch-all
+public class ProjectSpecificAdvice {
+    // ...
+}
+----
+
+[NOTE]
+====
+`CommonExceptionHandler` is package-private (`class CommonExceptionHandler`, no `public`). That is deliberate: it exists to be picked up by Spring's component scan when the `com.timvero.web.common` package is included, not to be extended or wired directly. The public constant `LOAD_ORDER` is the only surface you touch from outside the package.
+====
+
+[[web-infrastructure-ui-alerts-button-styling-alerts]]
+== UI Alerts & Button Styling — Alerts
+
+`Alerts` is the server-to-browser toast channel used by async handlers (entity actions, operations, checker results) to push a flash notification to a specific user's currently-open admin session. It is a `@Service`, not a constants class.
+
+[source,java]
+----
+public enum AlertType { SUCCESS, INFO, WARNING, DANGER }
+
+public static class Alert {
+    private final String type;   // lowercase enum name
+    private final String text;
+}
+
+public static final String ALERT_URL = "/queue/alert";
+----
+
+The four `AlertType` values mirror Bootstrap's alert/button modifiers (`alert-success`, `btn-danger`, etc.) — this is where `<<entity-actions>>` reads the "highlight" style for action buttons.
+
+=== Publishing flow
+
+[source,java]
+----
+public void add(UserAccount user, AlertType type, String message, Object... args) { ... }
+public void add(UserAccount user, AlertType type, String[] messages, Object... args) { ... }
+public void addIfExists(UserAccount user, AlertType type, String[] messages, Object... args) { ... }
+public void addRaw(UserAccount user, AlertType type, String text) { ... }
+----
+
+The message codes compose as `alert.<message>.<type-lowercase>` — so `add(user, DANGER, "payment.failed")` resolves `alert.payment.failed.danger` from `messages.properties`. If you pass *multiple* message codes they are tried in order (via Spring's `DefaultMessageSourceResolvable`), making it easy to fall back from a specific code to a generic one.
+
+`addIfExists(...)` is the "don't spam on missing messages" variant: on first `NoSuchMessageException` the composite key is remembered in `ignoreMessages`, and subsequent calls with the same key are silently skipped. Use this for opportunistic notifications (e.g. "a checker found X, tell the user if there's a translated message for it, otherwise stay quiet").
+
+Delivery uses `SimpMessagingTemplate.convertAndSendToUser(username, "/queue/alert", alert)` — so alerts ride the same STOMP broker wired by `WebSocketConfig` (below). The admin front end subscribes to `/user/queue/alert` after authentication; only the intended user sees the toast.
+
+=== Usage patterns
+
+[source,java]
+----
+// From an entity action's execute method
+@Component
+public class ApproveApplicationAction implements EntityAction<Application> {
+    @Autowired private Alerts alerts;
+
+    @Override
+    public void execute(Application app, UserAccount operator) {
+        applicationService.approve(app);
+        alerts.add(operator, AlertType.SUCCESS,
+            new String[]{"application." + app.getStatus() + ".approved", "application.approved"},
+            app.getNumber());
+    }
+}
+----
+
+Two codes are tried: the status-specific one first, then a generic fallback. If neither exists, the user sees the last code string verbatim — which is the signal to add a translation.
+
+[NOTE]
+====
+Alerts do **not** survive a page refresh. They are STOMP messages delivered to an open session. For persistent notifications see `<<notifications>>` — the unread-count badge and message inbox are a different mechanism built on `EntityNotification`. `Alerts` is for "you just clicked a button and here is the result."
+====
+
+== WebSocket Configuration — WebSocketConfig
+
+`WebSocketConfig` is the single STOMP/SockJS wiring class for the admin back office. Every live-updating feature in the SDK rides this broker: `Alerts`, `<<reload-infrastructure-live-ui-updates-on-entity-changes>>`, `<<counters>>` badges, and entity-action progress streams.
+
+[source,java]
+----
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    public static final String WS_PATH = "/ws";
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint(WS_PATH + "/general").setAllowedOriginPatterns("*").withSockJS();
+    }
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/queue/", "/topic/", "/app/");
+        registry.setApplicationDestinationPrefixes("/user/queue", "/user/app");
+        registry.setPreservePublishOrder(true);
+    }
+
+    @Bean
+    NoticeHandler noticeHandler() { return new NoticeHandler(); }
+}
+----
+
+Five things worth knowing:
+
+* **Single endpoint, SockJS fallback.** `/ws/general` is the only STOMP endpoint. `withSockJS()` negotiates a WebSocket first and falls back to XHR-streaming or long-polling for clients behind misbehaving proxies. The admin UI assumes this endpoint exists — all subscription URLs are relative to it.
+* **Three broker prefixes** (`/queue/`, `/topic/`, `/app/`). Queue is for user-scoped messages (the `convertAndSendToUser` calls from `Alerts` and `<<notifications>>`); topic is for broadcasts (`<<reload-infrastructure-live-ui-updates-on-entity-changes>>`, `<<counters>>`); app is reserved for inbound messages from client → server.
+* **Application destination prefix is user-scoped.** `/user/queue` + `/user/app` mean inbound client messages are namespaced per authenticated principal — a user cannot spoof another user's destination.
+* **Ordered delivery.** `setPreservePublishOrder(true)` guarantees messages reach each subscriber in publish order. Without this, a rapid "operation started / operation finished" sequence could arrive reversed and the UI would show the finished state before the in-progress state.
+* **NoticeHandler bean.** The inner `@Bean` instantiates `NoticeHandler` from `com.timvero.web.common.dashboard` — the dashboard notice broadcaster. It has to be declared *inside* `WebSocketConfig` because it depends on the broker being already enabled at that point in the bean graph.
+
+`WS_PATH = "/ws"` is a public constant so the front end can reference it without hardcoding: `mainPath + WebSocketConfig.WS_PATH + "/general"`.
+
+[NOTE]
+====
+The `simp` broker is in-memory — messages are not persisted or replicated. If you scale the admin to multiple JVMs, either session-affinity-route the WebSocket connection to a specific node or swap `enableSimpleBroker(...)` for `enableStompBrokerRelay(...)` pointing at RabbitMQ / ActiveMQ. The switch is a one-line change to this config; downstream publishers (`Alerts.template.convertAndSendToUser(...)`, `ReloadPageHelper`) do not change.
+====
+
+== Small Utilities
+
+Three tiny classes round out the package. Each is less than 50 lines but solves a specific cross-cutting problem.
+
+=== NotesAvailabilityController
+
+An `@RestController` at `/notes-availability/check-path` that answers a single question: "does the controller owning this URL have notes enabled for this user?" The UI uses it when rendering cross-entity widgets that could potentially host a notes tab — dashboards, timelines, recent-activity feeds — without knowing at render time which of the linked entities implement `HasNotes`.
+
+[source,java]
+----
+@GetMapping("/check-path")
+public Response check(@RequestParam String path, UserAccount user) {
+    return new Response(notesAvailable(path, user));
+}
+
+private boolean notesAvailable(String path, UserAccount user) {
+    if (!StringUtils.hasLength(path)) return false;
+    if (path.startsWith("/")) path = path.substring(1);
+    String[] tokens = path.split("/");
+    if (tokens.length != 2) return false;                              // <1>
+    return controllerMapping.getController('/' + tokens[0])
+        .filter(c -> c instanceof ViewableFilterController<?, ?, ?>)   // <2>
+        .map(ViewableFilterController.class::cast)
+        .filter(c -> c.notesEnabled(user))                             // <3>
+        .isPresent();
+}
+----
+<1> Expects the shape `/<rootPath>/<id>` — deeper paths (tabs, sub-elements) return `false`.
+<2> Only `ViewableFilterController` has the notes plumbing; plain `WebFilterController` cannot host notes.
+<3> `notesEnabled` combines "the entity class implements `HasNotes`" with "the user has the derived `*_NOTES` role" — see the `ViewableFilterController` section above.
+
+No configuration needed. The bean is autoloaded by component scan and reuses `EntityControllerMapping`'s registry.
+
+=== TranslationsController
+
+A three-line `@RestController` at `/translations` that serves the admin UI's JavaScript i18n layer:
+
+[source,java]
+----
+@GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
+public Map<String, String> translations(@RequestParam("code") String[] codes, Locale locale) {
+    return Arrays.stream(codes).collect(Collectors.toMap(Function.identity(),
+        code -> messageSource.getMessage(code, args, "__" + code + "__", locale)));
+}
+----
+
+Calling `GET /translations?code=foo&code=bar&code=baz` returns `{"foo": "...", "bar": "...", "baz": "..."}` resolved through the same `MessageSource` that powers Thymeleaf `#{...}` lookups. Missing codes come back as `"__<code>__"` — visible sentinel strings that make untranslated UI strings obvious in QA without breaking the page layout.
+
+[NOTE]
+====
+The sentinel `"__code__"` format is a convention downstream consumers rely on — JS i18n helpers detect the leading/trailing double underscore and render a debug tooltip in dev builds. Do not change the sentinel format unless you audit all JS callers.
+====
+
+=== Redirect
+
+A 16-line value class that carries a target URL as a JSON body:
+
+[source,java]
+----
+public class Redirect {
+    private final String location;
+    public Redirect(String location) { this.location = location; }
+    public String getLocation() { return location; }
+}
+----
+
+Used by `RootController`, `CatalogController.save*`, and any admin handler that needs to tell the single-page front end "after this response, navigate to X." The front-end router reads `location` and performs a client-side navigation — no HTTP 302, no re-render, no full reload. A `null` location (`new Redirect(null)`) is the convention for "close the modal, stay where you are" — used after the catalog enable/disable toggles.
+
+[NOTE]
+====
+Do not confuse `com.timvero.web.common.Redirect` with Spring MVC's `RedirectView` or `"redirect:/..."` prefix. `Redirect` is a JSON DTO the front end interprets — it is not an HTTP 302. Returning `"redirect:/foo"` from an admin handler produces a real server-side redirect, which the single-page app does not handle correctly.
+====
+
+[[web-infrastructure-control-controller]]
+== Control Panel — ControlController + ControlButton
+
+The **Settings → Control** page (`/control`) is a pluggable dashboard of one-shot operator buttons: refresh counters, rebuild Lucene indexes, reload reference data, clear caches, warm the scheduler. Every button is a `ControlButton` bean — modules contribute their own buttons by implementing the interface; the SDK discovers them at startup:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/control")
+public class ControlController {
+
+    @Autowired(required = false)
+    private List<ControlButton> controlButtons;                     // <1>
+
+    @PreAuthorize("hasRole('" + SYSTEM_CONTROL + "')")
+    @GetMapping
+    public String control(Model model, BackOfficeUserDetails user) {
+        List<ControlButton> buttons = new ArrayList<>(
+            controlButtons != null ? controlButtons : List.of());
+        buttons.removeIf(b -> !user.hasPermission(b.permission()));  // <2>
+        model.addAttribute("controlButtons", buttons);
+        return "/settings/control";
+    }
+
+    @PreAuthorize("hasRole('" + SYSTEM_CONTROL + "')")
+    @GetMapping("/{code}")
+    @ResponseBody
+    public Redirect button(@PathVariable String code,
+                           BackOfficeUserDetails user) {
+        if (controlButtons != null) {
+            for (ControlButton button : controlButtons) {
+                if (button.code().equalsIgnoreCase(code)
+                        && user.hasPermission(button.permission())) {
+                    button.execute();                                // <3>
+                    break;
+                }
+            }
+        }
+        return new Redirect(PATH);                                   // <4>
+    }
+}
+----
+<1> `required = false` — a deployment with no `ControlButton` beans registered renders an empty page rather than failing startup. Most apps ship with at least `RefreshCountersControlButton` and `UpdateIndexesControlButton`.
+<2> Two-layer permission check: the `@PreAuthorize("SYSTEM_CONTROL")` gates the page itself, then each button is filtered by its *own* `permission()` — so a user with `SYSTEM_CONTROL` but not `COUNTERS_RESET` sees the Control page but not the "Refresh counters" button.
+<3> `execute()` runs synchronously in the request thread. Buttons that do heavy work (reindex, regenerate) typically kick off async background tasks and return immediately rather than blocking the page.
+<4> After execution, `Redirect(PATH)` sends the front end back to `/control` — the page re-renders with updated state.
+
+Key points:
+
+* **No `@MenuItem` on the controller itself** — the Control page is rendered as part of the project's settings UI or reached via a dedicated menu entry in the project's configuration. Some deployments hide it entirely from non-admins.
+* **`button.code()`** is the URL segment — case-insensitive match lets templates use human-friendly labels (`"refreshCounters"` vs `"REFRESH_COUNTERS"`).
+* **Every `ControlButton` implementation** declares its own `permission()` — see the SDK's `RefreshCountersControlButton` / `UpdateIndexesControlButton` for the canonical pattern, and contribute your own by just dropping a Spring `@Component` that implements `ControlButton` into your module.
+* **Failed button execution** is not surfaced through the controller — buttons catch their own errors and emit `Alerts.add(...)` or log. A thrown exception propagates to `CommonExceptionHandler` (see <<web-infrastructure-exception-handling-commonexceptionhandler>>).
+
+[[web-infrastructure-system-setting-controller]]
+== System Settings — SystemSettingController
+
+A read-only view page at `/systemSettings` exposes the contents of `SystemSettingsService` (values from `application.properties`, environment variables, DB-backed override tables) so admins can confirm runtime configuration without SSH access:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/systemSettings")
+@PreAuthorize("hasRole('" + SYSTEM_CONTROL + "')")
+@MenuItem(order = 900_910, name = "systemSettings", group = "setting")
+public class SystemSettingController {
+
+    @Autowired private SystemSettingsService systemSettingsService;
+
+    @GetMapping
+    public String getSettings(Model model) {
+        model.addAttribute("systemSettings", systemSettingsService.getSystemSettings());
+        return "/settings/view";
+    }
+}
+----
+
+Key points:
+
+* **Same `SYSTEM_CONTROL` permission** as `ControlController` — both pages expose operational state that should never leak to normal business users.
+* **Single endpoint.** There is no edit endpoint here: settings are read-only at the HTTP layer. Edits happen through property file changes + restart, or through dedicated admin pages for specific setting groups (feature flags, notification thresholds, etc.), not through this dashboard.
+* **`@MenuItem(group = "setting", order = 900_910)`** — sits in the **Settings** menu near the other system-level pages (control panel, calendar, export, templates).
+* **`SystemSettingsService.getSystemSettings()`** returns whatever shape the project chooses (typically a `Map<String, String>` or a structured DTO). The Thymeleaf template at `/settings/view` iterates and renders a table.
+
+A typical deployment pairs this page with `ControlController` in the same menu section: **Settings → System Settings** lets support verify configuration, **Settings → Control** lets them act on it.
+
+[[web-infrastructure-advanced-patterns]]
+== Advanced Patterns
+
+=== Contrasting Exception Handlers — admin vs REST
+
+Run both advisers side-by-side when the same deployment serves admin MVC and external REST:
+
+[source,java]
+----
+@RestControllerAdvice
+@Order(HIGHEST_PRECEDENCE)                 // <1>
+public class CustomExceptionControllerAdvice {
+
+    @ExceptionHandler(PreconditionFailedException.class)
+    public ResponseEntity<Map<String, String>> handlePreconditionFailed(PreconditionFailedException exception) {
+        return new ResponseEntity<>(
+            Map.of("message", exception.getMessage()),
+            responseHeaders(),
+            HttpStatus.PRECONDITION_FAILED
+        );
+    }
+}
+----
+<1> Higher priority than both SDK advisers (`900_000` admin, `950_000` REST). Your project-specific handlers load first; anything they don't catch falls through to the SDK pair.
+
+=== OAuth2 Client Discovery
+
+`LoginController` injects `List<ClientRegistration>` as `required = false`. If you register OAuth2 clients through Spring's standard `spring.security.oauth2.client.registration.*` properties, they appear as tiles on the login page automatically:
+
+[source,java]
+----
+model.addAttribute("oauth2Clients",
+    clientRegistrations.stream().map(r -> new Oauth2Client(r.getClientName(),
+        mainPath + SecurityConfig.OAUTH2_CLIENT_URI + "/" + r.getRegistrationId(),
+        String.valueOf(r.getProviderDetails().getConfigurationMetadata().get(OAUTH2_ICON)))));
+----
+
+The icon URI comes from the OIDC provider's configuration metadata under the key `iconUri` — populate it from your IdP's discovery document or hard-code it per environment.
+
+=== Role Derivation Convention
+
+Both `CatalogController` and `EntityElementController` derive roles from paths the same way. The convention lets a permissions spreadsheet map 1:1 to the URL tree:
+
+[cols="2,2,2", options="header"]
+|===
+|Controller path |Element name |Derived role(s)
+
+|`/catalog/country` on `CatalogController`
+|`catalog.country`
+|`CATALOG_COUNTRY_VIEW`, `CATALOG_COUNTRY_EDIT`
+
+|`/documents` (tab on `/client`)
+|`client.tab.documents`
+|`CLIENT_TAB_DOCUMENTS`
+|===
+
+Administrators assign roles via `<<user-roles>>`; any controller following this pattern shows up in the role-assignment UI automatically through `UserRoleRegister`.
+
+=== ReloadPageHelper After Catalog Writes
+
+`CatalogController.saveNew` calls `reloadPageHelper.reloadFragment(this.elementPath)`. The admin front end opens a WebSocket to the server; when the helper broadcasts a reload for a given path, every open browser viewing that path refreshes its table fragment without a full navigation. This is the "live admin UI" behaviour — add `reloadFragment(...)` to any write endpoint you own if you want the same feel for custom catalogs.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Scan `com.timvero.web.common` in the admin Spring Boot app** — not in a REST-only deployment. `CustomWebConfiguration` with `@ConditionalOnWebApplication` is a good template
+* {ok} **Extend `CatalogController<E, F>` for every `CatalogEntity`** — you get 7 endpoints, role derivation, and `<<user-roles>>` registration for free
+* {ok} **Implement `getTableTemplate` and `getFieldsTemplate`** as thin Thymeleaf fragment references — keep the table and form layouts in templates, not in Java strings
+* {ok} **Override `validateConstraint(name, binding)`** to translate unique-key violations into field errors — users see "code already exists" instead of a 500
+* {ok} **Use `EntityElementSecurityChecker.securityFilter(...)`** when building custom menus or registries — never re-implement `@PreAuthorize` evaluation
+* {ok} **Register OAuth2 clients via Spring's standard properties** — `LoginController` picks them up automatically
+* {ok} **Put project-specific `@ControllerAdvice` at `@Order(HIGHEST_PRECEDENCE)`** — the SDK advice at `900_000` catches what you don't
+* {ok} **Extend `ViewableFilterController<ID, E, LF>` for every admin entity with a detail page** — you get list, filter, Excel export, `/{id}` view, and (if `E implements HasNotes`) the five note endpoints for free
+* {ok} **Extend `WebFilterController<E, LF>` only when there is no detail page** — audit logs, event streams, read-only browsers
+* {ok} **Route URL resolution through `EntityControllerMapping.getLink(entityClass, id)`** — never hardcode `/credit/` + id string concatenation
+* {ok} **Use `Alerts.add(user, AlertType.X, codes, args)`** for transient toast notifications from async handlers — codes compose as `alert.<message>.<type>` and fall back through the message array
+* {ok} **Use `addIfExists(...)` for optional notifications** where the message translation may legitimately not exist — the first miss is cached and suppressed
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Hand-rolling a catalog CRUD controller** when `CatalogController<E, F>` already provides 7 endpoints, role derivation, and reload-fragment broadcasting
+* {bad} **Hardcoding role strings** like `@PreAuthorize("hasRole('CATALOG_COUNTRY_VIEW')")` — let `CatalogController` / `EntityElementController` derive them so renames of the `@RequestMapping` path automatically propagate
+* {bad} **Registering another `@RestControllerAdvice` at a lower order than `900_000`** for generic exceptions — it will shadow the SDK handlers and you lose localised field error messages
+* {bad} **Returning HTML from admin controllers on validation failure** — the admin front end expects JSON error maps; return `BindException` and let `ExceptionControllerAdvice` serialise it
+* {bad} **Calling `SecurityContextHolder.getContext().getAuthentication()` in a controller method** when `UserAccount` (or `BackOfficeUserDetails`) can be resolved via the argument resolver — see `<<api-module>>`
+* {bad} **Adding menu entries for catalogs manually** — `AllCatalogController` + `CatalogMapping` already render every `CatalogController` bean the user can view
+* {bad} **Evaluating `@PreAuthorize` by re-parsing the annotation yourself** — `EntityElementSecurityChecker.securityFilter` is the supported extension point
+* {bad} **Hardcoding menu items in templates or a config class** — annotate the controller with `@MenuItem(order, name, group)`; `MenuMapping` discovers it from the handler map and `Menu` filters per session
+* {bad} **Assigning the same `@MenuItem.name()` to two controllers** — startup asserts uniqueness and fails fast; if you need the same label in two places, make them different i18n keys and translate to the same string
+* {bad} **Using `RequestMessages` as a flash-message store across redirects** — it is `@RequestScope`; use `RedirectAttributes.addFlashAttribute` for post-redirect-get messages
+* {bad} **Hardcoding static-asset URLs with manual `?v=...` query strings** — register `LastModifiedVersionStrategy` on the resource handler and let `VersioningLinkBuilder` rewrite every `@{/...}` URL
+* {bad} **Calling `touch` on built static assets without a genuine content change** — `LastModifiedVersionStrategy` keys off the timestamp; identical content with a fresh `mtime` invalidates caches for no reason
+* {bad} **Hand-rolling a list/filter controller with `@GetMapping` methods** when `WebFilterController<E, LF>` already wires filter binding, session persistence, Excel export dispatch, and role derivation
+* {bad} **Returning `"redirect:/..."` from an admin handler** where the single-page front end expects a `Redirect` JSON body — the browser performs a full-page navigation instead of a client-side transition
+* {bad} **Hardcoding role strings like `"CREDIT_VIEW"` or `"CREDIT_NOTES"`** — they are derived from `@RequestMapping` + `HasNotes`; a rename of the path must propagate automatically
+* {bad} **Publishing toast messages through `model.addAttribute(...)` or `RedirectAttributes.addFlashAttribute(...)` when the work runs async** — the request has already returned; use `Alerts.add(user, type, codes)` so the toast reaches the user's open session over STOMP
+* {bad} **Subscribing to `/queue/alert` or `/topic/reload` directly in JS without authenticating the WebSocket first** — `WebSocketConfig` relies on the SockJS handshake carrying Spring Security's session; unauthenticated subscribers see empty queues
+* {bad} **Catching `Exception` in a custom `@ControllerAdvice` at an order higher than `CommonExceptionHandler.LOAD_ORDER`** — you silently shadow the SDK's Sentry correlation, client-abort filtering, and external-service logging
+* {bad} **Calling `SecurityContextHolder.getContext().getAuthentication()` inside a `ViewableFilterController` handler** — inject `UserAccount` as a method parameter; the SDK argument resolver already did the lookup
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `spring.mvc.servlet.path` is set for the admin servlet and matches the base href in the Thymeleaf layout
+* {todo} `server.error.path` (or `error.path`) is either unset or pointed at `/error` so `CommonErrorController` receives dispatcher errors
+* {todo} Every `CatalogController` subclass has its derived `*_VIEW` and `*_EDIT` roles assigned to at least one production role (check via `<<user-roles>>` UI after deployment)
+* {todo} `AttemptContainer` is backed by a shared cache if the admin runs in more than one JVM — otherwise lockout counts reset per node
+* {todo} `application.security.oauth2.client.registration.*` is populated if you advertise OAuth2 login tiles; each provider has an `iconUri` in its configuration metadata
+* {todo} Custom `@RestControllerAdvice` classes have `@Order(HIGHEST_PRECEDENCE)` so they run before `ExceptionControllerAdvice` (admin, 900_000) and `ApiExceptionControllerAdvice` (REST, 950_000)
+* {todo} Constraint names referenced in `validateConstraint(...)` match the actual DB constraints — name them explicitly in `@Table(uniqueConstraints = ...)` rather than relying on Hibernate-generated names
+* {todo} `reloadPageHelper.reloadFragment(...)` is called after any write that should refresh open admin sessions — custom catalog endpoints, status transitions, external-event handlers
+* {todo} Password policy (`BackOfficeUserDetailsService.checkPasswordPatten`) and history length (`UserAccountService.checkPasswordHistory`) are configured for the target jurisdiction — both are invoked by `LoginController.savePasswordChange`
+* {todo} Swagger and REST controllers are excluded from the admin security chain so `ApiExceptionControllerAdvice` answers for REST paths — not `ExceptionControllerAdvice`
+* {todo} `menu.items.exclude` is set to the hidden-feature menu-item names if this deployment ships a subset of the SDK's standard menu (white-label builds)
+* {todo} `oauth2.client.registration.google.client-id` / `client-secret` and any additional IdP keys are populated only for environments that should expose federated login — missing properties silently disable the tile via `@ConditionalOnProperty`
+* {todo} Static resource handler is configured with `VersionResourceResolver` + `LastModifiedVersionStrategy` for every directory served as an asset (`/css/**`, `/js/**`, `/assets/**`) — without this, `VersioningLinkBuilder` passes URLs through unchanged
+* {todo} Build pipeline preserves file `mtime` on unchanged assets (e.g. `rsync -t`, Maven copy-resources default) so repeated deploys of the same artifact do not invalidate CDN caches
+* {todo} Every `ViewableFilterController` subclass carries a single `@RequestMapping("/path")` whose path matches the `*_VIEW` (and optional `*_NOTES`) roles in the role-management spreadsheet — run `EntityControllerMapping` through a startup smoke test that asserts no duplicate paths
+* {todo} `/ws/general` is exempt from CSRF and reachable from the admin origin — STOMP over SockJS does not carry the XSRF token automatically
+* {todo} The STOMP broker is sized for the deployment — single-JVM uses `enableSimpleBroker`; multi-JVM clusters switch to `enableStompBrokerRelay(...)` so `Alerts`, `<<reload-infrastructure-live-ui-updates-on-entity-changes>>`, and `<<counters>>` messages reach subscribers on other nodes
+* {todo} Project-specific `@ControllerAdvice` runs above `CommonExceptionHandler.LOAD_ORDER (1_000_000)` — test by throwing a handled exception and asserting the custom body shape reaches the client
+* {todo} `ExternalServiceUnavailableException`s raised from integration code carry a `serviceName` and (optionally) a `messageCode` — `CommonExceptionHandler` surfaces both in the UI response and in the persisted `ExceptionEntity`
+* {todo} `messages.properties` contains `alert.<code>.success|info|warning|danger` entries for every `Alerts.add(...)` call-site, plus generic fallbacks — untranslated codes render as the code string until `addIfExists(...)` silences them
+* {todo} `/translations` is reachable without authentication (or with a permissive authenticator) so the JS i18n layer can bootstrap before login; missing codes return as `__code__` sentinel strings, visible in QA
+
+---
+
+**Related:** <<catalog>>, <<api-module>>, <<entity-actions>>, <<user-management>>, <<user-roles>>, <<forms>>
+
+**Next:** <<entity-actions>>

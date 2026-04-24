@@ -1,0 +1,995 @@
+[[credit-servicing]]
+= Credit Servicing — SDK internals
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+This chapter is the SDK-reference companion to the <<credit-management>> tutorial. While that tutorial shows **how** to assemble a working credit product, this one documents **what** the `com.timvero.servicing.credit` package actually ships: the `Credit` entity hierarchy, the immutable `CreditSnapshot` that materialises calculation results, the `CreditOperation` tree, the extensible `CreditStatus` enum, the four domain events that fire during calculation, and the tabs / filters / history suppliers / notification events / actions that every credit implementation reuses.
+
+The package covered here is the domain core — entities, events, and support components. The calculation engine that produces snapshots from operations (`CreditCalculationService`, `AccrualService`, `DistributionService`, `LoanEngine`, `ScheduledEngine`, operation handlers) lives one package up in `com.timvero.servicing.engine` and is documented in <<credit-operations-framework>> and <<servicing-engines>>. The separation matters: `servicing.credit` defines **state**, `servicing.engine` defines **behaviour**. You extend state; the engine rewrites snapshots for you.
+
+== What You Need to Know
+
+The 35-file module breaks down into 11 subpackages. Eight of them are public surface you extend or subscribe to; three (`label`, `filter`, `history`) are convenience wrappers.
+
+[cols="1,3", options="header"]
+|===
+|Subpackage |Role
+
+|`entity`
+|The persistent core. `Credit` (abstract, `@Inheritance(SINGLE_TABLE)`, `credit_type` discriminator), `CreditSnapshot` (immutable per-day state with embedded `Debt`), `CreditStatus` (extensible `CustomCoddedEnum` with an `isEnding()` flag that gates all "active-loan" logic), and `CreditFeeRepository`.
+
+|`entity.debt`
+|`Debt` — an `@Embeddable` `Map<String, MonetaryAmount>` persisted as JSON. The canonical bucketed debt representation used in every snapshot, every distribution, and every accrual result.
+
+|`entity.operation`
+|`CreditOperation` tree: the abstract parent (also `@Inheritance(SINGLE_TABLE)`, `operation_type` discriminator, with `@PreRemove` that forbids deletion), the two built-in concrete types `CreditPayment` (type=200) and `CreditFee` (type=300), the `OperationStatus` lifecycle (PENDING / APPROVED / DECLINED / CANCELED), the `Distribution` / `CreditOperationDistribution` audit trail that records what each operation did to the debt, and `AbstractOperationService` — the base class every custom operation service extends to get pessimistic-lock loading and automatic recalculation.
+
+|`event`
+|Four Spring events fired by the calculation engine: `CreditSnapshotChangeEvent`, `CreditStatusChangeEvent`, `CreditCalculationDateChangeEvent`, and `CreditCalculationRequestCompliteEvent`. These are the extension points for past-due detection, notifications, downstream sync, and metrics.
+
+|`notification`
+|Two abstract `NotificationEvent` listeners wired to `CreditCalculationDateChangeEvent`: `AbstractPastDueNotificationEvent` and `AbstractPaymentSoonNotificationEvent`. Subclass, implement two abstract methods, and past-due / upcoming-payment notifications flow through the <<notifications>> template system.
+
+|`tab`
+|Three Thymeleaf tab controllers: `AbstractCreditAccrualsTab` (accrual engine breakdown — see <<credit-accruals-tab>>), `AbstractCreditCalculationTab` (day-by-day snapshot ledger), `CreditPaymentsTab` (payments with their distribution history). These are the visual windows into the internal state.
+
+|`controller` / `filter`
+|`AbstractPaymentController<F>` + `PaymentController` — a cross-credit payment list view gated by `core.payment.controller.enabled`. `PaymentFilter` / `PaymentFilterService` drive the filter panel.
+
+|`action`
+|`AbstractCalculatePayOffAmountAction<T>` — a reusable "calculate the payoff amount for a future date" button that uses `CreditCalculationService.extendCredit()` + `AccrualService.calculateAccurals()` to produce a forward-looking debt projection.
+
+|`history`
+|Two `HistoryEventSupplier` implementations for the <<entity-history>> timeline: `CreditAddedHistorySupplier<C>` (creation event) and `CreditPaymentHistorySupplier` (payment / refund events via Envers revisions).
+
+|`label`
+|`OperationPaymentStatusLabel<P>` — a generic `EntityStatusLabel` bound to `CreditOperation::getStatus`. Subclass with a concrete operation type and register as a `@Component` to colour-code rows in list views.
+
+|Root (`CreditViewOptions`)
+|A Spring bean that declares the display order of debt accounts (`PRINCIPAL`, `INTEREST`, `PAST_DUE_PRINCIPAL`, ...) used by every tab and action that renders a `Debt`. One `@Bean` per project.
+|===
+
+== Architecture Overview
+
+[source]
+----
+                       com.timvero.servicing.credit
+                       ────────────────────────────
+
+ Credit  (abstract, @Inheritance SINGLE_TABLE, discriminator = credit_type)
+   │
+   │   + startDate                    ── fixed at origination
+   │   + calculationDate              ── "up to which day the engine has processed"
+   │   + actualSnapshot  ───────────────────► CreditSnapshot   (latest materialised)
+   │   + creditSnapshots : SortedMap<LocalDate, CreditSnapshot>   (full history)
+   │   + operations      : List<CreditOperation>                  (ordered by date)
+   │
+   ▼ 1 credit
+CreditOperation  (abstract, @Inheritance SINGLE_TABLE, discriminator = operation_type)
+   │   + date, status : OperationStatus, order, isEndDayOperation()
+   │   + distributions : List<CreditOperationDistribution>
+   │        │
+   │        └── Distribution   type = ADJUST | CANCEL, debt : Debt, ditributedAt
+   │
+   ├── CreditPayment (type 200)   amount, initialAmount, paymentType, isRefunded()
+   ├── CreditFee     (type 300)   ledger, amount
+   └── (project operations: ChargeOperation 901, AccrualOperation 950, PastDueOperation 900,
+        VoidOperation 995, CloseOperation 999 — see <<credit-operations-framework>>)
+
+CreditSnapshot  (@Immutable, one row per (credit, date))
+   ├─ date   : LocalDate
+   ├─ status : CreditStatus   (extensible CustomCoddedEnum, ending-flag drives lifecycle)
+   └─ debt   : Debt  (@Embeddable → JSON Map<String, MonetaryAmount>)
+
+
+                 Engine -writes→                  Engine -fires→
+CreditOperation ───────────────► CreditSnapshot ────────────────► Spring ApplicationEvent
+(new / updated)                  (new / replaced)                  │
+                                                                   ├── CreditSnapshotChangeEvent
+                                                                   ├── CreditStatusChangeEvent
+                                                                   ├── CreditCalculationDateChangeEvent
+                                                                   └── CreditCalculationRequestCompliteEvent
+                                                                          │
+                                                      listeners ──────────┤
+                                                                          ├── AbstractPastDueNotificationEvent
+                                                                          ├── AbstractPaymentSoonNotificationEvent
+                                                                          └── project-specific listeners
+----
+
+The key invariant: `actualSnapshot` always equals `creditSnapshots.get(calculationDate)`. The engine maintains both on every successful calculation pass. Everything that reads "the current state of the credit" reads `actualSnapshot`; everything that reads "the state on a past date" uses `getCreditSnapshot(date)` which falls back to the nearest prior entry.
+
+== The `Credit` Entity
+
+=== Structure
+
+`Credit` is abstract and uses single-table inheritance, so every concrete credit type you define shares one physical `credit` table, disambiguated by the integer `credit_type` discriminator:
+
+[source,java]
+----
+@Entity
+@Table(name = "credit")
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@DiscriminatorColumn(name = "credit_type", discriminatorType = DiscriminatorType.INTEGER)
+@EntityListeners(AuditingEntityListener.class)
+public abstract class Credit extends UUIDPersistable implements NamedEntity {
+
+    @Column(name = "start_date", nullable = false)
+    private LocalDate startDate;
+
+    @OneToOne(fetch = FetchType.EAGER, cascade = CascadeType.ALL)
+    @Fetch(FetchMode.JOIN)
+    @JoinColumn(name = "actual_snapshot")
+    private CreditSnapshot actualSnapshot;                       // <1>
+
+    @Column
+    private LocalDate calculationDate;                           // <2>
+
+    @OneToMany(fetch = FetchType.LAZY, cascade = CascadeType.ALL, orphanRemoval = true)
+    @JoinColumn(name = "credit_id", nullable = false)
+    @MapKey(name = CreditSnapshot_.DATE)
+    private SortedMap<LocalDate, CreditSnapshot> creditSnapshots; // <3>
+
+    @OneToMany(fetch = FetchType.LAZY, cascade = CascadeType.ALL, orphanRemoval = true)
+    @JoinColumn(name = "credit_id")
+    @OrderBy(value = "date")
+    private List<CreditOperation> operations;                    // <4>
+
+    // Spring Data JPA auditing via AbstractAuditable-style columns
+    @CreatedDate  Instant createdAt;
+    @CreatedBy    Auditor createdBy;
+    @LastModifiedDate  Instant updatedAt;
+    @LastModifiedBy    Auditor updatedBy;
+}
+----
+<1> `actualSnapshot` is eagerly fetched because virtually every UI render (tabs, counters, filters, labels) needs to see the current status and debt.
+<2> `calculationDate` is the high-water mark: the engine has computed snapshots up to and including this date. It moves forward on every `calculate()` call; it can also move *backwards* if an operation is back-dated, triggering recalculation.
+<3> The snapshots map is keyed by date. `getCreditSnapshot(date)` uses `SortedMap.headMap(date.plusDays(1)).lastKey()` to return the snapshot "effective as of" a given date — handy when you need to see "what did this loan look like on 2025-06-15" without requiring an exact match.
+<4> All operations — payments, fees, and every project-defined operation — live in one list, ordered by date. Sort by `CreditOperation.compareTo()` (end-of-day flag → order → type → createdAt → id) to replay them in processing order.
+
+=== Key Behaviours
+
+[cols="1,3", options="header"]
+|===
+|Method |Purpose
+
+|`getOperations(Class<T>, OperationStatus...)`
+|Typed stream filter: `credit.getOperations(CreditPayment.class, OperationStatus.APPROVED)` returns only approved payments, ready for reduce operations.
+
+|`getPayments()`
+|Shortcut for approved `CreditPayment` stream — used by `CreditPaymentsTab`, `CreditPaymentHistorySupplier`, and any aggregate like "total paid to date".
+
+|`getCreditSnapshot(LocalDate)`
+|"Floor" lookup — returns the last snapshot whose date is ≤ the argument. Use this for historical queries.
+
+|`getActualSnapshot()`
+|Current state. **Never read stale** because the engine updates it inside the same transaction as the operation that triggered recalculation. Reading it inside a listener of `CreditSnapshotChangeEvent` gives you the post-calculation value.
+|===
+
+=== Extending Credit
+
+Every concrete subclass picks an integer discriminator and adds the product-specific fields:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("1")                                 // <1>
+public class ExampleCredit extends Credit implements NamedEntity, HasCovenant {
+
+    @NotNull
+    @OneToOne(fetch = FetchType.EAGER)
+    @JoinColumn(nullable = false)
+    private Application application;
+
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn(name = "condition")
+    @Fetch(FetchMode.JOIN)
+    private ExampleCreditCondition condition;
+
+    @Override
+    public String getDisplayedName() {                   // <2>
+        return "Loan for " + getApplication().getBorrowerParticipant().getDisplayedName();
+    }
+
+    @Transient
+    public LocalDate getMaturityDate() {
+        return getStartDate().plus(getCondition().getPeriod().multipliedBy(getCondition().getTerm()));
+    }
+}
+----
+<1> The discriminator value is a **database-wide** identity — once assigned, do not change it or existing rows become invisible.
+<2> `NamedEntity.getDisplayedName()` drives every UI rendering that shows "the name of this credit": list rows, notification subjects, document variables, launchpad cards.
+
+Custom repositories can extend `SynchronousAccessRepository` to inherit `LockUtils`-backed pessimistic locking:
+
+[source,java]
+----
+public interface ExampleCreditRepository
+        extends JpaRepository<ExampleCredit, UUID>,
+                JpaSpecificationExecutor<ExampleCredit>,
+                SynchronousAccessRepository<ExampleCredit, UUID> {
+
+    ExampleCredit findByOperationsIn(CreditOperation... operation);       // <1>
+}
+----
+<1> JPA-derived query using the `operations` collection — useful in payment controllers to go from a `CreditPayment` back to its owning `Credit`.
+
+== Snapshots: The Materialised State
+
+`CreditSnapshot` is deliberately immutable. Every calculation produces a *new* snapshot for a given date; the engine replaces the map entry and updates `actualSnapshot` atomically.
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_snapshot")
+@Immutable                                                         // <1>
+public class CreditSnapshot extends BasePersistable<Long> {
+
+    @Column(name = "date", nullable = false, updatable = false)
+    private LocalDate date;
+
+    @Column(name = "credit_status", nullable = false)
+    @Type(CustomCoddedEnumType.class)                              // <2>
+    private CreditStatus status;
+
+    @Embedded
+    private Debt debt;                                             // <3>
+
+    public boolean isSimilarTo(CreditSnapshot other) {             // <4>
+        return Objects.equals(date, other.date)
+            && Objects.equals(debt, other.debt)
+            && Objects.equals(status, other.status);
+    }
+}
+----
+<1> `@Immutable` — Hibernate skips dirty-checking. Mutating a snapshot in code is silently ignored at flush time; re-persist a new one instead.
+<2> `CustomCoddedEnumType` resolves the `int` code in the column to the registered `CreditStatus` bean. Unknown codes throw at query time — catch this in migrations.
+<3> The `Debt` embeddable lives in the same `credit_snapshot` row (no join), keyed by the parent's id.
+<4> Used by the engine to decide whether to fire `CreditSnapshotChangeEvent`. If a recalculation produces a snapshot "similar to" the prior one (same date, same status, same debt), no event is fired and no downstream listeners run.
+
+=== Debt — The Bucketed Balance
+
+`Debt` is the single representation of "how much is owed and in what form". It appears in `CreditSnapshot`, in every `Distribution`, and in every `AccrualEngine` result.
+
+[source,java]
+----
+@Embeddable
+public class Debt {
+
+    public static final Debt ZERO = new Debt(Map.of());
+
+    @Column(name = "debt", nullable = false, updatable = false)
+    @JdbcTypeCode(SqlTypes.JSON)                                   // <1>
+    private Map<String, MonetaryAmount> accounts;
+
+    public Debt(Map<String, MonetaryAmount> accounts) {
+        this.accounts = new HashMap<>(accounts);
+        this.accounts.entrySet().removeIf(e -> e.getValue().isZero()); // <2>
+    }
+
+    public Optional<MonetaryAmount> getAccount(String accountName) { ... }
+    public Optional<MonetaryAmount> getTotal()   { /* reduce MonetaryAmount::add */ }
+    public Debt add(Debt other)                  { /* merge and sum */ }
+    public Debt subtract(Debt other)             { return add(other.negate()); }
+    public Debt negate()                         { /* map each entry to .negate() */ }
+    public boolean isEmpty()                     { return accounts.isEmpty(); }
+}
+----
+<1> Stored as a JSON column — new account types don't require schema migrations. Hibernate 6's `@JdbcTypeCode(SqlTypes.JSON)` handles PostgreSQL `jsonb` automatically.
+<2> Zero-valued accounts are pruned on construction. This keeps `isEmpty()` correct and avoids "PRINCIPAL: $0.00" noise in the UI. It also means that `debt.getAccount("PRINCIPAL").isEmpty()` and `debt.getAccount("PRINCIPAL").get().isZero()` are semantically equivalent — prefer the former.
+
+Account names are **project-defined strings**. `CreditCalculationConfiguration` in `timvero-example` declares:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[tag=account-types]
+----
+
+The order these appear in matters for UI — wire it through the `CreditViewOptions` bean (see below).
+
+=== Why SortedMap?
+
+`Credit.creditSnapshots` is a `SortedMap<LocalDate, CreditSnapshot>` (initialised lazily as `TreeMap`) so `headMap(date)` / `tailMap(date)` / `firstKey()` / `lastKey()` are O(log n) without a round-trip. The engine relies on this for "find all snapshots between calculation-from and calculation-to" during recalculation.
+
+== The CreditStatus Lifecycle
+
+`CreditStatus` is not a standard Java enum — it's a `CustomCoddedEnum`, which means statuses are **declared as `@Bean`s** and new ones can be added by any module:
+
+[source,java]
+----
+public final class CreditStatus extends CustomCoddedEnum<CreditStatus> {
+    private boolean ending;
+    public CreditStatus(String name, int code, boolean ending) { ... }
+    public boolean isEnding() { return ending; }
+}
+----
+
+The `ending` flag is the single most-checked boolean in the codebase. When `true`, the credit is terminal (paid off, written off, voided) and:
+
+* Past-due notifications stop firing (`AbstractPastDueNotificationEvent.handle`)
+* Payment-soon notifications stop firing (`AbstractPaymentSoonNotificationEvent.handle`)
+* The payoff-amount action is hidden (`AbstractCalculatePayOffAmountAction.isAvailable`)
+* Accrual engines skip new accruals (convention, not enforced)
+
+=== Declaring Statuses
+
+In `CreditCalculationConfiguration`:
+
+[source,java]
+----
+public static final CreditStatus PENDING = new CreditStatus("PENDING", 1000, false);
+public static final CreditStatus ACTIVE  = new CreditStatus("ACTIVE",  1100, false);
+public static final CreditStatus CLOSED  = new CreditStatus("CLOSED",  2000, true);   // <1>
+public static final CreditStatus VOID    = new CreditStatus("VOID",    2100, true);
+----
+<1> `ending = true` — terminal state.
+
+The integer code is what lands in the database column. Pick codes carefully — changing them is a data migration. The convention in `timvero-example` is: `1xxx` non-terminal, `2xxx` terminal, leaving room (1200, 1300, …) for intermediate business states like "IN_GRACE_PERIOD" or "RESTRUCTURED".
+
+=== Status Transitions
+
+The engine never transitions statuses by itself — that's the `LoanEngine`'s responsibility. `BasicLoanEngine(PENDING)` (from `servicing.engine.general`) starts a credit in PENDING at origination; operation services (like `CloseOperation`) transition it. See <<credit-operations-framework>> for the full operation-to-status wiring.
+
+When the engine writes a snapshot whose status differs from the previous snapshot, `CreditStatusChangeEvent` fires — see the events section.
+
+== Operations — The Mutation Log
+
+=== CreditOperation
+
+Every state change to a `Credit` is an operation. Operations are persisted, ordered, never deleted, and replayed by the engine to produce snapshots.
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_operation")
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@DiscriminatorColumn(name = "operation_type", discriminatorType = DiscriminatorType.INTEGER)
+@Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)     // <1>
+public abstract class CreditOperation extends AbstractAuditable
+        implements Comparable<CreditOperation> {
+
+    private static final Comparator<CreditOperation> OPERATION_COMPARATOR =
+        Comparator.comparing(CreditOperation::isEndDayOperation)   // <2>
+            .thenComparing(CreditOperation::getOrder)
+            .thenComparing(CreditOperation::getType)
+            .thenComparing(CreditOperation::getCreatedAt)
+            .thenComparing(CreditOperation::getId);
+
+    @Column(name = "operation_type", nullable = false, insertable = false, updatable = false)
+    private Integer type;
+
+    @Column(name = "date", nullable = false)
+    private LocalDate date;
+
+    @Column(name = "status", nullable = false)
+    @Type(EnumCodeType.class)
+    private OperationStatus status;
+
+    @OneToMany(fetch = FetchType.LAZY, mappedBy = "operation", cascade = {CascadeType.REFRESH})
+    @NotAudited
+    private List<CreditOperationDistribution> distributions;       // <3>
+
+    @PreRemove                                                     // <4>
+    protected void preRemove() {
+        throw new UnsupportedOperationException("Remove of CreditOperation is not allowed");
+    }
+
+    public abstract boolean isEndDayOperation();                   // <5>
+
+    @Transient
+    public int getOrder() { return getType(); }                    // <6>
+}
+----
+<1> Envers is enabled for operation history but related entities (like `Credit`) are not re-audited with each revision, which would explode the revision table.
+<2> The processing order: end-of-day operations run *after* intraday operations for the same date; among operations in the same tier, `getOrder()` wins, then the integer type, then creation timestamp, then id. Stable and deterministic.
+<3> A `CreditOperationDistribution` records "this operation moved this `Debt` delta on this date". Multiple distributions per operation are the norm (one per day on a multi-day accrual, for example). `@NotAudited` — distributions are the audit trail; auditing the audit trail adds no information.
+<4> Operations are append-only. If you need to "cancel" one, change its status to CANCELED and let the engine record an `ADJUST`/`CANCEL` distribution. This preserves the history that regulators expect.
+<5> Intraday vs end-of-day — see <<credit-operations-framework>>.
+<6> Subclasses override `getOrder()` to pin their processing position (e.g., `ChargeOperation` returns 101, `PastDueOperation` returns 900).
+
+=== OperationStatus Lifecycle
+
+[source,java]
+----
+public enum OperationStatus implements Codded {
+    PENDING  (100),   // created but not yet effective
+    APPROVED (110),   // effective, participates in calculation
+    DECLINED (130),   // rejected; never participates
+    CANCELED (180);   // was effective, now reversed
+    public boolean in(OperationStatus... statuses) { ... }
+}
+----
+
+Only APPROVED operations alter the debt; the engine filters the rest. `Credit.getPayments()` already implies APPROVED.
+
+A common pattern in operation services:
+
+[source,java]
+----
+operation.setStatus(OperationStatus.CANCELED);
+creditCalculationService.calculate(creditId, operation.getDate(), credit.getCalculationDate());
+----
+
+The engine sees the status change and emits an `ADJUST` distribution negating the original effect.
+
+=== Distribution — The Per-Operation Debt Delta
+
+`Distribution` (mapped-superclass) + `CreditOperationDistribution` (concrete, in `credit_operation_distribution`) capture **what each operation did to the debt on each date**:
+
+[source,java]
+----
+@MappedSuperclass
+@Immutable
+public abstract class Distribution extends BasePersistable<Long> {
+    @Enumerated(EnumType.ORDINAL)
+    private DistributionType type;    // ADJUST | CANCEL
+
+    @Embedded
+    private Debt debt;                // signed delta — negative = reduces debt
+
+    @Column(name = "ditributed_at")   // sic — database column name
+    private Instant ditributedAt;
+}
+----
+
+`CreditOperation.getFinalDebt()` reduces all distributions to a single `Debt` — useful for reporting "net effect of payment X".
+
+`CreditPaymentsTab` uses `CreditOperationDistributionRepository.findAllByOperationIn(payments)` to batch-load distributions and render a compact per-payment breakdown.
+
+=== Built-in Operation Types
+
+Two concrete operations ship with the module; everything else is project-defined.
+
+==== CreditPayment (type 200)
+
+[source,java]
+----
+@Entity @DiscriminatorValue("200")
+public class CreditPayment extends CreditOperation implements NamedEntity {
+    public static Integer TYPE = 200;
+
+    @Type(CustomEnumType.class)
+    private CreditPaymentType creditPaymentType;       // <1>
+
+    @Embedded @CompositeType(MonetaryAmountType.class)
+    private MonetaryAmount amount;
+
+    @Column(name = "initial_amount", updatable = false)
+    private BigDecimal initialAmount;                  // <2>
+
+    public boolean isRefunded() { return !getAmount().isEqualTo(getInitialAmount()); }
+    public boolean isCanceled() { return getAmount().isZero(); }
+
+    @Override public boolean isEndDayOperation() { return false; }
+}
+----
+<1> `CreditPaymentType` is another `CustomEnum` — declare `GENERAL`, `EARLY`, `PAYOFF`, etc. as `@Bean`s. Routes to different payment handlers in the payment hub.
+<2> `initialAmount` is immutable. A partial refund decreases `amount` but leaves `initialAmount` alone; `isRefunded()` compares the two.
+
+==== CreditFee (type 300)
+
+A thin operation with a free-form `ledger` string (e.g., `"ORIGINATION_FEE"`) and a `MonetaryAmount`. Query via `CreditFeeRepository`; filter by ledger in client code. Most projects extend it — e.g., `ChargeOperation` (discriminator `901`) in `timvero-example` is a richer variant.
+
+=== AbstractOperationService
+
+Every project-defined operation service extends this base class:
+
+[source,java]
+----
+public abstract class AbstractOperationService {
+
+    @Autowired protected EntityManager entityManager;
+    @Autowired @Lazy protected CreditCalculationService creditCalculationService;
+
+    protected final Credit loadCredit(UUID creditId) {
+        return LockUtils.lock(creditId, Credit.class,
+                              LockModeType.PESSIMISTIC_WRITE, entityManager);       // <1>
+    }
+
+    protected final <T extends CreditOperation> Stream<T> loadOperations(
+            UUID creditId, Class<T> operationType) { ... }
+
+    protected final <T extends CreditOperation> Optional<T> loadSingleOperation(
+            UUID creditId, Class<T> operationType) { ... }
+
+    protected <T extends CreditOperation> T saveOperation(UUID creditId, T operation) {
+        Credit credit = loadCredit(creditId);
+        credit.getOperations().add(operation);
+        entityManager.flush();
+        if (operation.getStatus() == OperationStatus.APPROVED) {
+            creditCalculationService.calculate(                                     // <2>
+                creditId, operation.getDate(), credit.getCalculationDate());
+        }
+        return operation;
+    }
+}
+----
+<1> **Pessimistic write lock** on the `Credit` row for the whole transaction. Two concurrent payment attempts on the same loan serialise here, which is what you want — the calculation engine is not commutative under arbitrary interleaving.
+<2> If the operation is born APPROVED, a recalculation window `[operation.date, credit.calculationDate]` is triggered immediately. If it's PENDING, the recalculation happens when the operation is eventually approved.
+
+Concrete example subclasses in `timvero-example` — `ChargeOperationService`, `AccrualOperationService`, `PastDueOperationService`, `VoidOperationService`, `CloseOperationService` — all extend this class.
+
+== Events
+
+Four Spring `ApplicationEvent`s are fired by the calculation engine within the same transaction that writes the snapshots. Listen with `@EventListener` or `EntityEventListener<E>` for auto-subscription.
+
+=== CreditSnapshotChangeEvent
+
+Fires whenever a snapshot is materially different from the prior one (via `CreditSnapshot.isSimilarTo`).
+
+[source,java]
+----
+public class CreditSnapshotChangeEvent extends EntityEvent {
+    public UUID getCreditId();
+    public CreditSnapshot getPrevious();   // nullable — first-ever snapshot
+    public CreditSnapshot getCurrent();
+}
+----
+
+Use cases: metric export, external-system sync, BI ingestion, covenant re-evaluation.
+
+=== CreditStatusChangeEvent
+
+Fires as a companion to `CreditSnapshotChangeEvent` when — and only when — the status itself changed.
+
+[source,java]
+----
+public class CreditStatusChangeEvent extends EntityEvent {
+    public UUID getCreditId();
+    public CreditStatus getPrevious();     // nullable
+    public CreditStatus getCurrent();
+}
+----
+
+Use cases: "loan closed" webhook, reporting-to-bureau, cron de-registration when status becomes `ending`.
+
+=== CreditCalculationDateChangeEvent
+
+Fires once per calculate() call, after the last snapshot has been written and `calculationDate` has been advanced. Carries the **final** snapshot:
+
+[source,java]
+----
+public class CreditCalculationDateChangeEvent extends EntityEvent {
+    public UUID getCreditId();
+    public LocalDate getCalculationDate();
+    public CreditSnapshot getSnapshot();   // the actualSnapshot at the new date
+}
+----
+
+This is the event that the two abstract notification listeners subscribe to. Use it for anything that is "per-calculation, not per-day-of-snapshot".
+
+=== CreditCalculationRequestCompliteEvent
+
+Fires once per batch calculation (e.g., nightly calc for all active credits). Contains `Collection<CalculationResult>` from `CreditCalculationService`.
+
+Use cases: aggregate metrics, batch-end notifications, database vacuum triggers.
+
+== Notifications
+
+Two abstract `NotificationEvent` base classes cover the two ubiquitous credit notifications. Both extend `NotificationEvent<C, Model>` (from the <<notifications>> subsystem) and listen to `CreditCalculationDateChangeEvent`.
+
+=== AbstractPastDueNotificationEvent
+
+[source,java]
+----
+public abstract class AbstractPastDueNotificationEvent<C extends Credit>
+    extends NotificationEvent<C, CreditPastDueNotificationModel>
+    implements EntityEventListener<CreditCalculationDateChangeEvent> {
+
+    public static final NotificationEventType TYPE = new NotificationEventType("CREDIT_PASTDUE");
+    public static final String PAST_DUE_DAYS_PARAM = "pastDueDays";
+
+    @Override
+    public void handle(CreditCalculationDateChangeEvent event) {
+        if (event.getSnapshot().getStatus().isEnding()) return;
+        Optional<MonetaryAmount> pastDue = getPastDueAmount(
+            event.getCreditId(), event.getCalculationDate(), event.getSnapshot());
+        if (pastDue.isPresent() && pastDue.get().isPositive()) {
+            long days = getPastDueDays(event.getCreditId(),
+                event.getCalculationDate(), event.getSnapshot());
+            notify(event.getCreditId(), new CreditPastDueNotificationModel(pastDue.get(), days));
+        }
+    }
+
+    protected abstract long getPastDueDays(UUID id, LocalDate today, CreditSnapshot snap);
+    protected abstract Optional<MonetaryAmount> getPastDueAmount(UUID id, LocalDate today, CreditSnapshot snap);
+}
+----
+
+Implement the two abstract methods (usually by reading past-due accounts from the snapshot's debt) and register as a `@Component`. The `pastDueDays` template parameter lets you keep multiple templates per tier ("5 days late", "30 days late", ...) off one event.
+
+=== AbstractPaymentSoonNotificationEvent
+
+Mirrors the past-due event but for upcoming payments. Returns `Optional<Pair<LocalDate, MonetaryAmount>>` for the next payment; the `paymentInDays` template parameter selects "3 days before", "1 day before", etc.
+
+Both listeners deliberately do nothing when `snapshot.getStatus().isEnding()` — closed loans stop generating reminders.
+
+=== Project Example — Bespoke Payment Reminder
+
+If the two abstract events don't fit, write a plain `NotificationEvent` listener directly:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/notification/PaymentReminderEvent.java[lines=21..45]
+----
+
+== Tabs — Visual Windows Into State
+
+All three tabs extend `EntityTabController<UUID, C>` and expect a `Credit` subtype as their generic parameter. Register concrete subclasses with `@RequestMapping` and `@Controller`.
+
+=== AbstractCreditAccrualsTab
+
+Renders the accrual breakdown — "what interest / late-fee / etc. has accumulated between snapshots". For every registered `RecordableAccrualEngine<C>` bean, the tab collects `AccrualRecord`s (start/end dates + increment) via `engine.calculateAccrualRecords(credit, snapshotRecords, calculationDate)` and computes a per-account total. `DistributionService.getSnapshotRecords(credit)` provides the intermediate input. The tab is hidden (`isVisible`) until at least one snapshot exists.
+
+Concrete subclass — one line in `timvero-example`:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/credit/tab/CreditAccrualsTab.java[lines=9..14]
+----
+
+See <<credit-accruals-tab>> for the UI template and accrual engine contract.
+
+=== AbstractCreditCalculationTab
+
+The day-by-day snapshot ledger — the "what happened on each date" view. For every date that has either a snapshot or an approved operation, the tab renders the snapshot's debt, each operation's final-debt delta, and — for today — the accrued but not-yet-materialised increment.
+
+Uses `DistributionService.getFinalDebts(operations)` to resolve each operation's net effect and `AccrualService.calculateCurrentAccurals(credit)` to compute "what would accrue if we stopped right now".
+
+Concrete subclass in `timvero-example`:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/credit/tab/CreditCalculationTab.java[lines=11..17]
+----
+
+The `@ConditionalOnBean(CreditViewOptions.class)` guard is defensive — without a `CreditViewOptions` bean, the template has no column order and renders blank.
+
+=== CreditPaymentsTab
+
+Already concrete (but generic on `C extends Credit`). Lists approved payments reverse-sorted by `createdAt`, and groups their distributions by operation-id (ordered by distribution timestamp), rendering a compact per-payment breakdown. Override `getPayments(Credit)` in a subclass to further filter — e.g., show only "general" payments, or hide payments before a cut-off date:
+
+[source,java]
+----
+protected Stream<CreditPayment> getPayments(Credit credit) {
+    return credit.getPayments();
+}
+----
+
+== Cross-Credit Payment Listing
+
+`AbstractPaymentController<F>` + `PaymentController` expose a `/credit-payment` menu item that lists payments across **all** credits, filtered by `PaymentFilter` (status + payment type).
+
+[source,java]
+----
+@ConditionalOnProperty(value = "core.payment.controller.enabled", havingValue = "true")
+@Controller
+@MenuItem(order = 5_100, name = "payment")
+public class PaymentController extends AbstractPaymentController<PaymentFilter> {
+
+    private final JpaRepositorySupport<UUID, Credit> repositorySupport;
+
+    public PaymentController(EntityManager entityManager) {
+        this.repositorySupport = new JpaRepositorySupport<>(Credit.class, entityManager);
+    }
+
+    @Override
+    protected void assembleViewModel(CreditPayment payment, Model model) {
+        model.addAttribute("credit", getCredit(payment));
+    }
+
+    public Credit getCredit(CreditPayment payment) {              // <1>
+        return repositorySupport.getSpecificationExecutor()
+            .findOne((root, query, cb) -> cb.isMember(payment, root.get(Credit_.operations)))
+            .orElseThrow();
+    }
+}
+----
+<1> Uses a Criteria API `isMember` predicate to navigate from a payment back to its parent credit without a dedicated foreign key — payments only know they belong to a credit by virtue of being in `Credit.operations`.
+
+Disable with `core.payment.controller.enabled=false` if your project has a different cross-credit payment view.
+
+=== PaymentFilter
+
+[source,java]
+----
+public class PaymentFilter extends AbstractPaymentFilter {
+    @Field(restriction = Restriction.IN, value = CreditPayment_.STATUS)
+    private OperationStatus[] status;
+
+    @Field(restriction = Restriction.IN, value = CreditPayment_.CREDIT_PAYMENT_TYPE)
+    private CreditPaymentType[] paymentType;
+}
+----
+
+`PaymentFilterService` extends `AbstractPaymentFilterService` and only needs to populate the filter dropdown for `paymentType`:
+
+[source,java]
+----
+@Override
+protected FilterValues getFilterValues(Locale locale) {
+    FilterValues filterValues = super.getFilterValues(locale);
+    filterValues.add("paymentType", CustomEnum.values(CreditPaymentType.class), locale);
+    return filterValues;
+}
+----
+
+For per-credit payment filtering (the tab case), extend `AbstractPaymentFilter` directly with credit-specific predicates.
+
+== The Payoff Action
+
+`AbstractCalculatePayOffAmountAction<T>` powers the "calculate payoff amount for a future date" button on the credit page. The core flow:
+
+[source,java]
+----
+private void fillModel(Model model, Credit credit, LocalDate date) {
+    NavigableMap<LocalDate, SnapshotRecord> records =
+        creditCalculationService.extendCredit(credit.getId(), date);        // <1>
+    Debt accruals = accrualService.calculateAccurals(credit, records, date);// <2>
+    Debt debt = records.floorEntry(date).getValue().debt().add(accruals);
+
+    Map<String, MonetaryAmount> filtered = getAccounts().stream()          // <3>
+        .filter(k -> debt.getAccounts().containsKey(k))
+        .collect(Collectors.toMap(k -> k, k -> debt.getAccounts().get(k),
+                                  Lang.mergeNotExpected(), LinkedHashMap::new));
+    model.addAttribute("debtAccounts", filtered);
+    model.addAttribute("debtTotal",
+        filtered.values().stream().reduce(MonetaryAmount::add).orElse(null));
+}
+
+@Override
+protected boolean isAvailable(T entity, UserAccount user) {
+    return entity.getActualSnapshot() != null
+        && !entity.getActualSnapshot().getStatus().isEnding();              // <4>
+}
+----
+<1> `extendCredit()` is a *read-only* projection — it returns the snapshots the engine would produce up to `date` but **does not persist them**. Safe to call from a GET handler.
+<2> The projected snapshots cover principal; `calculateAccurals` adds the interest / late fee that would accumulate between the last snapshot and the target date.
+<3> `creditViewOptions.getAccountsOrder()` gives the display order; the filter + `LinkedHashMap` preserves it.
+<4> Disabled for ending (closed / void) loans — they have no "payoff amount".
+
+The action also enforces a future-date requirement (`parsed.isBefore(LocalDate.now().plusDays(1))` returns `credit.payoff.error.date.futureRequired`) and passes `minDate = tomorrow` to the Thymeleaf template.
+
+=== CreditViewOptions
+
+A single project-wide `@Bean` that declares "which accounts to show, in what order" for every component that displays a `Debt`:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/credit/CreditCalculationConfiguration.java[lines=44..47]
+----
+
+Not every account needs to be listed — `OVERPAYMENT`, for example, is omitted in `timvero-example` because it's a temporary bucket consumed by the payment handler before the snapshot is written. The account order drives the column order in tabs, the row order in the payoff fragment, and the display order in notification templates.
+
+== History Suppliers
+
+=== CreditAddedHistorySupplier
+
+One-liner integration with the <<entity-history>> timeline — a "Credit created" entry:
+
+[source,java]
+----
+public class CreditAddedHistorySupplier<C extends Credit> extends AbstractAddedHistorySupplier<UUID, C> {
+    public static final String CREDIT_CREATED = "CREDIT_CREATED";
+    public CreditAddedHistorySupplier(Class<C> rootClass) { super(rootClass, CREDIT_CREATED); }
+}
+----
+
+Register as a `@Bean` per concrete credit type:
+
+[source,java]
+----
+@Bean
+CreditAddedHistorySupplier<ExampleCredit> exampleCreditAddedHistorySupplier() {
+    return new CreditAddedHistorySupplier<>(ExampleCredit.class);
+}
+----
+
+=== CreditPaymentHistorySupplier
+
+Queries Envers revisions for `CreditPayment` entities, emitting one `CreditPaymentHistoryEvent` per payment creation. Distinguishes refunds from regular payments via `CreditPayment.isRefunded()`:
+
+[source,java]
+----
+public abstract class CreditPaymentHistorySupplier
+    implements HistoryEventSupplier<Credit, CreditPaymentHistorySupplier.CreditPaymentHistoryEvent> {
+
+    public static final String CREDIT_PAYMENT = "CREDIT_PAYMENT";
+
+    @Autowired private AuditService auditService;
+
+    @Override public Class<Credit> getRootClass() { return Credit.class; }
+    @Override public String getEventPage() { return "/history/fragments/credit_payment"; }
+
+    @Override
+    public List<CreditPaymentHistoryEvent> getHistoryEvents(Credit credit) {
+        List<CreditPaymentHistoryEvent> events = new ArrayList<>();
+        for (CreditPayment payment :
+                credit.getOperations(CreditPayment.class, OperationStatus.APPROVED).toList()) {
+            for (RevisionPair<CreditPayment> rev : auditService.queryChanges(
+                    CreditPayment.class, payment.getId(), Set.of(), Set.of(RevisionType.ADD))) {
+                CreditPayment state = rev.after();
+                String op = state.isRefunded() ? "REFUND" : "PAYMENT";
+                events.add(new CreditPaymentHistoryEvent(Icon.ADD, CREDIT_PAYMENT,
+                    rev.updatedAt(), rev.updatedBy(), state.getAmount(), op));
+            }
+        }
+        return events;
+    }
+}
+----
+
+Register a trivial concrete subclass:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/credit/history/ExampleCreditPaymentHistorySupplier.java[tag=class]
+----
+
+== Status Labels
+
+`OperationPaymentStatusLabel<P>` wires the SDK's `EntityStatusLabel` to `CreditOperation::getStatus` — so you get coloured pills on every payment/charge row automatically:
+
+[source,java]
+----
+public class OperationPaymentStatusLabel<P extends CreditOperation> extends EntityStatusLabel<P> {
+    public OperationPaymentStatusLabel() { super(CreditOperation::getStatus); }
+}
+----
+
+Concrete one-liner in the project:
+
+[source,java]
+----
+@Component
+public class CreditPaymentStatusLabel extends OperationPaymentStatusLabel<CreditPayment> { }
+----
+
+The label template resolution and styling conventions are shared with every other status label — see <<entity-module-sdk-reference-hierarchy>> for the underlying abstraction.
+
+== Advanced Patterns
+
+=== 1. Use `extendCredit()` for Forward-Looking Queries
+
+`CreditCalculationService.extendCredit(creditId, date)` produces the snapshot sequence the engine would write *if it ran up to `date`* — but **nothing is persisted**. Use this for:
+
+* Payoff amount calculation (see `AbstractCalculatePayOffAmountAction`)
+* "What would my next statement look like" previews
+* Scenario testing without polluting `creditSnapshots`
+
+Contrast with `calculate(creditId, from, to)`, which writes snapshots and fires events — only call that from code that intends to advance the credit's state.
+
+=== 2. Reason About Staleness by `calculationDate`
+
+Any read of `actualSnapshot.getDebt()` is "accurate as of `calculationDate`". If your credit's `calculationDate` is 2025-10-14 but today is 2025-10-20, six days of unmaterialised accruals are missing. Two patterns:
+
+[source,java]
+----
+// Pattern A — read persisted state only (cheap, stale)
+Debt debt = credit.getActualSnapshot().getDebt();
+
+// Pattern B — read current state (expensive, live)
+Debt debt = credit.getActualSnapshot().getDebt()
+    .add(accrualService.calculateCurrentAccurals(credit));
+----
+
+Pattern A is right for list views and counters (hundreds of rows); pattern B is right for detail pages and notifications.
+
+`DebtService` in the example project wraps pattern B:
+
+[source,java,indent=0]
+----
+include::{sourcedir}/credit/DebtService.java[lines=14..38]
+----
+
+=== 3. Don't Delete Operations — CANCEL Them
+
+`CreditOperation.@PreRemove` throws. The right "undo" flow is:
+
+[source,java]
+----
+operation.setStatus(OperationStatus.CANCELED);
+creditCalculationService.calculate(
+    creditId, operation.getDate(), credit.getCalculationDate());
+----
+
+The engine records a `CANCEL` distribution and rewrites all snapshots from `operation.getDate()` forward. Auditors see both the original operation and its cancellation.
+
+=== 4. Listen to `CreditCalculationDateChangeEvent`, Not Business Dates
+
+If your listener needs to run "once per day that passes for the credit", subscribe to `CreditCalculationDateChangeEvent`, not to a cron job. The calculation engine runs whenever an operation is posted — a borrower making a Saturday payment will advance `calculationDate` past your cron schedule. Event-driven listeners see every transition; cron jobs miss some.
+
+=== 5. Back-Date Operations Freely
+
+When you add an operation with `date` in the past, `AbstractOperationService.saveOperation` calls `calculate(creditId, operation.date, credit.calculationDate)`. The engine rewinds, rewrites snapshots in the affected window, and fires `CreditSnapshotChangeEvent` for every snapshot that materially changed. This is safe and idempotent — but expensive for long windows. Avoid large back-fills in hot paths.
+
+== Best Practices
+
+* {ok} **Extend `AbstractOperationService`** for any service that mutates a credit. You get pessimistic locking, consistent fetching, and automatic recalculation for free.
+
+* {ok} **Fire a recalc whenever an operation's status transitions to/from `APPROVED`.** The engine is the only component that can keep snapshots consistent with the operation log.
+
+* {ok} **Prune zero-account entries** by going through `new Debt(Map.of(...))` — the constructor does it. Hand-building a `Map` and assigning it to the field is an anti-pattern.
+
+* {ok} **Use `isEnding()` in every listener** that should skip closed loans. Past-due and payment-soon notifications already do it; your custom listeners should too.
+
+* {ok} **Put `CreditViewOptions` in the same `@Configuration` that declares your account-type constants.** Keeps the display order and the account constants together — diverging is a common bug source.
+
+* {ok} **Declare statuses as `public static final` constants** on your `@Configuration` class — not as Spring `@Bean`s. Statuses need compile-time references (`if (credit.status == CLOSED)`); beans don't give you that.
+
+* {ok} **Use `SortedMap`/`NavigableMap` return types from SDK query methods** — don't collect them into `HashMap` early. `floorEntry(date)` and `headMap(date)` are exactly the operations the calculation layer needs.
+
+* {ok} **Register one `CreditAddedHistorySupplier` bean per concrete credit type.** The supplier is parameterised by class, so generic registration isn't automatic.
+
+== Anti-Patterns
+
+* {bad} **Don't mutate `CreditSnapshot` fields.** It's `@Immutable`. Changes are silently dropped at flush time and the in-memory state diverges from the database.
+
+* {bad} **Don't reuse `CreditStatus` codes.** Once a code lands in the `credit_snapshot.credit_status` column for any production row, reassigning it to a different status corrupts history. Pick a new code.
+
+* {bad} **Don't read `credit.getOperations()` and expect order.** It's `@OrderBy("date")` — ties break in an undefined order. Use `Stream.sorted(Comparator.naturalOrder())` (which uses `CreditOperation.compareTo`) when order matters.
+
+* {bad} **Don't skip `isEnding()` checks in listeners.** Notifying on closed loans ("you have a payment due tomorrow" on a paid-off loan) is a high-profile user-facing bug.
+
+* {bad} **Don't call `creditCalculationService.calculate(...)` outside a transaction.** The engine acquires a pessimistic lock on the credit row; without a transaction the lock is released immediately and two callers can interleave.
+
+* {bad} **Don't create `Debt` with mutable maps.** The constructor wraps the incoming map in a new `HashMap`, but anyone holding a reference to the original can still mutate it. Build a fresh `Map` per construction.
+
+* {bad} **Don't query `creditSnapshots` by iterating the map in Java.** Use `getCreditSnapshot(date)` which leverages the `SortedMap` — iterating is O(n) and defeats the index.
+
+* {bad} **Don't override `CreditOperation.@PreRemove`.** Operations are append-only; every regulator cares. If you need to suppress an operation, set `OperationStatus.DECLINED` or `CANCELED`.
+
+* {bad} **Don't instantiate `CreditPayment` outside a payment service.** The calculation engine expects approved payments to be handled by a `CreditPaymentOperationHandler` — wiring that up is the payment service's job (see <<payment-hub>>).
+
+== Production Checklist
+
+* {todo} Each concrete `Credit` subclass has a unique `@DiscriminatorValue` — documented in the project data-model doc.
+
+* {todo} Every declared `CreditStatus` has its `code` uniqueness verified against the database and against other subsystems that read `credit_snapshot.credit_status`.
+
+* {todo} `CreditViewOptions` bean is declared and includes every account that appears in production snapshots.
+
+* {todo} Both history suppliers (`CreditAddedHistorySupplier<YourCredit>` bean + `CreditPaymentHistorySupplier` subclass) are registered as `@Component`.
+
+* {todo} A status label component (`OperationPaymentStatusLabel<YourPayment>` subclass) is registered — list views otherwise render raw enum names.
+
+* {todo} Notification events (`AbstractPastDueNotificationEvent`, `AbstractPaymentSoonNotificationEvent`) are subclassed, implemented, and templates are populated (see <<notifications>>).
+
+* {todo} At least one concrete `AbstractCalculatePayOffAmountAction<YourCredit>` is registered if your product supports early payoff.
+
+* {todo} Payment controller is either enabled (`core.payment.controller.enabled=true` + a `PaymentFilter` impl) or explicitly disabled with a comment explaining the project-specific replacement.
+
+* {todo} Tab controllers (`AbstractCreditAccrualsTab`, `AbstractCreditCalculationTab`, `CreditPaymentsTab`) are subclassed + `@Controller` + `@RequestMapping` for each credit type.
+
+* {todo} The credit repository extends `SynchronousAccessRepository` so services inherit pessimistic-lock semantics via `LockUtils`.
+
+* {todo} Envers auditing is enabled (`hibernate.envers.*` properties) and the audit tables are in the schema migrations.
+
+* {todo} All operation services extend `AbstractOperationService` and use its `loadCredit` / `saveOperation` helpers — no bespoke `EntityManager` access paths.
+
+* {todo} A smoke test verifies `calculate()` idempotence: running `calculate(creditId, startDate, today)` twice produces identical snapshots and fires no second round of events.
+
+* {todo} Back-dated operation scenarios are integration-tested: posting a payment dated one month ago rewrites the snapshots in that window and fires the right `CreditSnapshotChangeEvent`s.
+
+* {todo} A load test confirms the pessimistic lock in `AbstractOperationService.loadCredit` doesn't deadlock under concurrent payment + accrual traffic.
+
+* {todo} Production `credit_operation_distribution` has an index on `(operation_id)` — `CreditPaymentsTab` and `CreditOperation.getFinalDebt()` hit it for every credit view.
+
+* {todo} Schema migrations verified: `credit.credit_type`, `credit.actual_snapshot`, `credit.calculation_date`, `credit_snapshot.debt` (JSON) all present with correct types.
+
+---
+
+**Related:**
+
+* <<credit-management>> — user-facing Credit Management System tutorial
+* <<credit-product>> — credit product entity (rates, terms, offers)
+* <<credit-operations-framework>> — full operation processing pipeline (handlers, ordering, end-of-day semantics)
+* <<credit-accruals-tab>> — accrual UI tab details
+* <<payment-hub>> — payment allocation and routing
+* <<payment-transactions>> — payment transaction ledger
+* <<offer-engine>> — offer generation upstream of credit origination
+* <<servicing-engines>> — `LoanEngine`, `ScheduledEngine`, and the calculation pipeline
+* <<entity-module-sdk-reference-hierarchy>> — entity base classes (`UUIDPersistable`, `AbstractAuditable`, `BasePersistable`)
+* <<entity-history>> — Envers-backed history timeline
+* <<notifications>> — notification template system consumed by the abstract notification events
+
+**Next:** See <<servicing-engines>> for the calculation engine that writes the snapshots this chapter describes, or <<credit-operations-framework>> for the operation-type catalogue and handler wiring.

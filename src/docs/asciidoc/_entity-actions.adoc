@@ -1,3 +1,5 @@
+[[entity-actions]]
+[[entity-actions-setup-and-usage]]
 = Entity Actions
 
 Add custom business actions to your entities as buttons that appear on entity pages.
@@ -515,22 +517,376 @@ public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 }
 ----
 
-=== Transaction and Locking
+=== SDK Contract — EntityAction & EntityActionProcessor
 
-Actions run in transaction with pessimistic write lock:
+The `when().then()` DSL used throughout this guide is syntactic sugar. Underneath, every action resolves to an implementation of the two-method `EntityAction<E, F>` interface (from `com.timvero.ground.action`):
+
+[source,java]
+----
+public interface EntityAction<E, F> {
+
+    boolean isAvailable(E entity, UserAccount userAccount);                         // <1>
+
+    void perform(E entity, F form, UserAccount user) throws ValidationException;    // <2>
+}
+----
+<1> Returns `true` if the action is allowed for this entity and user. Used **twice** — for button rendering (page load) and again at execution time (race-safe re-check).
+<2> Runs the business logic. Throw `ValidationException` (via `ValidationException.binding().rejectValue(...).throwIfNotEmpty()`) for user-facing errors — transaction rolls back and the user sees field errors. Other exceptions propagate as 500.
+
+The mapping from DSL to interface is direct:
+
+[cols="2,3", options="header"]
+|===
+|DSL call |EntityAction method
+
+|`when(predicate)`
+|Becomes the body of `isAvailable` — the user-account is ignored in the most common case. Multiple `when(...).and(...)` calls are ANDed.
+
+|`when(entity -> ...).byUser((entity, user) -> ...)`
+|Same but `isAvailable` now uses both arguments.
+
+|`.then((entity, form, user) -> { ... })`
+|Becomes the body of `perform`.
+|===
+
+=== Execution Flow — EntityActionProcessor
+
+`EntityActionProcessor` is the `@Service` that wraps every action call. A single method handles the whole flow:
+
+[source]
+----
+controller POST /{action-path}
+         │
+         ▼
+  EntityActionProcessor.performAction(action, form, entityId, entityClass, user)
+         │
+         │  @Transactional(rollbackFor = ValidationException.class)
+         ▼
+  LockUtils.lock(entityId, entityClass, PESSIMISTIC_WRITE, entityManager)   // <1>
+         │
+         ▼
+  action.isAvailable(entity, user)                                           // <2>
+         │
+    ┌────┴─────┐
+   true      false
+    │          │
+    ▼          ▼
+  action    return false
+  .perform  (HTTP 4xx surfaced by the controller advice — no mutation)
+    │
+    ▼
+  return true
+----
+<1> **Pessimistic write lock** — row-level `SELECT ... FOR UPDATE`. Concurrent actions on the same entity wait until this transaction commits, preventing lost updates. Lock is released at commit or rollback.
+<2> **Runtime re-check** — even if the button was visible (first `isAvailable` call on page render), the entity state may have changed between render and submit. Re-checking inside the locked transaction prevents acting on stale preconditions. The order `lock → check → perform` is critical.
+
+The processor signature:
 
 [source,java]
 ----
 @Transactional(rollbackFor = ValidationException.class)
-public <ID, E extends Persistable<ID>, F> boolean performAction(...) {
-    E entity = LockUtils.lock(entityId, entityClass, 
-                              LockModeType.PESSIMISTIC_WRITE, 
-                              entityManager);
-    // ...
+public <ID, E extends Persistable<ID>, F> boolean performAction(
+    EntityAction<? super E, F> action,
+    F form,
+    ID entityId,
+    Class<E> entityClass,
+    UserAccount user
+) throws ValidationException;
+----
+
+Key properties:
+
+- **Returns boolean** — `false` when `isAvailable` fails the re-check (the action quietly does nothing — no DB changes made). Controllers typically treat `false` as "condition changed, reload page".
+- **Throws `ValidationException`** — business validation errors from inside `perform()`. Transaction rolls back cleanly thanks to `rollbackFor = ValidationException.class`.
+- **Runtime exceptions** (e.g., `DataIntegrityViolationException`) also roll back — standard Spring behavior.
+
+[NOTE]
+====
+`EntityAction<? super E, F>` uses `? super E` — your action can target a supertype (e.g., `EntityAction<BaseEntity, Object>`) and still apply to concrete subclasses. Useful when the same action logic applies across a hierarchy.
+====
+
+WARNING: **Never call `performAction` from a method that already holds a transaction** without understanding the nested-transaction behavior. The default is `Propagation.REQUIRED` — joining the existing transaction — which means the pessimistic lock is held for the entire outer transaction. If the outer transaction is long-running, concurrent actions on the same entity block until it completes.
+
+== Web Layer — Action Controllers
+
+`EntityActionProcessor` is the business core — it owns the transaction, the pessimistic lock, and the `isAvailable → perform` contract. This chapter documents the HTTP-layer controllers in `com.timvero.web.common.action` that wire that core to Spring MVC: how the `GET` form renders, how the `POST` submit flows into `performAction`, and how the framework auto-discovers every controller and emits the button bar.
+
+The hierarchy you extend in your project:
+
+[source]
+----
+EntityElementController<E>
+  └── EntityButtonController<ID, E>            ← renders the button + handles GET
+        └── EntityActionController<ID, E, F>   ← adds POST submit + EntityAction DSL
+              ├── EditEntityActionController<ID, E, F>
+              ├── SimpleActionController<ID, E>        (F = Object, GET returns 405)
+              └── SimpleActionWithDateController<ID, E> (F = ActionDateForm)
+
+EntityElementController<E>
+  └── ListActionController<E, F>               ← list-level action (no entity id)
+        └── EntityCreateController<ID, E, F>
+----
+
+=== EntityActionController — The Abstract Base
+
+`EntityActionController<ID, E, F>` is the class most of your project's actions extend. It inherits `GET` handling from `EntityButtonController` and adds the `POST` submit endpoint plus the `when(...).then(...)` DSL.
+
+**Required overrides:**
+
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`action()`
+|Factory method — returns the `EntityAction<? super E, F>` that will be cached on `@PostConstruct`. The `when(...).then(...)` DSL is the idiomatic way to build it.
+
+|`getActionTemplate(ID, Model, String)`
+|Returns the Thymeleaf template path to render on `GET`. For POST-only actions, throw `HttpRequestMethodNotSupportedException` (see `SimpleActionController`).
+|===
+
+**Optional overrides:**
+
+[cols="2,3", options="header"]
+|===
+|Method |Default |When to override
+
+|`getHighlighted()` |`null` (collapsed into dropdown) |Return `BTN_PRIMARY` / `BTN_SUCCESS` / `BTN_DANGER` etc. to pin a button and pick its colour.
+|`isOwnPage()` |`false` (modal) |Return `true` if the action is a full page navigation rather than a modal.
+|`isPostOnly()` |`false` |Informational — surfaces in `ActionDescription.isPostOnly` so the UI skips the modal.
+|`redirectLocation(id, form, user)` |Reads `REDIRECT_ATTR` request attribute |Compute a custom redirect URL after a successful POST.
+|===
+
+**Form resolution.** The controller resolves `Class<F>` from its generic signature via `ResolvableType` (or you can pass it in the protected constructor). Every request gets a fresh instance through the `@ModelAttribute("form")` factory — your form must have a public no-arg constructor.
+
+**The submit endpoint (inherited, do not override):**
+
+[source,java]
+----
+@PostMapping(produces = MediaType.APPLICATION_JSON_VALUE)
+@PreAuthorize("hasRole(this.role)")
+@ResponseBody
+public Redirect submit(@PathVariable ID id,
+                       @Valid @ModelAttribute("form") F form,
+                       UserAccount user) throws ValidationException {
+    boolean result = actionProcessor.performAction(action, form, id, getEntityClass(), user);
+    alerts.addIfExists(user,
+        result ? Alerts.AlertType.SUCCESS : Alerts.AlertType.DANGER,
+        getAlertMessages());
+    return new Redirect(redirectLocation(id, form, user));
 }
 ----
 
-This prevents concurrent modifications automatically.
+Three things happen for free:
+
+1. **`@PreAuthorize("hasRole(this.role)")`** — `role` is derived from the controller's `@RequestMapping` path; see <<user-roles>> for the naming convention.
+2. **`@Valid`** — JSR-380 validation on the form. Violations surface as `400 Bad Request` with a JSON error payload; the modal renders field-level messages.
+3. **`alerts.addIfExists(...)`** — looks up alert messages by convention (`{entity-path}.{element-path}.success` / `...danger`). Success triggers a green toast; `performAction` returning `false` triggers a warning toast.
+
+NOTE: `REDIRECT_ATTR` is a request-scoped attribute, not a field on the controller. Inside `then(...)` call `setRedirectToEntity(id)` or `setRedirectToPath(path)` to drop a location into the request, which `redirectLocation()` picks up after commit. Returning nothing keeps the user on the same page.
+
+=== Specialization Controllers
+
+Four ready-made subclasses cover the common shapes. Pick the most specific one that fits.
+
+[cols="2,1,2,3", options="header"]
+|===
+|Controller |Form type |GET behavior |POST behavior
+
+|`EntityActionController<ID, E, F>`
+|Your `F`
+|Renders `getActionTemplate(...)` (usually a modal)
+|Runs `when/then` action via `EntityActionProcessor`
+
+|`EditEntityActionController<ID, E, F>`
+|Entity form
+|Renders `getEditPage()` prefilled by `EntityFormService.getEditModel(id)`
+|Calls `EntityFormService.save(id, form)` via the default `action()` implementation
+
+|`EntityCreateController<ID, E, F>`
+|Entity form
+|Renders `getEditPage()` with `isCreate=true`
+|Calls `EntityFormService.save(null, form)` — creates a new entity (list-level action)
+
+|`SimpleActionController<ID, E>`
+|`Object`
+|Throws `HttpRequestMethodNotSupportedException` — triggers direct POST in UI
+|Runs `when/then` action
+
+|`SimpleActionWithDateController<ID, E>`
+|`ActionDateForm`
+|Renders `/common/action/submit-with-date` with today's date pre-populated
+|Runs `when/then` action with the chosen `LocalDate`
+|===
+
+**`EditEntityActionController`.** Mapped at `/edit` relative to the entity path. Delegates saving to an autodiscovered `EntityFormService<E, F, ID>` bean — see <<form-classes-setup-and-usage>>. Override `isEditable(entity)` to gate the edit button at runtime. The default `action()` returns `when(this::isEditable).then((e, f, u) -> setRedirectToEntity(saveEntity(e, f)))` so you rarely need to override it.
+
+**`EntityCreateController`.** Mapped at `/new` relative to the entity path. Extends `ListActionController` (not `EntityActionController`), because there is no entity yet — there is no id, no entity lock, no `EntityAction`. `saveEntity(form)` calls `EntityFormService.save(null, form)`. The default highlight is `BTN_SECONDARY` with a `+` icon.
+
+**`SimpleActionController`.** For one-click actions like "Recalculate". Form type is `Object` — Spring binds the empty form. `getActionTemplate` intentionally returns `HTTP 405` on `GET`; the UI detects `isPostOnly=true` via `EntityActionMapping` and triggers the POST directly from the button click. `{ok}` skip the template, `{bad}` rendering an empty modal.
+
+**`SimpleActionWithDateController`.** When you need exactly one date field (e.g., "Close as of"). Uses `ActionDateForm` (`@PastOrPresent LocalDate`). Override `assembleModel(Model)` to add extra read-only context to the shared `/common/action/submit-with-date` template.
+
+[TIP]
+====
+Picking the right base:
+
+- One button, no inputs → `SimpleActionController` {ok}
+- One date → `SimpleActionWithDateController` {ok}
+- Multi-field form on an existing entity → `EntityActionController<ID, E, F>` {ok}
+- Edit-the-entity (form + `EntityFormService` save) → `EditEntityActionController` {ok}
+- "Create new X" button on the list page → `EntityCreateController` {ok}
+- Bulk / global action, no entity scope → `ListActionController` directly
+====
+
+=== EntityButtonController — Button Rendering
+
+`EntityButtonController<ID, E>` is the parent of every per-entity action and the piece that makes buttons appear on detail pages. It contributes three things:
+
+1. **The GET endpoint** — `action(id, model, user)` mapped at `/{entityPath}/{id}/{elementPath}`. It calls `isAvailable(loadEntity(id), user)` first; if the check fails it throws `ActionNotAvailableException` (see below), otherwise it hands off to `getActionTemplate(...)`.
+2. **Entity loading** — `loadEntity(id)` uses `EntityManager.getReference(...)` so the entity is fetched lazily. If your `isAvailable` reads entity state, Hibernate initializes the proxy on first access.
+3. **Button metadata** — `getHighlighted()`, `getImg()`, `getActionPath(id)`, plus `isPostOnly()` and `isOwnPage()` flags — consumed by `EntityActionMapping` to build the button bar.
+
+**How buttons end up on the detail page.** The page template calls `@pathRegistry.getAvailableActions(entity)` via `EntityActionMapping`. That service:
+
+1. Enumerates every `EntityButtonController` bean whose `getEntityClass()` is assignable from the current entity class.
+2. Applies Spring Security's `securityChecker` using the controller's `@PreAuthorize` — invisible controllers silently drop out.
+3. Calls `isAvailable(entity, user)` on each remaining controller.
+4. Partitions into three buckets: `highlighted` (has `additionalClass`, rendered as pinned buttons), `collapsed` (no colour, collapsed into a kebab menu), and `unavailable` (rendered disabled with a tooltip, so reviewers can see why a button is greyed out).
+
+The partition is why two seemingly equivalent actions render differently: a `null` from `getHighlighted()` pushes the action into the overflow menu, while any non-null CSS class pins it.
+
+=== ListActionController — List-Level Actions
+
+`ListActionController<E, F>` targets the list page, not a single entity. Use it for:
+
+- "Create new" buttons (handled by `EntityCreateController`)
+- Bulk imports / exports
+- Global triggers ("Run nightly job", "Refresh cache")
+
+The URL shape is `GET/POST /{entityPath}/{elementPath}` — no `{id}` segment. The POST endpoint does not call `EntityActionProcessor`; you implement `perform(F form, UserAccount user)` directly and return a `Redirect`. Rationale: there is no entity to lock, no `EntityAction` contract to enforce, and the permission check is a plain `isAvailable(user)`. If the check fails at either GET or POST time the controller throws `AccessDeniedException` (HTTP 403), which is different from `ActionNotAvailableException` (HTTP 500 by default).
+
+Discovery mirrors the entity variant: `ListActionMapping#getAvailableActions(entityClass, user)` enumerates every `ListActionController` bean whose entity class is assignable and emits an `ActionDescription` per controller. List actions always go to the `highlighted` bucket (`additionalClass` is not required to pin them) because the list page renders a simple button row, not a dropdown.
+
+[source,java]
+----
+@Controller
+public class CreateClientAction extends EntityCreateController<UUID, Client, ClientForm> {
+
+    @Override
+    protected boolean isOwnPage() {
+        return false;                     // render as modal, not a full page
+    }
+}
+----
+
+See <<list-filters-annotation-driven-jpa-query-dsl>> for the list page that hosts these buttons.
+
+=== Action Registry — EntityActionMapping, EntityActionPath, ListActionMapping, EntityActionPathRegistry
+
+Four beans cooperate to make "define a controller, get a button" work without any XML or explicit wiring.
+
+**`EntityActionMapping`** (`@Service`). Injected with `List<EntityButtonController<?, ?>>` — Spring collects every bean of that type automatically. Maintains a `Class<?> → Collection<EntityButtonController>` cache (lazy, `ConcurrentHashMap`) so the "find all actions for `Participant`" lookup is O(1) after the first call. Exposes:
+
+- `getAvailableActions(entity)` / `getAvailableActions(entity, entityClass, user)` — returns the `ActionDetails` (highlighted / collapsed / unavailable).
+- `getActionRoles(entityClass)` — returns all `EntityRoleDescription`s used by the actions, consumed by the role-admin UI.
+- `getDescriptionIfAvailable(controller, entity, user)` — single-controller variant.
+
+**`ListActionMapping`** (`@Service`). Twin of the above for `ListActionController`. Same lazy cache, different method surface because there is no entity instance — just `getAvailableActions(entityClass, user)`.
+
+**`EntityActionPath`**. A simple immutable `Class<?> → String` multimap built via a fluent `builder()`. You declare custom URL prefixes for specific entity classes by publishing an `EntityActionPath` `@Bean`:
+
+[source,java]
+----
+@Bean
+public EntityActionPath paymentActionPath() {
+    return EntityActionPath.builder()
+        .addPath(CreditPayment.class, "/payment")
+        .build();
+}
+----
+
+Duplicate mappings for the same class throw `IllegalArgumentException` at build time — the registry is fail-fast.
+
+**`EntityActionPathRegistry`** (`@Component("pathRegistry")`). The Spring bean exposed to Thymeleaf templates. On context refresh it receives every `EntityActionPath` bean (via `@Autowired(required = false) List<EntityActionPath>`) and flattens them into a single `LinkedHashMap`. Lookup order:
+
+1. Direct hit on the concrete class → use the registered path.
+2. Walk up the superclass chain — lets `CreditPaymentSubclass` inherit `/payment` without re-registering.
+3. Fall back to `EntityControllerMapping.getPath(entityClass)` — i.e., the `@RequestMapping` of the entity's main `@Controller`.
+4. Still nothing → `NoSuchElementException`.
+
+The registry is used inside `.html` templates as `@pathRegistry.getPath(entity)` to compute canonical entity URLs (`/credit/abc-123`, `/payment/xyz-456`) without hardcoding them in views.
+
+[cols="2,1,3", options="header"]
+|===
+|Bean |Discovery mechanism |Consumer
+
+|`EntityActionMapping` |Injected `List<EntityButtonController>` |Entity detail pages — button bar
+|`ListActionMapping` |Injected `List<ListActionController>` |List pages — "Create", bulk actions
+|`EntityActionPath` bean(s) |`@Bean` in your config |Registered into `EntityActionPathRegistry`
+|`EntityActionPathRegistry` |`@Component("pathRegistry")` |Thymeleaf SpEL, redirect builders
+|===
+
+**Ordering.** Button order within the bar is Spring's standard `@Order` / `Ordered` contract — the `List<EntityButtonController>` Spring injects respects `@Order(n)` on each controller class (lower = earlier = left).
+
+=== ActionNotAvailableException — Runtime Re-check Flow
+
+Two distinct "not available" paths exist; do not confuse them.
+
+[cols="2,2,2", options="header"]
+|===
+|Thrown from |Condition |HTTP surface
+
+|`EntityButtonController.action(...)` (GET) |`isAvailable(entity, user)` fails when user opens the modal |`ActionNotAvailableException` → 500 by default; usually mapped to a branded error page
+|`ListActionController.action(...)` (GET/POST) |`isAvailable(user)` fails |`AccessDeniedException` → 403
+|`EntityActionProcessor.performAction(...)` |`isAvailable` fails inside the locked transaction |Returns `false` — no exception, DANGER alert, redirect back
+|===
+
+The `ActionNotAvailableException` case typically means: the user had the button rendered a while ago (page still open) and clicked it after the entity's state changed (someone else approved / closed / voided). The GET-level check fires before any mutation, so no rollback is needed. The 500-ish default is intentional — this is never expected in normal flow, and surfacing it as an error helps diagnose stale-tab bugs.
+
+The `performAction`-level check is gentler: inside the same transaction where the lock is held, the re-check returns `false`, the transaction commits empty, and the user gets a red alert ("Action not available — please refresh"). See `Alerts.AlertType.DANGER` wiring in the submit method above.
+
+[TIP]
+====
+If you want `ActionNotAvailableException` to render as a branded page rather than the default Spring error page, map it in your `@ControllerAdvice`:
+
+[source,java]
+----
+@ExceptionHandler(ActionNotAvailableException.class)
+public String onNotAvailable(ActionNotAvailableException e, Model m) {
+    m.addAttribute("message", e.getMessage());
+    return "error/action-not-available";
+}
+----
+
+Parallel the REST handling described in <<api-module>>.
+====
+
+=== Anti-Patterns (Web Layer)
+
+{bad} **Bypassing `EntityActionProcessor`.** Do not inject services and call `.perform(...)` from a `@PostMapping` you wrote by hand — you lose the pessimistic lock, the runtime re-check, and the `ValidationException` rollback semantics. Extend `EntityActionController` and put the logic in `then(...)`.
+
+{bad} **Registering two controllers with the same `@RequestMapping` path on the same entity.** Spring MVC registers both handlers and you get non-deterministic dispatch. `EntityActionMapping` renders two buttons too. Make `@RequestMapping` paths unique per entity — a good convention is the verb (`/approve`, `/void`, `/recalculate`).
+
+{bad} **Putting slow work in `isAvailable`.** It is called every time the page renders — for every action — for every entity in a list view when row-level actions are enabled. Keep it to field comparisons. Offload anything expensive to `perform` and let `ValidationException` reject.
+
+{bad} **Throwing checked exceptions from `action()`.** `EntityAction.perform` only declares `ValidationException`. Wrap anything else in `ValidationException.binding().reject(...).throwIfNotEmpty()` or let it propagate as a runtime exception (500).
+
+{bad} **Manually calling `loadEntity()` inside `perform`.** The processor already passes you the managed entity — calling `loadEntity` again inside `then(...)` detaches you from the locked row and defeats the lock. Use the first parameter of the lambda.
+
+=== Production Checklist — Web Layer
+
+Before shipping a new action:
+
+- {todo} Pick the most specific base class — `SimpleActionController` / `SimpleActionWithDateController` / `EditEntityActionController` / `EntityCreateController` before falling back to `EntityActionController`.
+- {todo} `@RequestMapping` path is unique for this entity and follows the verb convention.
+- {todo} `@Order(n)` is set if the button should not float to the end.
+- {todo} `getHighlighted()` is set (or intentionally `null` for the overflow menu).
+- {todo} `isAvailable` is O(1) on already-loaded fields — no service calls, no queries.
+- {todo} Destructive actions have `BTN_DANGER` and a confirmation modal.
+- {todo} i18n keys exist for `{entity-path}.{element-path}` (button label) and the `.success` / `.danger` variants (alert text).
+- {todo} Role `hasRole("{ENTITY}_BUTTON_{ACTION}")` is granted to the expected users — see <<user-roles>>.
+- {todo} `ActionNotAvailableException` mapped in `@ControllerAdvice` if you want a branded page.
+- {todo} For custom entity URL prefixes, an `EntityActionPath` `@Bean` is declared and picked up by `EntityActionPathRegistry`.
 
 == Real Examples
 

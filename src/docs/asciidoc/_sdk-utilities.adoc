@@ -1,0 +1,463 @@
+[[sdk-utilities]]
+= SDK Utilities — cheat sheet
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+Grab-bag of SDK utility classes (`com.timvero.ground.util`) that the rest of the codebase uses constantly but nobody explains. This is a **cheat sheet** — method signatures, one-line descriptions, small examples. For deep mechanics of specific utilities, see the linked docs (`EntityUtils` is detailed in <<entity-module-sdk-reference-hierarchy>>, `LockUtils` in <<entity-actions>>, `TransactionUtils` in <<reload-infrastructure-live-ui-updates-on-entity-changes>>).
+
+== What You Need to Know
+
+All 12 classes are stateless utility holders with `public static` methods (with one exception: `Listable` is an interface; `ConvertIterator` is a regular class). None require Spring wiring — call directly from any context.
+
+[cols="1,3", options="header"]
+|===
+|Category |Classes
+
+|Hibernate / JPA operations
+|`EntityUtils`, `LockUtils`, `TransactionUtils`
+
+|Monetary math
+|`MonetaryUtil`
+
+|Java-lang helpers (streams, varargs, null-safety)
+|`Lang`, `Listable`
+
+|Async scheduling
+|`AsyncUtils`
+
+|Lazy proxy construction
+|`ProxyBuilder`
+
+|Document parsing
+|`DocumentParserUtils`
+
+|Payment card BIN lookup
+|`BinUtil`
+
+|Functional iterators
+|`function.ConvertIterator`
+|===
+
+NOTE: `XmlUtils.java` exists in the module but is **entirely commented out** (legacy code). The class is effectively empty — don't reference it.
+
+== Hibernate / JPA
+
+=== EntityUtils
+
+Proxy unwrapping, dirty-check, class resolution.
+
+[cols="2,3", options="header"]
+|===
+|Method |Use
+
+|`initializeAndUnproxy(T entity)` → `T`
+|Force-initialize a lazy `HibernateProxy` and return the real instance. Most common call site in SDK services (form save, document history, envers queries).
+
+|`initializeAndUnproxy(Collection<T>)` → `Collection<T>`
+|Same for a collection — initializes every element.
+
+|`isModified(Persistable<?> entity, EntityManager em)` → `boolean`
+|Check if the entity has pending changes vs the DB snapshot. Compares current state to Hibernate's `databaseSnapshot`. Useful in guards that want to skip no-op writes.
+
+|`equals(Persistable<?> p1, Persistable<?> p2)` → `boolean`
+|Id-based equality — null-safe, survives proxy / unproxied comparisons. Preferred over `.equals` when either side may be a Hibernate proxy.
+
+|`getClassWithoutInitializingProxy(T object)` → `Class<? extends T>`
+|Real entity class even for an uninitialized proxy. Essential when you need the class for reflection / metamodel access without triggering a DB load.
+|===
+
+Example:
+
+[source,java]
+----
+Participant p = entityManager.find(Participant.class, id);
+Participant loaded = EntityUtils.initializeAndUnproxy(p);      // safe to read fields
+
+Class<?> realClass = EntityUtils.getClassWithoutInitializingProxy(p);   // no DB hit
+if (EntityUtils.isModified(p, entityManager)) {
+    auditService.log(p);
+}
+----
+
+Must run inside an active Hibernate session for `initializeAndUnproxy` and `isModified` — outside you get `LazyInitializationException` / null state.
+
+=== LockUtils
+
+Pessimistic write locking.
+
+[cols="2,3", options="header"]
+|===
+|Method |Use
+
+|`lock(T entity, LockModeType lockModeType, EntityManager em)` → `T`
+|Acquire a `PESSIMISTIC_WRITE` row lock on the already-loaded entity. Verifies session is clean (no pending dirty changes) — throws if it isn't. Refreshes the entity after locking.
+
+|`lock(Object entityId, Class<T> entityClass, LockModeType lockModeType, EntityManager em)` → `T`
+|Same but starts from an id — `getReference` first, then lock.
+|===
+
+Currently **only `PESSIMISTIC_WRITE` is supported** — other lock modes throw `Assert`. Used by `PumpkinBaseRepository.getSync` and `EntityActionProcessor.performAction` (see <<entity-actions>>).
+
+[source,java]
+----
+Credit credit = LockUtils.lock(creditId, Credit.class,
+    LockModeType.PESSIMISTIC_WRITE, entityManager);
+// credit is now row-locked until the transaction commits
+----
+
+WARNING: `lock` throws if the session has uncommitted changes (`session.isDirty()`). Flush before locking, or restructure the flow to lock before mutating.
+
+=== TransactionUtils
+
+After-commit callback scheduling.
+
+[cols="2,3", options="header"]
+|===
+|Method |Use
+
+|`afterTransaction(Runnable)` → `void`
+|Register a callback that runs **after** the current transaction completes (commit OR rollback). If no transaction is active, runs immediately.
+|===
+
+Why this exists: Spring's `TransactionSynchronization` is powerful but verbose; this is the one-liner. Used by `EventService.fire` and `ReloadPageHelper.reload` to defer event dispatch until state is durable.
+
+[source,java]
+----
+@Transactional
+public void transferFunds(Transfer t) {
+    accountRepository.save(t);
+    TransactionUtils.afterTransaction(() -> notifier.notify(t));   // fires only after commit
+}
+----
+
+=== Related Docs
+
+- `EntityUtils` internals and when to use each method: <<entity-module-sdk-reference-hierarchy>>
+- `LockUtils` in the `SynchronousAccessRepository.getSync` flow: <<entity-module-sdk-reference-hierarchy>>
+- `LockUtils` in `EntityActionProcessor`: <<entity-actions>>
+- `TransactionUtils.afterTransaction` in the event pipeline: <<reload-infrastructure-live-ui-updates-on-entity-changes>>
+
+== Monetary
+
+=== MonetaryUtil
+
+`javax.money.MonetaryAmount` factory / arithmetic / parsing.
+
+[cols="2,3", options="header"]
+|===
+|Method |Use
+
+|`getCurrency(String currencyCode)` → `CurrencyUnit`
+|ISO code → `CurrencyUnit`. Thin wrapper on `Monetary.getCurrency`.
+
+|`of(BigDecimal number, CurrencyUnit currency)` → `MonetaryAmount`
+|Build a `MonetaryAmount`. Uses a per-currency `MonetaryContext` cached by fraction digits — avoids per-call context allocation.
+
+|`of(BigDecimal number, String currencyCode)` → `MonetaryAmount`
+|Same via ISO code.
+
+|`zero(CurrencyUnit)` → `MonetaryAmount`
+|`of(BigDecimal.ZERO, currency)` shorthand.
+
+|`deepCopy(MonetaryAmount)` → `MonetaryAmount`
+|Re-create the amount so it has a fresh, mutable-safe `MonetaryContext`. Use when the source was produced by a different provider and may have an incompatible context.
+
+|`numberValue(MonetaryAmount)` → `BigDecimal`
+|Extract the `BigDecimal` number (drops currency). Use for serialization / formatting / DB storage.
+
+|`checkAmountParameter(CurrencySupplier, CurrencyUnit)` → `void`
+|Assert the amount's currency matches the expected one. Throws `MonetaryException` on mismatch. Use at service boundaries to fail fast on currency drift.
+
+|`parse(String text)` → `MonetaryAmount`
+|Parse `"EUR:25.25"` format. Returns `null` for blank input, `MonetaryParseException` for malformed.
+
+|`equals(MonetaryAmount, MonetaryAmount)` → `boolean`
+|Currency-aware equality — null-safe, unlike `.isEqualTo` which NPE's on null. Use in service-layer comparisons.
+|===
+
+[source,java]
+----
+MonetaryAmount total = MonetaryUtil.of(new BigDecimal("1234.56"), "EUR");
+MonetaryAmount zero  = MonetaryUtil.zero(total.getCurrency());
+
+MonetaryUtil.checkAmountParameter(transfer.getAmount(), account.getCurrency());
+BigDecimal forExport = MonetaryUtil.numberValue(total);   // 1234.56 for Excel
+
+// For persistence via JPA — use directly, the SDK's converters handle it
+entity.setPrincipal(MonetaryUtil.of(amount, currency));
+----
+
+Related: `CurrencyUnitConverter` and `MonetaryAmount` composite-type registration in <<entity-module-sdk-reference-hierarchy>>; `#monetary` Thymeleaf helper in <<thymeleaf-helpers-expression-objects-lazy-unwrapping>>.
+
+== Java-Lang Helpers
+
+=== Lang
+
+224-line kitchen sink — converts, composes, compares. Frequently useful; rarely critical.
+
+==== Stream / Collection Conversion
+
+[source,java]
+----
+// Typed converters
+Set<Long>  ids    = Lang.convertSet(clients, Client::getId);
+List<Name> names  = Lang.convertList(clients, Client::getName);
+Map<UUID, Name> m = Lang.convertMap(clientsById, Client::getName);
+
+// With custom factory
+TreeSet<Long> sorted = Lang.convert(clients, TreeSet::new, Client::getId);
+----
+
+==== Null-Safety Helpers
+
+[source,java]
+----
+boolean anyMissing = Lang.anyNull(name, dob, ssn);                 // true if any null
+boolean allFilled  = Lang.notEmpty(name, dob, ssn);                // false if any null-or-blank-String
+T result = Lang.firstNotNull(a, b, c);                              // first non-null
+T result = Lang.firstNotNull(() -> loadA(), () -> loadB(), ...);   // lazy supplier variant
+R mapped = Lang.map(maybeEntity, e -> e.getName());                 // null-safe map
+----
+
+==== Varargs Membership
+
+Two styles — pick the one that reads better at the call site:
+
+[source,java]
+----
+// Static-method style
+if (Lang.in(status, APPROVED, ACTIVE, PENDING)) { ... }
+
+// Fluent style (wraps value first)
+if (Lang.value(status).in(APPROVED, ACTIVE, PENDING)) { ... }
+----
+
+==== Comparison & Aggregation
+
+[source,java]
+----
+LocalDate max = Lang.max(dueDate, expiryDate, lastPaymentDate);    // null-safe max
+LocalDate min = Lang.min(...);
+
+// Compose comparators
+Comparator<Credit> cmp = Lang.agregate(byStatus, byAmount, byCreatedAt);
+
+// String concat skipping blanks
+String csv = Lang.join(",", name, phone, email);   // skips any blank segment
+----
+
+==== Map Building
+
+[source,java]
+----
+Map<UUID, Client> byId = Lang.toMap(clients, Client::getId);
+Map<UUID, String> names = Lang.toMap(clients, Client::getId, Client::getName);
+----
+
+==== Stream Plumbing
+
+[source,java]
+----
+Stream<Integer> combined = Lang.concat(stream1, stream2, stream3);    // varargs concat
+Iterable<T> iter = Lang.iterable(stream);                              // for enhanced-for
+Stream<T> stream = Lang.stream(iterable);                              // inverse
+----
+
+==== Collector for "Expected Exactly One"
+
+[source,java]
+----
+Client one = repository.findAll().stream()
+    .filter(c -> c.getId().equals(id))
+    .collect(Lang.exactlyOne());   // throws if 0 or >1 elements
+
+// Building a map where duplicates should fail loudly:
+clients.stream().collect(Collectors.toMap(
+    Client::getId, Function.identity(), Lang.mergeNotExpected()));
+----
+
+=== Listable
+
+Interface — trivially adds `.in(...)` to classes:
+
+[source,java]
+----
+public enum Status implements Listable<Status> { NEW, ACTIVE, CLOSED }
+
+if (credit.getStatus().in(Status.ACTIVE, Status.CLOSED)) { ... }
+----
+
+Compared to `EnumSet.of(ACTIVE, CLOSED).contains(status)` — same effect, more fluent. Compared to `Lang.in(...)` — belongs to the enum rather than a utility class.
+
+== Async
+
+=== AsyncUtils
+
+One method — turn a `Callable<T>` into a `CompletionStage<T>` via an `Executor`.
+
+[source,java]
+----
+CompletionStage<Report> stage = AsyncUtils.getAsync(
+    () -> heavyReportService.generate(id),
+    asyncExecutor);
+
+stage.thenAccept(report -> sendEmail(report))
+     .exceptionally(ex -> { log.error("failed", ex); return null; });
+----
+
+Wraps `CompletableFuture.supplyAsync(...)` but propagates checked exceptions via `Callable` rather than forcing `Supplier`. Minor convenience — use Spring's `@Async` or plain `CompletableFuture` for anything more structured.
+
+== Proxy Construction
+
+=== ProxyBuilder
+
+Two ways to build **lazy-initialized** objects — the real object isn't constructed until the first method call.
+
+[cols="2,3", options="header"]
+|===
+|Method |Backing |Use when
+
+|`lazyProxy(Class<T> interfaceClass, Supplier<T> supplier)` → `T`
+|JDK `Proxy` — interface only
+|You have an interface and want a lazy delegate that plugs into any `interfaceClass`-typed slot. Cheap.
+
+|`lazyObject(Class<T> concreteClass, Supplier<T> supplier)` → `T`
+|Spring `ProxyFactory` with CGLIB — concrete class
+|You need a lazy instance of a concrete class. Requires a no-arg constructor; more expensive (class generation on first use).
+|===
+
+[source,java]
+----
+// Lazy interface proxy — real heavy service only instantiated on first call
+HeavyService svc = ProxyBuilder.lazyProxy(HeavyService.class,
+    () -> applicationContext.getBean(HeavyServiceImpl.class));
+
+svc.doSomething();   // first call — supplier fires, instance loaded, then forwarded
+
+// Lazy concrete proxy — for classes without an interface
+ExpensiveReport rpt = ProxyBuilder.lazyObject(ExpensiveReport.class,
+    () -> reportBuilder.build());
+----
+
+Double-checked locking inside both variants makes the lazy load thread-safe. Use when construction is expensive AND the object might not be used on every code path.
+
+Alternative: Spring's `@Lazy` / `ObjectProvider<T>` / Spring Data's `Lazy.of(...)`. Prefer those when the Spring context handles the wiring; reach for `ProxyBuilder` when you need a bare lazy reference outside Spring's scope.
+
+== Document Parsing
+
+=== DocumentParserUtils
+
+Parse a stored `DocumentResource` based on its `Content-Type`.
+
+[cols="2,3", options="header"]
+|===
+|Method |Behavior
+
+|`parseResource(DocumentResource)` → `Object`
+|Content-type-aware parser. Returns:
+- `org.w3c.dom.Document` for `application/xml` / `text/xml`
+- Parsed object (Map / List / String / Number) for `application/json` — via `JsonSmartJsonProvider`
+- `String` (with charset decoding) for any other type with a charset
+- `byte[]` for binary types
+
+|`printResource(DocumentResource)` → `String`
+|Convert content to `String` using the appropriate charset:
+- XML: reads charset from the XML declaration via `XMLStreamReader`
+- Non-XML with explicit charset: uses it
+- Non-XML without charset: UTF-8 default
+|===
+
+[source,java]
+----
+DocumentResource resource = documentStorage.getDocumentResource(doc);
+Object parsed = DocumentParserUtils.parseResource(resource);
+
+if (parsed instanceof Map<?, ?> json) {
+    // API response
+} else if (parsed instanceof org.w3c.dom.Document dom) {
+    // XML document
+} else if (parsed instanceof String text) {
+    // Plain text / CSV / other charset-aware
+}
+----
+
+Use for integrations that accept any format — e.g., webhook payloads, document import pipelines. For known formats, prefer a typed parser directly (Jackson `ObjectMapper`, JAXB).
+
+== Banking
+
+=== BinUtil
+
+Maps payment card BIN (Bank Identification Number — first 6 digits) to issuer network name.
+
+[source,java]
+----
+String network = BinUtil.find(453216);    // "Visa"
+String network = BinUtil.find(517654);    // "MasterCard"
+String network = BinUtil.find(220012);    // "MIR"
+String network = BinUtil.find(nonSense);  // null
+----
+
+Static BIN table covering ~20 networks including Visa, MasterCard, Amex, UnionPay, JCB, Diners, Discover, MIR, RuPay, Maestro, Troy, UATP, Verve, Dankort, Solo, Switch, Bankcard, InterPayment.
+
+Not a full BIN lookup service (those are commercial + paid) — covers issuer network identification, nothing more. Use when you need to display a card brand icon on a masked card number.
+
+== Iterators
+
+=== function.ConvertIterator
+
+Lazy chain iterator — produces a sequence by applying a `next` function to each emitted element.
+
+[source,java]
+----
+Iterator<LocalDate> dates = new ConvertIterator<>(
+    Optional.of(LocalDate.now()),
+    current -> current.getYear() < 2030
+        ? Optional.of(current.plusDays(1))
+        : Optional.empty());
+
+while (dates.hasNext()) {
+    LocalDate d = dates.next();
+    process(d);
+}
+----
+
+Each `next()` call consumes the current element and computes the following one from it. Stops when the `next` function returns `Optional.empty()`.
+
+Niche use case — payment-schedule generation, calendar traversal, any "walk forward until some condition" stream where the next element depends on the previous. For anything simpler, use `Stream.iterate` (fixed step) or `Stream.generate` (stateless).
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **`EntityUtils.initializeAndUnproxy` outside a Hibernate session** — `LazyInitializationException` on anything uninitialized
+* {bad} **`LockUtils.lock` with non-PESSIMISTIC_WRITE modes** — the `Assert` throws; pick a different locking strategy or file a feature request
+* {bad} **`LockUtils.lock` after dirty writes** — throws `"Flush all changes before locking entity"`; restructure so lock happens first
+* {bad} **`TransactionUtils.afterTransaction` for rollback-only logic** — the callback fires on rollback too; use Spring's `TransactionSynchronization.afterCompletion(STATUS_ROLLED_BACK)` directly if you need the distinction
+* {bad} **`MonetaryUtil.parse` with user input** — the `"EUR:25.25"` format is internal; for user input use proper parsing (`#monetary.format` inverse) or reject and re-prompt
+* {bad} **`Lang.exactlyOne()` where "at most one" is acceptable** — throws on 0 elements; use `findFirst` or a size-checked alternative
+* {bad} **`Lang.convertMap` without understanding `HashMap` order** — no ordering guarantees; use `Lang.convert(..., LinkedHashMap::new, ...)` if insertion order matters
+* {bad} **`AsyncUtils.getAsync` with the default `ForkJoinPool`** — you lose back-pressure + supervision; always pass a dedicated `Executor` tuned for your workload
+* {bad} **`ProxyBuilder.lazyObject` on a class without a no-arg constructor** — throws at the Spring `ProxyFactory` layer; prefer `lazyProxy` if the class exposes an interface
+* {bad} **`DocumentParserUtils.parseResource` for latency-sensitive endpoints** — constructs parsers per call; for hot paths cache a typed parser instance
+* {bad} **`BinUtil.find` assuming completeness** — the list is static and doesn't cover every global BIN; treat `null` as "unknown, show generic icon"
+* {bad} **Referencing `XmlUtils`** — the class file exists but every method is commented out; it's dead code, don't import it
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `EntityUtils.initializeAndUnproxy` call sites all run inside `@Transactional` or active session
+* {todo} `LockUtils.lock` is only called on entities loaded in the same transaction; no dirty writes before the call
+* {todo} `TransactionUtils.afterTransaction` callbacks are idempotent — they fire on commit AND rollback
+* {todo} `MonetaryUtil.checkAmountParameter` used at service boundaries where currency mismatch would corrupt data
+* {todo} `MonetaryUtil.of` used for construction (not `Money.of` directly) — benefits from the SDK's context cache
+* {todo} `Lang` helpers replaced inline nulls-checks / collection conversions — measurably shorter code
+* {todo} `AsyncUtils.getAsync` callers pass a dedicated named `Executor` (not the default)
+* {todo} `ProxyBuilder` usage documented — lazy behavior surprises future maintainers if undocumented
+* {todo} `DocumentParserUtils.parseResource` call sites handle all four return shapes (`Document`, JSON map, `String`, `byte[]`)
+* {todo} `BinUtil.find` null return mapped to a UI fallback (generic card icon)
+* {todo} No references to commented-out `XmlUtils` — grep confirms
+
+---
+
+**Related:** <<entity-module-sdk-reference-hierarchy>>, <<entity-actions>>, <<reload-infrastructure-live-ui-updates-on-entity-changes>>, <<api-module>>, <<thymeleaf-helpers-expression-objects-lazy-unwrapping>>
+
+**Next:** <<entity-module-sdk-reference-hierarchy>>, <<storage>>

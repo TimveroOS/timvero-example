@@ -1,0 +1,524 @@
+[[flowable-external-api]]
+= Flowable External API — REST endpoints for external workflow drivers
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The `com.timvero.flowable.external` package exposes a **dedicated REST API** that lets external systems — BPMN engines, underwriting services, scoring providers, integration middlewares — drive workflow execution inside timveroOS. It is the narrow, stable surface through which an outside workflow engine writes values, saves decision facts, reads entity data, and signals lifecycle transitions back into the core.
+
+This API is deliberately separate from:
+
+* The `com.timvero.api` module (see <<api-module>>) — the general-purpose REST API for first-party front-ends and portal clients.
+* The workflow integration guide (see <<workflow-integration>>) — which covers how to mark your **own entities** as workflow-enabled so the Flowable extension can drive decisions against them.
+
+In short: <<workflow-integration>> tells you how to **subscribe** an entity to workflows; this document describes the endpoints an **external workflow engine calls back** into timveroOS while running. For the internal domain model behind these endpoints (`ProcessExecution`, `DecisionFact`, `TypedValue`, `Feature`), see <<flowable-internals>>.
+
+== What You Need to Know
+
+[cols="1,3", options="header"]
+|===
+|Concept |Summary
+
+|**Dedicated web context**
+|The module is published as its own Spring Boot child context — a second servlet container — on a separate port with its own context path (default `/external-process` on port `8380`). It is not mounted under the main app's URL tree.
+
+|**HTTP Basic authentication**
+|Authentication is HTTP Basic with a single in-memory credential pair sourced from `process.engine.api.username` / `process.engine.api.password`. No session, no JWT, no user table involvement.
+
+|**No CORS**
+|The filter chain sets only `httpBasic` + `csrf disabled` + `anyRequest authenticated`. CORS is intentionally not configured — this API is for server-to-server traffic, not browsers.
+
+|**Four controllers**
+|`ProcessExecutionApiController` (lifecycle signals), `ExternalProcessController` (write values and facts into an execution), `ExternalDataProviderController` (read entity features), `UnderwritingOptionsController` (lookup catalogs).
+
+|**All writes go through `ProcessActionServiceProvider`**
+|The controllers are thin; all mutation logic (saving values, alerts, warnings, info facts) is delegated to a single `@Service` that loads the `ProcessExecution` by `processInstanceId` and mutates its `ExecutionResult`.
+
+|**`MisconfigurationException` is recorded on the execution**
+|When an unknown decline reason / decision department / form schema is referenced, the exception is persisted against the execution via `ExceptionEntityService` so the error is visible in the UI — not just returned as a 400.
+|===
+
+== Security Configuration — ExternalProcessSecurityConfig
+
+`ExternalProcessSecurityConfig` is a stand-alone Spring Security configuration imported by the external web context. It does **not** share the filter chain of the main application — the two contexts each have their own.
+
+[source,java]
+----
+@EnableWebSecurity
+@EnableMethodSecurity(prePostEnabled = true, securedEnabled = true, proxyTargetClass = true)
+public class ExternalProcessSecurityConfig {
+
+    @Value("${process.engine.api.username}") private String flowableApiUser;
+    @Value("${process.engine.api.password}") private String flowableApiPassword;
+
+    @Bean PasswordEncoder passwordEncoder() { return new BCryptPasswordEncoder(); }
+
+    @Bean UserDetailsService userDetailsService(PasswordEncoder passwordEncoder) {
+        UserDetails userDetails = User.builder()
+            .username(flowableApiUser)
+            .password(flowableApiPassword)
+            .passwordEncoder(passwordEncoder::encode)
+            .roles()
+            .build();
+        return new InMemoryUserDetailsManager(userDetails);
+    }
+
+    @Bean
+    protected SecurityFilterChain flowableFilterChain(HttpSecurity http) throws Exception {
+        http.httpBasic(Customizer.withDefaults());
+        http.csrf(AbstractHttpConfigurer::disable);
+        http.authorizeHttpRequests(r -> r.anyRequest().authenticated());
+        return http.build();
+    }
+}
+----
+
+=== Key Points vs. the Main API
+
+[cols="2,3,3", options="header"]
+|===
+|Area |External API |Main API (<<api-module>>)
+
+|**Principal source**
+|`InMemoryUserDetailsManager` with one static user
+|`UserAccount` table via `UserAccountService` / `UserDetailsService`
+
+|**Roles**
+|No roles — `.roles()` is called with zero arguments; the account has no authorities
+|`UserRole` + permission-based access (see <<user-roles>>)
+
+|**Auth scheme**
+|HTTP Basic only
+|Configurable — typically Basic for back-office, session / OAuth for portals
+
+|**CSRF**
+|Disabled (server-to-server)
+|Enabled for browser-facing endpoints
+
+|**Method security**
+|`@EnableMethodSecurity(prePostEnabled, securedEnabled, proxyTargetClass)` — but the current controllers carry no `@PreAuthorize`
+|Used by services to gate business operations
+|===
+
+The credentials come from application properties:
+
+[source,properties]
+----
+process.engine.api.username=flowable-deployment
+process.engine.api.password=5091071
+----
+
+These two properties are **also** the credentials the core uses when it calls out to the external BPMN engine's deployment API. Treat them as a shared secret between the two processes.
+
+[WARNING]
+====
+`.roles()` with no arguments produces a user with no authorities. `@PreAuthorize("hasRole('X')")` on any external controller method would therefore deny every call. If you need fine-grained authorization on external endpoints, give the in-memory user explicit roles or replace `UserDetailsService` with a custom implementation.
+====
+
+== Web MVC Configuration — ExternalProcessWebMvcConfig
+
+`ExternalProcessWebMvcConfig` is the root `@Configuration` for the external web context.
+
+[source,java]
+----
+@Configuration
+@ComponentScan
+@EnableAutoConfiguration
+@EnableTransactionManagement(proxyTargetClass = true)
+@Import(ExternalProcessSecurityConfig.class)
+public class ExternalProcessWebMvcConfig extends WebMvcConfigurationSupport {
+
+    @Override
+    protected void addFormatters(FormatterRegistry registry) {
+        registry.addConverter(new CustomEnumConverter());
+    }
+}
+----
+
+What it does:
+
+* **Runs as a child Spring Boot context.** The main app bootstraps with a hierarchical context — a parent non-web context, then `ExternalProcessWebMvcConfig` as the first servlet child, then the main `WebMvcConfig` as the second servlet child. Each child gets its own port and context path.
+* **`@ComponentScan`** picks up the controllers under `com.timvero.flowable.external.controller`, the service under `...external.service`, and the exception advice under `...external.common`.
+* **`@Import(ExternalProcessSecurityConfig.class)`** attaches the HTTP-Basic filter chain described above.
+* **`CustomEnumConverter`** lets `@RequestParam` and path variables parse SDK `CustomEnum` values (including `FeatureDataType`, `DecisionFactValue`) from their string codes.
+
+=== Boot Wiring
+
+This is how the external context is added alongside the main web app at startup:
+
+[source,java]
+----
+// Child context — workflow engine integration.
+// ExternalProcessWebMvcConfig is provided by the core — do not modify.
+parentBuilder.child(ExternalProcessWebMvcConfig.class)
+    .web(WebApplicationType.SERVLET)
+    .properties(
+        "server.port=${workflow.server.port:8380}",
+        "server.servlet.context-path=${workflow.server.context-path:/external-process}",
+        "management.server.port=-1")
+    .run(args);
+----
+
+Defaults result in all external endpoints living under `http://<host>:8380/external-process/...`.
+
+[NOTE]
+====
+Because the external context extends `WebMvcConfigurationSupport`, it takes over Spring MVC configuration for its own context only. It does **not** collide with the main application's `WebMvcConfig` — they live in separate child contexts.
+====
+
+== Controllers
+
+All four controllers are standard `@RestController` classes mapped at distinct path prefixes inside the `/external-process` context.
+
+=== ProcessExecutionApiController
+
+Lifecycle signals written back by the external workflow engine as a process instance progresses.
+
+Base path: `/process-execution`
+
+[cols="1,3,3,2", options="header"]
+|===
+|Method |Path |Request Body |Effect
+
+|`POST`
+|`/process-started`
+|`{ "processInstanceId": UUID }`
+|Sets execution status to `STARTED`
+
+|`POST`
+|`/process-completed`
+|`{ "processInstanceId": UUID }`
+|Sets execution status to `COMPLETED`
+
+|`POST`
+|`/process-failed`
+|`{ "processInstanceId": UUID, "failureReason": String }`
+|Sets status to `FAILED` and stores `failureReason`
+|===
+
+All three delegate to `ProcessExecutionService.updateExecution(processInstanceId, mutator)`:
+
+[source,java]
+----
+@PostMapping("/process-completed")
+public void processCompleted(@RequestBody ProcessExecutionStatusForm form) {
+    executionService.updateExecution(form.getProcessInstanceId(), execution -> {
+        execution.setStatus(ProcessExecutionStatus.COMPLETED);
+    });
+}
+----
+
+All endpoints return HTTP 200 with no body on success. They are the canonical way an external engine reports back state transitions defined in `ProcessExecutionStatus` — see <<flowable-internals>>.
+
+=== ExternalProcessController
+
+The main write surface for a running process: save values that end up in `ExecutionResult.values` and decision facts that drive the follow-up policy in the core.
+
+Base path: `/process`
+
+[cols="1,4,3,3", options="header"]
+|===
+|Method |Path |Inputs |Effect
+
+|`POST`
+|`/{processInstanceId}/save-value`
+|Query: `fieldName`, `value`, `dataType` (`FeatureDataType` enum)
+|Wraps into `TypedValue(dataType, value)` and stores in the execution result
+
+|`POST`
+|`/{processInstanceId}/save-fact`
+|Query: `fact`, `value` (`DecisionFactValue` enum)
+|Adds a `DecisionFact` to the execution result
+
+|`POST`
+|`/{processInstanceId}/save-alert-fact`
+|JSON: `{ factCode, declineReasonCode }`
+|Adds a `FixedDecisionFact.alert` — the execution will surface a decline reason
+
+|`POST`
+|`/{processInstanceId}/save-warning-fact`
+|JSON: `{ factCode, decisionDepartmentCode, schemaCode? }`
+|Adds a `FixedDecisionFact.warning` — routed to a decision department, optionally with a form schema
+
+|`POST`
+|`/{processInstanceId}/save-info-fact`
+|JSON: `{ factCode }`
+|Adds a `FixedDecisionFact.info` — non-blocking informational signal
+|===
+
+Mixed input style: `save-value` and `save-fact` use query parameters (easier for BPMN service tasks to wire up), while the fixed-fact endpoints use JSON bodies with `@Valid` records for multi-field payloads:
+
+[source,java]
+----
+public record SaveWarningForm(
+    @NotBlank String factCode,
+    @NotBlank String decisionDepartmentCode,
+    String schemaCode
+) { }
+----
+
+All endpoints return HTTP 200 with no body. Validation failures on the JSON records are caught by the SDK's Jakarta Validation and surface as 400 via the exception advice.
+
+=== ExternalDataProviderController
+
+The read surface — how the external engine asks timveroOS for data about the entity a given process is evaluating.
+
+Base path: `/external-data`, `produces = application/json`
+
+[cols="1,4,4,3", options="header"]
+|===
+|Method |Path |Response |Notes
+
+|`GET`
+|`/available-data-sources`
+|`["source1", "source2", …]`
+|All data sources the core knows about, via `ProcessEntityFeatureService.getAllAvailable()`
+
+|`GET`
+|`/get-data/{processInstanceId}/{dataSource}`
+|`{ "feature1": {"dataType": "NUMBER", "value": "42"}, … }`
+|Features resolved for the execution's entity, keyed by feature name
+|===
+
+The data payload is a `Map<String, TypedValueDTO>` where each entry is:
+
+[source,java]
+----
+record TypedValueDTO(FeatureDataType dataType, String value) { }
+----
+
+This matches the `TypedValue` shape used by `ExternalProcessController.save-value` — what you read out can be round-tripped back in.
+
+==== Error Response: HTTP 550
+
+`ExternalDataProviderController` uses a non-standard `550` status when `FeatureResolvingException` is thrown — i.e., the data source is known but cannot be resolved for this entity:
+
+[source,java]
+----
+try {
+    Collection<Feature> features = entityFeatureService.getFeatures(processInstanceId, dataSource);
+    return ResponseEntity.ok(Lang.toMap(features, Feature::getName, this::toDTO));
+} catch (FeatureResolvingException e) {
+    return ResponseEntity.status(550).body(Map.of("message", e.getMessage()));
+}
+----
+
+[TIP]
+====
+`550` is unregistered in the HTTP spec — treat it as a vendor-specific signal from timveroOS meaning "the data source is configured but the provider can't produce a value right now." External engines should distinguish this from generic `5xx` and usually route it to a retry / manual-review branch.
+====
+
+=== UnderwritingOptionsController
+
+Read-only catalog endpoints so the external engine can populate dropdowns and validate codes it is about to submit via `ExternalProcessController`.
+
+Base path: `/options`
+
+[cols="1,3,4", options="header"]
+|===
+|Method |Path |Response
+
+|`GET`
+|`/decision-department`
+|`[{ "code": "...", "description": "..." }, …]` — all active decision departments
+
+|`GET`
+|`/decline-reason`
+|`[{ "code": "...", "description": "..." }, …]` — all active decline reasons
+
+|`GET`
+|`/form-schema`
+|`[{ "code": "...", "description": "..." }, …]` — all active form schemas
+|===
+
+The three responses use three separate record types (`DecisionDepartmentModel`, `DeclineReasonModel`, `FormSchemaModel`) even though they share the same shape, so future fields on one don't leak into the others.
+
+== Exception Handling — FlowableExceptionControllerAdvice + MisconfigurationException
+
+A single `@RestControllerAdvice` governs error responses for all four controllers:
+
+[source,java]
+----
+@RestControllerAdvice
+public class FlowableExceptionControllerAdvice {
+
+    @ExceptionHandler(MisconfigurationException.class)
+    public ResponseEntity<String> exception(MisconfigurationException ex) {
+        return new ResponseEntity<>(ex.getMessage(), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<String> exception(HttpServletRequest req, Exception ex) {
+        logger.error("Error on request: " + req.getRequestURL() + "?" + req.getQueryString(), ex);
+        return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+}
+----
+
+=== HTTP Status Mapping
+
+[cols="2,1,3", options="header"]
+|===
+|Exception |HTTP Status |Response Body
+
+|`MisconfigurationException`
+|`400 Bad Request`
+|`ex.getMessage()` as `text/plain` — a human-readable description
+
+|`FeatureResolvingException` (handled locally in `ExternalDataProviderController`)
+|`550` (non-standard)
+|`{ "message": "<reason>" }`
+
+|Any other `Exception`
+|`500 Internal Server Error`
+|Empty body (the cause is logged but not leaked)
+|===
+
+=== MisconfigurationException — Dual Purpose
+
+`MisconfigurationException` is both an HTTP error **and** a business-record signal. When `ProcessActionServiceProvider` throws it, the exception is:
+
+1. **Saved to the database** via `ExceptionEntityService.saveException(exception, "Flowable")` and attached to the `ProcessExecution` (`execution.setExecutionException(exceptionEntity)`) — the transaction commits because the action service uses `@Transactional(noRollbackFor = MisconfigurationException.class)`.
+2. **Rethrown** up to the advice, which maps it to HTTP 400.
+
+The external caller sees a `400` with a readable message; a back-office user viewing the execution sees the same error on the UI. The two are the same record.
+
+== ProcessActionServiceProvider — SPI for Write Actions
+
+`ProcessActionServiceProvider` is a single `@Service` that the external controllers call. All write actions funnel through it.
+
+[source,java]
+----
+@Service
+public class ProcessActionServiceProvider {
+
+    @Autowired private ProcessExecutionService processExecutionService;
+    @Autowired private DeclineReasonService declineReasonService;
+    @Autowired private ExceptionEntityService exceptionEntityService;
+    @Autowired private DecisionDepartmentService decisionDepartmentService;
+    @Autowired private FormSchemaService formSchemaService;
+
+    @Transactional public void saveValue(UUID pid, String key, TypedValue value) { … }
+    @Transactional public void saveFact(UUID pid, String code, DecisionFactValue value) { … }
+
+    @Transactional(noRollbackFor = MisconfigurationException.class)
+    public void saveAlert(UUID pid, String factCode, String declineReasonCode) { … }
+
+    @Transactional(noRollbackFor = MisconfigurationException.class)
+    public void saveWarning(UUID pid, String factCode, String deptCode, String schemaCode) { … }
+
+    @Transactional public void saveInfo(UUID pid, String factCode) { … }
+}
+----
+
+Design notes:
+
+* **`findByProcessInstanceId(UUID)`** loads the `ProcessExecution` first on every call — the execution must exist, otherwise the service's own exception bubbles up as 500.
+* **Catalog lookups go through `@Service`s.** `DeclineReason`, `DecisionDepartment`, and `FormSchema` are looked up by code and must be `active`. Unknown codes produce `MisconfigurationException`.
+* **`noRollbackFor = MisconfigurationException.class`** is critical. It lets the exception-persistence write commit even though the exception is propagated. Without it, the `executionException` attachment would be rolled back along with the business mutation — and you would lose diagnostics.
+* **Result object mutation** — `execution.getExecutionResult().getValues().put(...)`, `.getDecisionFacts().add(...)`, `.getFixedDecisionFacts().add(...)` — is how the provider writes; JPA dirty-checking flushes the aggregate root.
+
+The provider is the seam where a project can add its own server-side handling of external calls (e.g., logging, metrics, business validation) by replacing or decorating the bean. Treat it as the SPI between the REST surface and the `ProcessExecution` domain model.
+
+== Advanced Patterns
+
+=== Adding a Custom External Endpoint
+
+Drop a new `@RestController` into `com.timvero.flowable.external.controller` (or any package reachable from `ExternalProcessWebMvcConfig`'s `@ComponentScan`) and it will be picked up automatically. Use `ProcessActionServiceProvider` for writes; call your own services for reads.
+
+[source,java]
+----
+@RestController
+@RequestMapping("/custom")
+public class CustomExternalController {
+
+    @Autowired private ProcessActionServiceProvider actionService;
+    @Autowired private MyReportService reportService;
+
+    @PostMapping("/{processInstanceId}/report")
+    public ReportDto report(@PathVariable UUID processInstanceId, @Valid @RequestBody ReportForm form) {
+        return reportService.generate(processInstanceId, form);
+    }
+}
+----
+
+The controller inherits the HTTP Basic filter chain automatically. Do not declare your own `SecurityFilterChain` in the same context — the existing one is `@Bean`-registered at the root `@Configuration`.
+
+=== Replacing the Authentication Mechanism
+
+To move from a single in-memory user to something richer (API keys, JWT, mTLS), provide a replacement `SecurityFilterChain` bean in a configuration that replaces `ExternalProcessSecurityConfig`. You cannot easily override `ExternalProcessSecurityConfig` because it is imported by name — but you **can** add a higher-priority filter chain bean and authorize requests against your own `UserDetailsService`.
+
+[source,java]
+----
+@Configuration
+@EnableWebSecurity
+public class ApiKeyExternalSecurityConfig {
+
+    @Bean
+    @Order(1)
+    SecurityFilterChain apiKeyChain(HttpSecurity http, ApiKeyFilter filter) throws Exception {
+        http.csrf(AbstractHttpConfigurer::disable);
+        http.addFilterBefore(filter, UsernamePasswordAuthenticationFilter.class);
+        http.authorizeHttpRequests(r -> r.anyRequest().authenticated());
+        return http.build();
+    }
+}
+----
+
+Register it in the same child context by adding it to the component scan or `@Import` of a configuration that is picked up there. Leave the default chain in place only if you need the Basic path as a fallback.
+
+=== Debugging an External Caller
+
+Because the external context runs on a separate port, it has its own actuator space (disabled by default via `management.server.port=-1`). To troubleshoot a misbehaving BPMN service task:
+
+1. **Check `ProcessExecution.executionException`** in the admin UI for the `processInstanceId` — most caller errors surface there as `MisconfigurationException`.
+2. **Enable request logging on the external context.** `FlowableExceptionControllerAdvice` logs every uncaught exception with the full request URL + query string; bump `org.springframework.web` to `DEBUG` for the external context only and you'll see the matching request log.
+3. **Hit `/external-data/available-data-sources` manually** with the configured credentials to confirm the external context is live and the caller's credentials are right, before chasing BPMN-specific issues.
+4. **For credential issues**, `process.engine.api.username` / `.password` must match on both sides. A 401 at the external port means a mismatch; a 401 at the core-to-engine call means the engine has the wrong credentials.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Treat `process.engine.api.username` / `.password` as a shared secret** — it authenticates both directions and must match the engine's configuration
+* {ok} **Run the external context on a separate port** — the default `8380` and context path `/external-process` should be preserved so operators can firewall it independently from the main API
+* {ok} **Prefer `save-fact` over `save-value` for anything the core reasons about** — facts carry a typed `DecisionFactValue` and are first-class citizens of the decision result; values are raw key/value pairs
+* {ok} **Validate codes against `/options/*` at engine-design time** — decision department, decline reason, and form schema codes must exist as active records in the core
+* {ok} **Handle HTTP 550 explicitly** — it signals a resolvable but currently-unavailable data source, different from 5xx
+* {ok} **Add `@PreAuthorize` only after adding roles to the in-memory user** — otherwise method security denies every call
+* {ok} **Use the `ProcessActionServiceProvider` SPI for business logic**, not from your controller body — it keeps the transactional boundary and the exception-persistence behaviour intact
+* {ok} **Keep external controllers thin** — HTTP mapping, validation, delegation; business logic belongs in `@Service`s that can be tested without MockMvc
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Calling the external API from a browser.** No CORS is configured; server-to-server only. If you need browser access, add a thin proxy in the main app context
+* {bad} **Hard-coding the external URL `/external-process` in your BPMN.** Use a process variable or external configuration; context path is operator-configurable
+* {bad} **Re-implementing `saveAlert` / `saveWarning` in your own controller.** The `noRollbackFor = MisconfigurationException.class` on the service method is load-bearing — rewriting without it loses the saved `ExceptionEntity` on any failure
+* {bad} **Mixing external and main-app endpoints under the same port.** Both contexts extend `WebMvcConfigurationSupport`; merging them will produce an ambiguous-bean failure at startup
+* {bad} **Throwing `MisconfigurationException` from code outside `ProcessActionServiceProvider`** without also persisting it via `ExceptionEntityService`. The caller gets 400, but no diagnostic trail in the execution record
+* {bad} **Changing `HttpStatus` to 400 for `FeatureResolvingException`.** External callers distinguish 550 (data source unavailable) from 400 (bad request) — collapsing them breaks retry policies
+* {bad} **Assuming the external user has any authorities.** `.roles()` is called with zero arguments; the authenticated principal has none
+* {bad} **Relying on session / cookies.** The filter chain is stateless Basic; no `JSESSIONID` is issued
+* {bad} **Logging request bodies in the exception advice.** The current advice logs only URL + query string; bodies may contain customer PII — any change needs a redaction policy
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `process.engine.api.username` and `process.engine.api.password` are set via environment variables or a secret store, never committed
+* {todo} The external context port (`workflow.server.port`, default `8380`) and context path (`workflow.server.context-path`, default `/external-process`) are configured explicitly
+* {todo} Firewall rules expose the external port only to the workflow engine host(s)
+* {todo} TLS is terminated in front of the external context (reverse proxy or Spring Boot SSL)
+* {todo} The workflow engine is configured with the same credentials and base URL — both sides must match
+* {todo} `management.server.port=-1` is set on the external child context so actuator endpoints don't leak through the Basic chain unintentionally
+* {todo} A monitoring job probes `GET /options/decision-department` with the configured credentials to detect downtime and credential drift
+* {todo} Dashboards surface `ProcessExecution.executionException` counts — spikes signal BPMN referencing invalid `declineReason` / `decisionDepartment` / `formSchema` codes
+* {todo} Alerts fire on sustained HTTP 500 from the external context (the generic advice returns empty body; only logs reveal the cause)
+* {todo} The external context has its own log appender / correlation id so its traffic can be separated from main-app traffic in observability tooling
+* {todo} Load tests cover the `save-value` / `save-fact` write path under the peak concurrency the workflow engine can produce for a single execution
+* {todo} The catalog endpoints (`/options/*`) are cached by the caller if it polls frequently — they query active catalog tables on every request
+* {todo} Any custom external controller added in the project has authorization reviewed (default chain authenticates but does not authorize beyond "logged in")
+* {todo} BPMN-side error handling distinguishes HTTP 400 (`MisconfigurationException`), HTTP 550 (`FeatureResolvingException`), and HTTP 500 (everything else) and routes each to an appropriate branch
+
+---
+
+**Related:** <<workflow-integration>>, <<flowable-internals>>, <<api-module>>, <<api-integration>>, <<user-management>>, <<user-roles>>
+
+**Next:** <<flowable-internals>> — the `ProcessExecution`, `ExecutionResult`, `DecisionFact`, `TypedValue`, and `Feature` domain model that these endpoints mutate and expose.

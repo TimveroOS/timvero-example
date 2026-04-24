@@ -1,3 +1,4 @@
+[[payment-hub]]
 = Payment Hub — Automatic Payment Allocation
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -1531,6 +1532,384 @@ Test full cycle: creation → allocation → void +
 Verify credit recalculation after each operation +
 Test partial allocation
 
+[[payment-hub-sdk-internals]]
+== SDK Internals — Paymenthub Implementation
+
+This section documents the actual SDK package layout of `com.timvero.transfer.paymenthub` so developers know where each moving part lives, how the beans are wired, and which classes they can subclass or replace. It complements — not replaces — the user-facing sections above.
+
+For parallel coverage of servicing primitives these classes operate on, see <<credit-servicing>>. For the generic transaction framework that `PaymentHubTransaction` extends, see <<payment-transactions>>. End-user workflow walkthroughs live in <<credit-management>>. Entity base classes referenced throughout (like `UndeletableEntity`, `NamedEntity`) are covered in <<entity-module-sdk-reference-hierarchy>>.
+
+=== Package Layout
+
+The `paymenthub` module is organised into seven subpackages plus three root-level interfaces/services:
+
+[cols="1,3",options="header"]
+|===
+|Subpackage |Responsibility
+
+|`paymenthub` (root)
+|Allocation SPI (`AllocationTargetProvider`, `AllocationPlanProvider`) and the orchestration service `PaymentHubService`.
+
+|`paymenthub.entity`
+|JPA entity `PaymentHubTransaction`, its repository, and the typed `PaymentTransactionPurpose` enum.
+
+|`paymenthub.handler`
+|`PaymentTransactionHandler` implementation that kicks off allocation when a transaction lifecycle event reaches `SUCCEED`.
+
+|`paymenthub.action`
+|`EntityActionController` subclasses for Manual Allocation and the (currently disabled) Smart Allocation UI action.
+
+|`paymenthub.controller`
+|`AbstractTransactionController` + the concrete list/view `PaymentTransactionController`.
+
+|`paymenthub.filter`
+|`ListFilter` hierarchy for the transaction list — annotation-driven JPA filtering via `@Field` / `Restriction`.
+
+|`paymenthub.label`
+|Four `EntityLabel` beans that mark a transaction `unallocated` / `partlyAllocated` / `allocated` / `overAllocated`, plus the status-copying `PaymentHubTransactionStatusLabel`.
+
+|`paymenthub.tab`
+|Two `EntityTabController` tabs — Credits and Trace — rendered on the transaction view.
+|===
+
+=== Root Package — SPI and Orchestration
+
+Three root classes form the allocation SPI and its executor.
+
+==== AllocationTargetProvider<E>
+
+SPI that selects which credits are even considered for a given transaction. Typed by the owner entity class `E` (usually `Client`):
+
+[source,java]
+----
+public interface AllocationTargetProvider<E extends Persistable<UUID>> {
+    List<? extends Credit> provideAllocationTargets(
+        LocalDate forDay,
+        PaymentTransactionPurpose<E> purpose,
+        E owner,
+        CurrencyUnit currency);
+}
+----
+
+One bean per owner class is required — `PaymentHubService` asserts `beanNames.length == 1` during context refresh.
+
+==== AllocationPlanProvider<E>
+
+SPI that decides how a pre-filtered list of credits should be paid. Returns an ordered list of `AllocationPlanItem` records — the order is the allocation priority:
+
+[source,java]
+----
+public interface AllocationPlanProvider<E extends Persistable<UUID>> {
+    List<AllocationPlanItem> provideAllocationPlan(
+        LocalDate forDay, List<? extends Credit> credits,
+        PaymentTransactionPurpose<E> purpose, E owner, CurrencyUnit currency);
+
+    record AllocationPlanItem(
+        UUID creditId, String shortId, String description,
+        CreditPaymentType paymentType, MonetaryAmount amount) { }
+}
+----
+
+==== PaymentHubService
+
+The service wires the SPI beans together and performs the allocation arithmetic. Key facts about its implementation:
+
+* `ApplicationContextAware` — on `setApplicationContext` it enumerates every `PaymentTransactionPurpose` value, resolves its parameterised bean name via `ResolvableType.forClassWithGenerics(...)` and caches the provider maps. No SpEL, no `@Qualifier` — purely generic-type-based lookup.
+* Provider cache keys are `Class` objects from `PaymentTransactionPurpose.getEntityClass()`. Registering a `PaymentTransactionPurpose` without matching providers fails startup with a clear message — see <<payment-hub-anti-patterns>>.
+* `allocate(transaction, today)` is the full loop: resolve targets, build the plan via `findAllocation`, call `apply` per plan item, then invoke `CreditCalculationService.calculate` per affected credit.
+* `findAllocation` walks the plan using a `Mutator` accumulator initialised with the current unallocated amount, clamping each item with `Lang.min(item.amount(), remaining)`.
+* Three money getters have subtle semantics you should prefer over the deprecated `PaymentHubTransaction#getAvailableAmount()`:
+
+[cols="1,3",options="header"]
+|===
+|Method |Behaviour
+
+|`getUnallocatedAmount(t)` {ok}
+|`amount - sum(APPROVED payments) - activeRefund`, floored at zero. The canonical amount to drive new allocations or UI max limits.
+
+|`getActualAmount(t)` {ok}
+|`amount - activeRefund`. The post-refund transaction size; does NOT subtract already-allocated payments.
+
+|`getActiveRefund(t)`
+|Sum of refund-target transactions that are either in-progress (`!status.isComplete()`) or already `isSuccessful()`. Failed and cancelled refunds are excluded.
+|===
+
+[source,java]
+----
+// prefer
+MonetaryAmount available = paymentHubService.getUnallocatedAmount(tx); // {ok}
+
+// deprecated — misses pending refunds / chargebacks
+MonetaryAmount available = tx.getAvailableAmount(); // {bad}
+----
+
+=== Entity Subpackage — `paymenthub.entity`
+
+==== PaymentHubTransaction
+
+Extends `PaymentTransaction` with the single-table-inheritance discriminator `"HUB"` and adds three fields that matter to allocation:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("HUB")
+@Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
+public class PaymentHubTransaction extends PaymentTransaction implements NamedEntity {
+
+    @Column
+    private UUID ownerId;                                     // {ok} generic owner FK
+
+    @Column(updatable = false)
+    @Type(value = CustomEnumType.class)
+    private PaymentTransactionPurpose<?> purpose;             // {ok} immutable after insert
+
+    @OneToMany(fetch = FetchType.LAZY,
+               cascade = {CascadeType.MERGE, CascadeType.PERSIST})
+    @JoinColumn(name = "payment_transaction_id")
+    @OrderBy(value = "date")
+    @NotAudited
+    private List<CreditPayment> payments;
+}
+----
+
+Non-obvious wiring:
+
+* `ownerId` is a raw UUID, not a typed relation — this is what lets one entity serve many owner types. The mapping back to a typed entity is via `PaymentTransactionPurpose.getEntityClass()` + `EntityManager.find(...)` in `PaymentHubService.getOwner()`.
+* `purpose` is persisted with `CustomEnumType` so new purposes can be declared at runtime without schema changes (see <<payment-hub-payment-transaction-purpose>>).
+* `payments` is `@NotAudited` — Envers will not version each allocation; revisions track transaction-level mutations only.
+* `getAvailableAmount()` is `@Deprecated(since = "8.0", forRemoval = true)` because it ignores pending refund transactions. Callers MUST migrate to `PaymentHubService#getUnallocatedAmount`.
+
+[[payment-hub-payment-transaction-purpose]]
+==== PaymentTransactionPurpose<E>
+
+Custom enum (extends `CustomEnum<PaymentTransactionPurpose<E>>`) that binds a textual name to an owner `Class<E>`:
+
+[source,java]
+----
+public static final PaymentTransactionPurpose<Client> GENERAL =
+    new PaymentTransactionPurpose<>("GENERAL", Client.class);
+----
+
+The generic parameter is what makes the provider lookup in `PaymentHubService` type-safe — `ResolvableType.forClassWithGenerics(AllocationTargetProvider.class, entityClass)` is resolved against each registered purpose at startup.
+
+==== PaymentHubTransactionRepository
+
+Extends `JpaRepository`, `JpaSpecificationExecutor`, and `SynchronousAccessRepository` — the last one is what enables pessimistic-lock helpers used by the allocation flow. Only five finders are declared; anything else goes through `Specification`:
+
+[source,java]
+----
+boolean existsByOwnerId(UUID ownerId);
+boolean existsByPaymentsId(UUID paymentId);
+boolean existsByOwnerIdAndStatusIn(UUID ownerId, Collection<TransactionStatus>);
+PaymentHubTransaction findByPaymentsId(UUID paymentId);
+List<PaymentHubTransaction> findAllByOwnerId(UUID ownerId);
+----
+
+=== Handler Subpackage — `paymenthub.handler`
+
+==== PaymentHubTransactionHandler
+
+Implements `PaymentTransactionHandler` (from the transaction framework in <<payment-transactions>>). On every lifecycle callback it unproxies via `EntityUtils.initializeAndUnproxy`, checks for a `PaymentHubTransaction` + `SUCCEED` status, and invokes `hubService.allocate(...)` with the completion-date derived from `completedAt` in system zone:
+
+[source,java]
+----
+@Override
+public void handle(PaymentTransaction t) {
+    t = EntityUtils.initializeAndUnproxy(t);
+    if (t instanceof PaymentHubTransaction transaction) {
+        if (transaction.getStatus() == TransactionStatus.SUCCEED) {
+            hubService.allocate(transaction,
+                LocalDate.ofInstant(transaction.getCompletedAt(),
+                                    ZoneId.systemDefault()));
+        }
+    }
+}
+----
+
+Note: the handler is a plain POJO with constructor injection — register it as a Spring bean via your own `@Configuration` if you want allocation to run automatically on lifecycle transitions.
+
+=== Action Subpackage — `paymenthub.action`
+
+==== ManualAllocationPaymentTransactionAction
+
+Mounted at `/manual-distribute` with `@Order(2000)`. It is an `EntityActionController<Long, PaymentHubTransaction, DistributeTransactionForm>` — see entity-action patterns in <<entity-module-sdk-reference-hierarchy>>.
+
+Key behaviour:
+
+* `when(...)` guard checks `ownerId != null && status.isSuccessful() && getUnallocatedAmount.isPositive()` — the action disappears from the UI when there is nothing to allocate.
+* Rejects `amount > unallocated` with a `ValidationException.binding()` bound to the `amount` field.
+* Accepts an optional `?credit=<uuid>` query param — if present and valid, the form pre-selects that credit; otherwise the operator picks from `paymentHubService.getAllocationTargets(...)`.
+* After `paymentHubService.apply(...)` it ALWAYS calls `creditCalculationService.calculate(credit.getId(), date, credit.getCalculationDate())` and `reloadPageHelper.reload(t)`. Forgetting either step is the #1 cause of stale schedules.
+
+==== SmartAllocationPaymentTransactionAction
+
+The source file is present but entirely commented out — the Smart Allocation UI is currently driven via a different flow or disabled. Do not reintroduce this class; copy the pattern into your own `@Controller` if you need a custom smart-allocation action.
+
+=== Controller Subpackage — `paymenthub.controller`
+
+Two classes, one abstract:
+
+[source,java]
+----
+@RequestMapping("/transaction")
+public abstract class AbstractTransactionController<F extends ListFilter>
+        extends ViewableFilterController<Long, PaymentHubTransaction, F> {
+
+    @Override
+    protected void assembleViewModel(PaymentHubTransaction entity, Model model) {
+        model.addAttribute("trace", entity.getTrace());
+        model.addAttribute("transaction", entity);
+    }
+
+    @Override
+    protected String getHeaderPage() { return "/transaction/header"; }
+}
+----
+
+`PaymentTransactionController` is the concrete binding to `PaymentTransactionFilter`, guarded by:
+
+[source,java]
+----
+@ConditionalOnProperty(value = "core.transaction.controller.enabled",
+                       havingValue = "true", matchIfMissing = true)
+----
+
+Set `core.transaction.controller.enabled=false` in `application.properties` to disable the default list entirely and replace it with your own controller.
+
+=== Filter Subpackage — `paymenthub.filter`
+
+The filter hierarchy is a thin vertical slice of the generic list-filter DSL (see <<list-filters-annotation-driven-jpa-query-dsl>> if available in your project):
+
+[source,java]
+----
+public abstract class AbstractPaymentTransactionFilter extends ListFilter { }
+
+public class PaymentTransactionFilter extends AbstractPaymentTransactionFilter {
+    @Field(restriction = Restriction.EQ, value = PaymentHubTransaction_.OWNER_ID)
+    private UUID clientId;
+    // ...
+}
+----
+
+`AbstractPaymentTransactionFilterService<F>` extends `FilterListService<PaymentHubTransaction, F>` and is the extension point for adding secondary filters (currency, date range, amount bucket) — subclass it and declare a `@Bean` of your subclass plus a matching `ListFilter`.
+
+=== Label Subpackage — `paymenthub.label`
+
+Five `EntityLabel<PaymentHubTransaction>` beans drive the list-view badges. Their boolean predicates are the authoritative definitions:
+
+[cols="1,3",options="header"]
+|===
+|Label bean |Predicate
+
+|`PaymentHubTransactionUnallocatedLabel`
+|`!actual.isZero() && allocated.isEmpty()`
+
+|`PaymentHubTransactionPartlyAllocatedLabel`
+|`!actual.isZero() && allocated.isPresent() && allocated.get().isLessThan(actual)`
+
+|`PaymentHubTransactionAllocatedLabel`
+|`allocated.map(a -> a.isEqualTo(actual)).orElse(false)`
+
+|`PaymentHubTransactionOverAllocatedLabel`
+|`allocated.isPresent() && allocated.get().isGreaterThan(actual)`
+
+|`PaymentHubTransactionStatusLabel`
+|`extends EntityStatusLabel<PaymentHubTransaction>` — wraps `PaymentTransaction::getStatus` so the transaction status shows up through the generic status-label renderer.
+|===
+
+`actual` is `paymentHubService.getActualAmount(tx)` (post-refund); `allocated` is `paymentHubService.getAllocatedAmount(tx)`. Note `OverAllocated` is a real state — it flags operator errors or race conditions where payments exceed the post-refund amount.
+
+=== Tab Subpackage — `paymenthub.tab`
+
+==== PaymentHubTransactionCreditTab
+
+At `/credits`, `@Order(8500)`, guarded by `@ConditionalOnBean(CreditViewOptions.class)` — the tab only appears in projects that have activated credit views.
+
+Rendering logic:
+
+. Resolve allocation targets via `paymentHubService.getAllocationTargets(tx, LocalDate.now())` — shows credits eligible for this transaction right now, not historical ones.
+. Collect the transaction's payments, then for each target credit filter its operations to the intersection of `{APPROVED, CANCELED, DECLINED, PENDING}` and the transaction's payment ids.
+. Expose `accounts` (from `CreditViewOptions.getAccountsOrder()`), the `creditPaymentsMap`, and the live action list via `entityActionMapping.getAvailableActions(...)`.
+. `isVisible` returns `true` only when `ownerId != null` — raw (pre-import) transactions won't show a Credits tab.
+
+==== PaymentHubTransactionTraceTab
+
+Bare tab at `/trace`, `@Order(10_500)`, visible only when `entity.getTrace() != null`. The template is expected at `/transaction/tab/trace` (resolved by convention from the `@Order` + `@RequestMapping` pair).
+
+[[transfer-method-sdk]]
+== Transfer Methods — `transfer.method`
+
+The tiny `com.timvero.transfer.method` package declares the abstract `PaymentMethod` entity used by payment transactions (and referenced from `PaymentHubTransaction.paymentMethod` in the larger transfer framework). Two files, one subpackage.
+
+=== PaymentMethod — Base Entity
+
+Abstract single-table-inheritance root for any tokenised payment instrument (card token, SEPA mandate, wallet handle, etc.):
+
+[source,java]
+----
+@Entity
+@Table(name = "payment_method")
+@DiscriminatorColumn(name = "d_type", discriminatorType = DiscriminatorType.STRING)
+public abstract class PaymentMethod extends UndeletableEntity<Long> {
+
+    @Column(name = "exported_id")
+    private String exportedId;          // id in the external PSP
+
+    @Column(name = "d_type", nullable = false, insertable = false, updatable = false)
+    private String type;                // discriminator mirror
+
+    @Column(name = "token")
+    private String token;               // PSP-owned opaque token
+
+    protected PaymentMethod() {}
+    protected PaymentMethod(String type) { this.type = type; }
+
+    public abstract boolean isExpired();
+}
+----
+
+Design notes:
+
+* Extends `UndeletableEntity<Long>` — the framework forbids hard deletes; archive via your own soft-delete flag on the subclass. See <<entity-module-sdk-reference-hierarchy>>.
+* `d_type` is mapped twice — as the JPA discriminator AND as a read-only `type` column — so the concrete subtype is queryable without polymorphic fetch.
+* `exportedId` is reserved for the external payment provider's id (Stripe, Adyen, local PSP). `token` is for the provider-issued re-use handle.
+* `isExpired()` is abstract — every concrete subtype MUST answer it. Callers rely on this when building `AllocationTargetProvider` results for auto-debit scenarios.
+
+Minimal concrete subclass:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("CARD")
+public class CardPaymentMethod extends PaymentMethod {
+
+    @Column(name = "card_last4") private String last4;
+    @Column(name = "expires_at") private YearMonth expiresAt;
+
+    public CardPaymentMethod() { super("CARD"); }
+
+    @Override
+    public boolean isExpired() {
+        return expiresAt != null && YearMonth.now().isAfter(expiresAt);
+    }
+}
+----
+
+=== PaymentMethodRepository
+
+Fully-declarative — no custom finders:
+
+[source,java]
+----
+public interface PaymentMethodRepository extends
+        JpaRepository<PaymentMethod, Long>,
+        JpaSpecificationExecutor<PaymentMethod>,
+        SynchronousAccessRepository<PaymentMethod, Long> { }
+----
+
+`SynchronousAccessRepository` supplies `findByIdForUpdate` / pessimistic-lock helpers used when a payment method is consumed by an outgoing transfer. If you add finders, add them on a subclass interface in your project — do not modify the SDK.
+
+[[payment-hub-anti-patterns]]
 == Anti-Patterns
 Common mistakes when working with Payment Hub and how to avoid them.
 
@@ -1755,5 +2134,14 @@ Final checklist before launching Payment Hub in production.
 * {todo} Allocation results logging
 * {todo} Void operations logging
 * {todo} Metrics: transaction count by status
+
+=== SDK Internals Wiring
+[.unstyled]
+
+* {todo} All call sites migrated from deprecated `PaymentHubTransaction#getAvailableAmount()` to `PaymentHubService#getUnallocatedAmount(tx)` (refund-aware)
+* {todo} Exactly one `AllocationTargetProvider<E>` and one `AllocationPlanProvider<E>` per registered `PaymentTransactionPurpose` — `PaymentHubService` startup assertion will fail otherwise
+* {todo} `PaymentHubTransactionHandler` registered as a `@Bean` if automatic allocation on lifecycle `SUCCEED` is desired
+* {todo} Concrete `PaymentMethod` subclass implements `isExpired()` and uses a unique `@DiscriminatorValue`
+* {todo} `core.transaction.controller.enabled` explicitly set if the default `PaymentTransactionController` / `PaymentTransactionFilterService` is being replaced
 * {todo} Metrics: average allocation time
 * {todo} Alerts on allocation errors

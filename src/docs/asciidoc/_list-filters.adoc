@@ -1,0 +1,797 @@
+[[list-filters]]
+= List Filters — annotation-driven JPA query DSL
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The list filter module (`com.timvero.ground.filter`) is a declarative DSL for building paginated, sortable, filterable JPA queries from a simple DTO. You annotate a `ListFilter` subclass with `@Field`/`@Restriction` declarations, the runtime reads them reflectively, and `FilterSupport` produces a `TypedQuery<E>` with the right `WHERE`, `ORDER BY`, `LIMIT`, and `OFFSET` — no manual `CriteriaBuilder` code. The same annotations feed the frontend filter panel (via `FilterDescriptor`) and Excel export (via `ExcelExportProcessor`).
+
+== What You Need to Know
+
+The module has **four cooperating pieces** — each serves a distinct purpose:
+
+[cols="1,3,3", options="header"]
+|===
+|Piece |Role |Key types
+
+|**Annotations** (`annotation/`)
+|Declare filter semantics on DTO fields — what column to filter, what restriction (EQ, IN, LIKE, etc.), optional value converter, optional custom path resolver
+|`@Field`, `@Fields`, `@Restriction`, `@Order`, `@Converter`, `FieldPathResolver`
+
+|**Base** (`base/`)
+|Runtime that reads annotations and produces JPA queries
+|`ListFilter` (DTO base), `FilterSpecification` (annotation → JPA Predicate), `FilterSupport` (@Service — executes paginated queries), `NotFoundException`
+
+|**List** (`list/`)
+|Controller-side machinery — turns a list request into a `FilterPage<R>` with pagination metadata plus frontend descriptors
+|`FilterListService<E, LF>` (abstract controller base), `FilterDescriptor`, `FilterElement`, `FilterPage`, `FilterValue`, `FilterValues`
+
+|**Export** (`export/`)
+|Excel export of filtered results via JXLS templates + JEXL expressions
+|`ExcelExportProcessor`, `ExcelProcessorModel`, `JexlCustomFunctions`
+|===
+
+Key characteristics:
+
+- **Fully declarative** — the filter DTO is a plain POJO; annotations wire everything
+- **Generics-driven** — `FilterListService<ExampleCredit, ExampleCreditFilter>` — Spring resolves both types at construction via `ResolvableType`
+- **Works with any JPA entity** — requires only `EntityManager` (no Spring Data repo)
+- **Integrated with `CustomEnum`** — enum-typed filter fields automatically populate dropdown values
+- **Case-insensitive LIKE by default** — both sides lowercased before comparison
+
+== Architecture Overview
+
+[source]
+----
+       HTTP request (?status=ACTIVE&page=2&sort=title)
+                          │
+                          ▼
+     ┌─────────────────────────────────────┐
+     │  Spring MVC binds to filter DTO     │
+     │  extends ListFilter                 │
+     │    @Field(restriction = IN)         │
+     │    private CreditStatus[] status;   │
+     └───────────────────┬─────────────────┘
+                         │
+                         ▼
+     ┌─────────────────────────────────────┐
+     │  FilterListService.doFilter(filter) │
+     │    └─ filterSupport.readPage()      │
+     └───────────────────┬─────────────────┘
+                         │
+                         ▼
+     ┌─────────────────────────────────────┐
+     │  FilterSupport                      │
+     │    1. new FilterSpecification(f)    │
+     │    2. CriteriaBuilder query         │
+     │    3. apply spec → WHERE + ORDER BY │
+     │    4. first/max results             │
+     │    5. count query                   │
+     └───────────────────┬─────────────────┘
+                         │
+                         ▼
+     ┌─────────────────────────────────────┐
+     │  FilterSpecification                │
+     │    For each property with @Field:   │
+     │     - restriction.isApplicable(v)?  │
+     │     - converter.apply(v)            │
+     │     - resolver.path(root)           │
+     │     - getPropertyPath(path, name)   │
+     │     - apply(restriction, path, v)   │
+     │    ORs multiple @Field on same prop │
+     │    ANDs across properties           │
+     └───────────────────┬─────────────────┘
+                         │
+                         ▼
+                   JPA Predicate
+                         │
+                         ▼
+               SQL SELECT ... WHERE
+----
+
+The left-to-right flow is declarative: a filter DTO's annotations are the only thing the developer writes; everything downstream is framework code.
+
+== Annotation Reference
+
+=== @Field
+
+The workhorse — declares a filter on a DTO property.
+
+[source,java]
+----
+@Target({FIELD, METHOD})
+@Retention(RUNTIME)
+public @interface Field {
+    Restriction restriction() default Restriction.EQ;                       // <1>
+    String[] value() default {};                                            // <2>
+    Class<? extends Converter> converter() default Converter.None.class;    // <3>
+    Class<? extends FieldPathResolver<?>> pathResolver()                    // <4>
+        default DefaultFieldPathResolver.class;
+}
+----
+<1> Which comparison operator to use against the DB column
+<2> Entity field path(s) to filter on. Dots mean JPA joins. Empty → use the DTO property name. Multiple values → OR across paths.
+<3> Transform the DTO value before passing to the query (e.g., normalize date to start-of-day, strip non-digits)
+<4> Custom JPA `Root` → `Path<?>` resolver for complex joins. Default just returns the root.
+
+Simple example:
+
+[source,java]
+----
+include::{sourcedir}/credit/filter/ExampleCreditFilter.java[lines=10..21]
+----
+
+The path `actualSnapshot.status` — framework navigates via JPA `JOIN` when it encounters a `From<?, ?>`, falls back to direct path access otherwise. Using JPA metamodel constants (`ExampleCredit_.ACTUAL_SNAPSHOT + "." + CreditSnapshot_.STATUS`) makes refactors safe.
+
+=== Restriction — Comparison Operators
+
+[source,java]
+----
+public enum Restriction {
+    LIKE,       // lower(column) LIKE '%lower(value)%'
+    IN,         // column IN (values...)  — needs Collection or Object[]
+    NOT_IN,     // column NOT IN (values...)
+    EQ,         // column = value
+    EQ_IC,      // lower(column) = lower(value)  — case-insensitive equality
+    NE,         // column <> value
+    LT, GT, LE, GE    // <, >, <=, >= — require Comparable value
+}
+----
+
+`Restriction.isApplicable(value)` decides whether the restriction participates in the query:
+
+[cols="2,3", options="header"]
+|===
+|Input |Applicable?
+
+|`null`
+|**No** — restriction skipped entirely
+
+|Empty `String`
+|**No** — skipped (form submit with empty field shouldn't filter)
+
+|Empty `Collection` / empty array
+|**No**
+
+|Any non-empty scalar / collection / array
+|**Yes**
+|===
+
+This "empty filter = no restriction" rule is **exactly** what form submissions need: blank fields don't filter.
+
+=== @Fields — Multiple Annotations (OR)
+
+Apply multiple `@Field` annotations to the same DTO property, joined by **OR**:
+
+[source,java]
+----
+@Fields({
+    @Field(restriction = LIKE, value = "firstName"),
+    @Field(restriction = LIKE, value = "lastName")
+})
+private String name;    // "Smith" searches both firstName OR lastName
+----
+
+Useful for free-text search across multiple columns. The `FilterListService` enforces **all restrictions in a `@Fields` group must be the same type** — mixing `IN` and `LIKE` in one `@Fields` throws at startup.
+
+=== @Order — Filter Display Order
+
+Used by `FilterListService` to order filters on the frontend panel:
+
+[source,java]
+----
+@Order(100) @Field(restriction = IN)
+private CreditStatus[] status;
+
+@Order(200) @Field(restriction = GE)
+private LocalDate createdAtFrom;
+----
+
+Lower values appear first. Without `@Order`, the filter lands at `Integer.MAX_VALUE` (last). Use increments of 100 to leave room for future insertions.
+
+=== @Converter — Value Transformation
+
+Converters apply transformations before the value reaches the JPA predicate. The SDK ships several:
+
+[cols="2,3,3", options="header"]
+|===
+|Converter |Transformation |Typical use
+
+|`Converter.None` (default)
+|Passthrough
+|Any scalar / collection filter
+
+|`Converter.PersisanceValue`
+|Calls `PersisanceValue.persisanceValue()` on the DTO value
+|When your filter field is an enum-like DTO that needs unwrapping before DB comparison
+
+|`Converter.DateAtStartOfDay`
+|`LocalDate` → `LocalDateTime` at 00:00
+|"Created on or after {date}" — map to the earliest instant of the day
+
+|`Converter.DateAtEndOfDay`
+|`LocalDate` → `LocalDateTime` at 23:59:59.999999999
+|"Created on or before {date}" — latest instant
+
+|`Converter.InstantAtStartOfDay` / `Converter.InstantAtEndOfDay`
+|Same but zoned to system default → `Instant`
+|For entity columns stored as `Instant`
+
+|`Converter.UpperCase`
+|Uppercases the string
+|Case-normalized search against all-uppercase columns
+
+|`Converter.DigitsOnly`
+|Strips non-digits via regex
+|Phone number / IBAN search where the user may type separators
+|===
+
+Example:
+
+[source,java]
+----
+@Field(restriction = GE, value = "createdAt", converter = Converter.InstantAtStartOfDay.class)
+private LocalDate createdAtFrom;
+
+@Field(restriction = LE, value = "createdAt", converter = Converter.InstantAtEndOfDay.class)
+private LocalDate createdAtTo;
+----
+
+The user picks a date from the UI; the converter turns it into the right `Instant` boundary for inclusive range filtering.
+
+Implement your own converter by implementing the `Converter` interface — instances are cached in `ConverterHolder` (keyed by class, one instance per JVM) with a null-safety wrapper. Must have a no-arg constructor.
+
+=== FieldPathResolver — Custom Join Paths
+
+When the entity field lives behind a complex navigation that can't be expressed with a simple dot path:
+
+[source,java]
+----
+public interface FieldPathResolver<T> {
+
+    default Path<?> path(Root<? extends T> root, CriteriaBuilder cb) {
+        return root;
+    }
+
+    default Optional<Predicate> filter(Root<? extends T> root, CriteriaBuilder cb) {
+        return Optional.empty();
+    }
+}
+----
+
+Override `path()` to return a `Path` rooted at something other than the main root (e.g., a join alias, a subquery). Override `filter()` to return an extra predicate that must ALWAYS apply when this resolver's `@Field` is active (e.g., "and the joined row is not deleted").
+
+Example:
+
+[source,java]
+----
+public class LatestSnapshotResolver implements FieldPathResolver<ExampleCredit> {
+    @Override
+    public Path<?> path(Root<? extends ExampleCredit> root, CriteriaBuilder cb) {
+        return root.join(ExampleCredit_.ACTUAL_SNAPSHOT, JoinType.LEFT);
+    }
+}
+
+public class MyFilter extends ListFilter {
+    @Field(restriction = EQ, value = "status", pathResolver = LatestSnapshotResolver.class)
+    private CreditStatus status;
+}
+----
+
+Resolvers are cached in a `ConcurrentHashMap` keyed by class — one instance per JVM. Keep them stateless.
+
+=== PersisanceValue Interface
+
+A marker interface (typo kept for historical compatibility — "Persisance" instead of "Persistence"):
+
+[source,java]
+----
+public interface PersisanceValue {
+    Object persisanceValue();
+}
+----
+
+Implement on DTO types where the form-layer representation differs from the DB value. Combined with `Converter.PersisanceValue`, lets a form carry `MyDto` but filter on `MyDto.persisanceValue()`.
+
+== Base Layer
+
+=== ListFilter — The DTO Base
+
+[source,java]
+----
+public class ListFilter {
+
+    public static final String FIELD_ID = "createdAt";
+    public static final String ORDER_DESC = "desc";
+
+    private int page = 1;                          // <1>
+    private int count = 50;                        // <2>
+    private String sortField = FIELD_ID;           // <3>
+    private String sortOrder = ORDER_DESC;
+    private boolean withDeleted = false;           // <4>
+
+    protected Predicate defaultPredicate(Root<?> root,
+                                         CriteriaQuery<?> query,
+                                         CriteriaBuilder cb) {
+        return null;                                // <5>
+    }
+}
+----
+<1> **1-based** page number (not 0-based). `FilterSupport` converts to `setFirstResult`.
+<2> Page size. Defaults to 50; controllers can lower the cap per-endpoint.
+<3> Default sort by `createdAt` descending. Override via query param `?sortField=...&sortOrder=asc`.
+<4> Hint for filter logic to include soft-deleted rows (`active = false`). The actual filter is applied via the subclass's `@Field` / `defaultPredicate`.
+<5> Hook for hard-coded predicates the caller can't control (tenant scoping, security-driven filters, "always exclude archived"). Returns `null` = no default.
+
+Subclass and add `@Field`-annotated properties:
+
+[source,java]
+----
+public class ExampleCreditFilter extends ListFilter {
+
+    @Field(restriction = IN, value = ExampleCredit_.ACTUAL_SNAPSHOT + "." + CreditSnapshot_.STATUS)
+    private CreditStatus[] status;
+
+    // getters / setters
+}
+----
+
+To add a default predicate (e.g., "exclude archived" always):
+
+[source,java]
+----
+public class CreditFilter extends ListFilter {
+    @Override
+    protected Predicate defaultPredicate(Root<?> root, CriteriaQuery<?> query, CriteriaBuilder cb) {
+        return cb.isFalse(root.get(ExampleCredit_.ARCHIVED));
+    }
+}
+----
+
+`defaultPredicate` is ANDed with the annotation-derived predicates.
+
+=== FilterSpecification — Annotation → JPA Predicate
+
+Not typically instantiated directly — `FilterSupport` creates one per query. Worth understanding the conversion rules:
+
+[source]
+----
+For each property descriptor of the filter DTO:
+  if property has @Field or @Fields:
+      for each @Field annotation:
+          if restriction.isApplicable(value):
+              value = converter.apply(value)
+              mainPath = resolver.path(root, cb)
+              for each entity field path in @Field.value():
+                  leafPath = follow dots from mainPath
+                  predicate = apply(restriction, leafPath, value)
+              if multiple paths: OR together
+              if resolver.filter() present: AND with it
+              fieldPredicates.add(predicate)
+      // multiple @Field annotations on one property
+      if multiple fieldPredicates: OR together
+      // accumulate across properties
+      result = (result == null) ? fieldPredicate : AND(result, fieldPredicate)
+return result
+----
+
+Combination rules:
+
+- **Within `@Field(value = {"a", "b"})`** — OR (match EITHER path)
+- **Within `@Fields({@Field, @Field})`** — OR (match EITHER restriction)
+- **Across properties** — AND (every declared filter must match)
+
+`FilterSpecification` also produces `ORDER BY` from `ListFilter.sortField` + `sortOrder`. Comma-separated sort fields are supported (`?sortField=title,createdAt`). String columns auto-lowercase for case-insensitive sort.
+
+=== FilterSupport — The @Service That Executes Queries
+
+[source,java]
+----
+@Service
+public class FilterSupport {
+
+    public record Page<R>(List<R> content, int itemsCount, int maxPage) {}
+
+    public <E> Page<E> readPage(Class<E> entityClass, ListFilter filter);    // <1>
+    public <E> Stream<E> readAll(Class<E> entityClass, ListFilter filter);   // <2>
+}
+----
+<1> Runs two queries: content (with LIMIT/OFFSET) and count (without ORDER BY for efficiency). Returns a `Page<E>` with content and pagination metadata.
+<2> Streaming variant — no pagination. Used for exports and bulk reads. **Must be consumed inside the same transaction** that started the stream.
+
+`readAll` returns a `java.util.stream.Stream<E>` via JDBC cursor; don't collect the whole thing into a `List` if the result set is large — use it as an iterable.
+
+=== FormService & FormContainer — Auxiliary
+
+`FormService<E extends BaseEntity<?>, F>` is a small abstract CRUD helper separate from the main filter flow:
+
+[source,java]
+----
+public abstract class FormService<E extends BaseEntity<?>, F> {
+    protected abstract CrudRepository<E, Long> getRepository();
+    protected abstract E formToEntity(F form);
+    protected abstract F entityToForm(E entity);
+
+    @Transactional(readOnly = true) public F get(Long id);
+    @Transactional public F save(F form);
+    @Transactional public void delete(Long id);
+}
+----
+
+Prefer `com.timvero.base.form.EntityFormService` (covered in <<form-classes-setup-and-usage>>) for new code — it integrates with the SDK's `EntityToFormMapper`, `ValidationException`, and constraint-violation handling. This `FormService` is kept for legacy code that doesn't need those features.
+
+`FormContainer<T>` wraps a form plus binding errors — returned from AJAX endpoints when validation fails:
+
+[source,java]
+----
+public class FormContainer<T> implements Serializable {
+    private T form;
+    protected List<FieldError> errors;
+}
+----
+
+=== NotFoundException
+
+[source,java]
+----
+@ResponseStatus(value = HttpStatus.NOT_FOUND, reason = "No such entity")
+public class NotFoundException extends RuntimeException { /* ... */ }
+----
+
+Throw from a controller method to return HTTP 404 — Spring's `@ResponseStatus` handles the rest. Used throughout the SDK (see e.g. `EntityDocumentService.getDocument`).
+
+== List Layer — FilterListService
+
+The controller-side service that orchestrates filtering + pagination + export. Your service extends it with concrete generic types:
+
+[source,java]
+----
+include::{sourcedir}/credit/filter/ExampleCreditFilterService.java[]
+----
+
+Key points:
+
+- Extends `FilterListService<ExampleCredit, ExampleCreditFilter>` — **both types** resolved via `ResolvableType` at construction
+- Overrides `getFilterValues(locale)` to populate dropdown values for frontend filter panel
+- `super.getFilterValues(locale)` pre-populates enum-typed fields automatically; we only add the `CustomEnum`-typed status list
+
+=== Public API
+
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`getFilterDescriptor(Locale locale)`
+|Returns `FilterDescriptor` — used by frontend to render the filter panel (field list, labels, restrictions, dropdown values)
+
+|`doFilter(LF filter)`
+|Execute filter, return `FilterPage<?>` with one page of results + pagination metadata. Calls `getListView(entity)` for each row (override to return a DTO instead of the entity)
+
+|`doFilter(LF filter, Function<E, R> converter)`
+|Same but with explicit converter — typical for mapping entity → list-row DTO
+
+|`loadAll(LF filter, Function<E, R> converter)`
+|Streaming — applies filter + sort but no pagination. Returns `Iterator<R>`. For bulk reads.
+
+|`doExcelExport(LF filter, Locale locale, ExcelExportProcessor<E> exportProcessor)`
+|Produce an Excel file with filtered results. See Excel Export below.
+
+|`getListView(E entity)`
+|Override to transform entity → row DTO. Default: returns the entity itself (serialize your own JSON view).
+|===
+
+=== Automatic Frontend Metadata
+
+`initFilterMappings()` (called lazily on first `getFilterDescriptor`) introspects the filter class and produces a `List<FilterElement>`:
+
+- **Data type** inferred from the property type:
+
+  [cols="2,1", options="header"]
+  |===
+  |Property type |`DataType`
+
+  |`Number` subtype (Integer, Long, BigDecimal, etc.)
+  |`NUMERIC`
+
+  |`Boolean`
+  |`BOOLEAN`
+
+  |`Temporal` (LocalDate, Instant, etc.)
+  |`DATE`
+
+  |Everything else
+  |`STRING`
+  |===
+
+- **Label** — derived from the property name (CamelCase → "Camel Case"), then localized via `filter.<entityGroup>.<property>` message key (falls back to `<entityGroup>.<property>`, then the derived default).
+
+- **Dropdown values** for enum-typed fields — `Enum` and `Enum[]`/`Collection<Enum>` auto-populated in `defaultfilterValues`. `CustomEnum` types must be added manually via `getFilterValues` override (see the `ExampleCreditFilterService` above).
+
+=== Supporting Records
+
+[cols="2,3", options="header"]
+|===
+|Type |Role
+
+|`FilterElement`
+|One field in the filter panel — `type` (STRING/NUMERIC/DATE/BOOLEAN), `parameter` (property name), `comparation` (`Restriction`), `label` (localized), `order`
+
+|`FilterDescriptor`
+|Top-level descriptor passed to frontend — list of `FilterElement` + per-field dropdown values map
+
+|`FilterValue`
+|A single dropdown option — `value` (string) + `label` (localized)
+
+|`FilterValues`
+|Builder for populating dropdown values. Overloads for `Map`, `Collection<Persistable<?>>`, `Enum[]`, `CustomEnum[]`, `Object[]` — pick whichever matches your source.
+
+|`FilterPage<E>`
+|Result of `doFilter` — `page`, `count`, `firstRow`, `lastRow`, `total`, `maxPage`, `rows`. Ready for JSON serialization to the frontend table.
+|===
+
+== Excel Export
+
+Filtered results can be exported to Excel via JXLS templates. Pattern:
+
+[source,java]
+----
+@Component
+public class CreditExcelExportProcessor extends ExcelExportProcessor<ExampleCredit> {
+
+    @Value("classpath:/templates/excel/credit-report.xlsx")
+    private Resource template;
+
+    @Override public Resource getReportTemplate() { return template; }
+    @Override public String getRole() { return "CREDIT_EXPORT"; }       // <1>
+
+    @Override
+    protected String getElementCollectionName() { return "credits"; }   // <2>
+
+    @Override
+    protected Iterable<?> getCustomFieldsModelsList(ExampleCredit entity) {
+        return List.of(new CreditRowDto(entity));                        // <3>
+    }
+}
+----
+<1> Permission code for export authorization — typically checked in the controller before invoking the processor
+<2> The name of the collection variable in the JXLS template (`jx:each items="credits"`)
+<3> Transform entity → template-friendly row. Can return multiple rows per entity (e.g., one per credit + one per operation, flattened)
+
+=== JXLS Template Context
+
+The processor populates three data keys in the JXLS context:
+
+[cols="2,3", options="header"]
+|===
+|Key |Content
+
+|`{elementCollectionName}` (`"credits"` in example above)
+|The rows to render
+
+|`filters`
+|The `ListFilter` instance — useful for putting the active filter values in the report header ("Exported on {date}, filters: status=...")
+
+|`customFunction`
+|`JexlCustomFunctions` — helper functions callable from JXLS/JEXL expressions
+|===
+
+=== JexlCustomFunctions
+
+Available in every exported template as `${customFunction.methodName(...)}`:
+
+[cols="2,3", options="header"]
+|===
+|Function |Use
+
+|`instantToLocalDate(Instant)`
+|Convert `Instant` to `LocalDate` using system zone — for displaying just the date
+
+|`enumName(Object, String localeStr)`
+|Localize enum / CustomEnum value. `localeStr` is a language tag (`"en"`, `"de-AT"`).
+
+|`coalesce(Object...)`
+|`firstNonNull` equivalent. Special case: if the first value is `LocalDate` and there are 3 args, formats it with the third arg as pattern.
+
+|`formatInstant(Instant, String pattern)`
+|Format `Instant` via `DateTimeFormatter.ofPattern()` in system zone
+
+|`monetaryValue(MonetaryAmount)`
+|Extract `BigDecimal` from `MonetaryAmount` for numeric Excel cells
+|===
+
+=== File Naming
+
+`createDocument()` names the output `<template-name>_<yyyy-MM-dd_HH-mm-ss>.xlsx`. Override `getResultFileName()` to customize.
+
+=== ExcelProcessorModel
+
+A trivial two-field holder (`excelPath`, `reportName`) — used in the UI layer to carry the result back to the client. Most code paths don't touch it directly; the processor returns a `DocumentResource`.
+
+[[list-filters-entity-export-controller]]
+=== EntityExportController — Import/Export Page Dispatcher
+
+A separate admin page (`/export`, menu **Settings → Export**) handles *environment-transfer* export/import — dumping catalogs, form schemas, roles, templates to a single JSON file and re-importing them elsewhere. This is distinct from Excel list export above: list export is per-page and per-entity-type; the export page is full-environment, cross-module.
+
+[source,java]
+----
+@Controller
+@RequestMapping("/export")
+@PreAuthorize("hasRole('" + ENTITY_EXPORT + "')")
+@ConditionalOnBean(EntityExportService.class)
+@MenuItem(order = 900_960, name = "export", group = "setting")
+public class EntityExportController {
+
+    @Autowired private EntityExportService exportService;
+    @Autowired private Alerts alerts;
+
+    @GetMapping                         public String page() { return "/settings/export"; }
+    @GetMapping("/import")              public String importModal() { return "/settings/import"; }
+
+    @GetMapping("/export") @ResponseBody
+    public ResponseEntity<InputStreamResource> button() throws IOException {
+        byte[] data = exportService.prepareExport();
+        DocumentResource resource = new DocumentResource(
+            "export_" + LocalDateTime.now().format(FORMATTER),
+            MediaType.APPLICATION_JSON_VALUE, data);
+        return HttpUtils.fileDownload(resource);
+    }
+
+    @PostMapping(path = "/import",
+        consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
+        produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Redirect executeImport(@RequestParam MultipartFile file, UserAccount user) throws IOException {
+        try {
+            exportService.executeImport(file.getInputStream());
+            alerts.add(user, AlertType.SUCCESS, "entity.export");
+        } catch (JsonProcessingException ignored) {
+            alerts.add(user, AlertType.DANGER, "entity.export.json");
+        }
+        return new Redirect(PATH);
+    }
+}
+----
+
+Key points:
+
+* **`@ConditionalOnBean(EntityExportService.class)`** — if no export service is registered (typically a thin deployment), the page disappears. Same pattern as `BiController` with `BiDashboardProperties`.
+* **`ENTITY_EXPORT` is a single permission** — export and import gated together. The assumption is that anyone allowed to dump production data is also allowed to *load* it into a staging environment and vice versa.
+* **Success/failure surfaces through `Alerts`, not `Model` attributes** — the import can take seconds, and the subsequent navigation (`Redirect(PATH)`) triggers a fresh page render; attaching the alert via `Alerts.add(user, ...)` pushes the toast through the STOMP channel so the user sees it after the page reloads. See <<web-infrastructure-ui-alerts-button-styling-alerts>>.
+* **File naming: `export_yyyy-MM-dd'T'HHmmss.json`** — deterministic, sortable, safe for filesystem. The import side is filename-agnostic; only the JSON content matters.
+* **`ExcelExportProcessor` is NOT wired through this controller.** Per-list Excel export is dispatched by the filter controller base class directly — see `WebFilterController` in <<web-infrastructure-entity-view-controllers>>. The two export paths share no code.
+
+== Advanced Patterns
+
+=== Filtering by an Association's Nested Field
+
+Dot paths in `@Field.value()` are JPA joins:
+
+[source,java]
+----
+@Field(restriction = LIKE, value = "client.individualInfo.fullName")
+private String fullName;    // joins via client, then individualInfo
+----
+
+The framework emits a `LEFT JOIN`. For multiple nested fields into the same association, the joins are **not** shared — each dot path creates its own join. For heavy panels with many same-association filters, use a `FieldPathResolver` to make the join once and reuse.
+
+=== Searching Multiple Columns With One Field
+
+OR across columns for free-text search:
+
+[source,java]
+----
+@Field(restriction = LIKE, value = {"code", "title", "client.displayedName"})
+private String search;
+----
+
+The one property `search` fans out to three `LIKE`s joined with OR. If you want different restrictions per column, use `@Fields`:
+
+[source,java]
+----
+@Fields({
+    @Field(restriction = LIKE, value = "title"),
+    @Field(restriction = EQ,   value = "code")
+})
+private String keyword;
+----
+
+=== Date Range Filters
+
+Two DTO properties + start/end-of-day converters:
+
+[source,java]
+----
+@Field(restriction = GE, value = "createdAt", converter = Converter.InstantAtStartOfDay.class)
+private LocalDate createdAtFrom;
+
+@Field(restriction = LE, value = "createdAt", converter = Converter.InstantAtEndOfDay.class)
+private LocalDate createdAtTo;
+----
+
+The user picks dates; converters translate to the inclusive day boundaries on the entity's `Instant` column. Omit the `value` attribute if the DTO property name already matches the entity field name.
+
+=== Default Predicate for Security / Multi-Tenancy
+
+Override `defaultPredicate` to enforce invariants the user can't turn off:
+
+[source,java]
+----
+public class TenantScopedCreditFilter extends ListFilter {
+    @Override
+    protected Predicate defaultPredicate(Root<?> root, CriteriaQuery<?> query, CriteriaBuilder cb) {
+        UUID tenantId = TenantContext.current().id();
+        return cb.equal(root.get(Credit_.TENANT_ID), tenantId);
+    }
+}
+----
+
+ANDed with annotation-derived predicates. Useful for:
+
+- Multi-tenant row-level security
+- Excluding soft-deleted rows unless `ListFilter.withDeleted` is set
+- Role-based row visibility (e.g., underwriters see only their assigned applications)
+
+=== Streaming for Large Exports
+
+For exports over 100k rows, use `filterSupport.readAll()` + a streaming `ExcelExportProcessor`:
+
+[source,java]
+----
+Stream<E> stream = filterSupport.readAll(entityClass, filter);
+// hand off to JXLS template with jx:each — consumes lazily
+----
+
+Must be inside an open transaction — the stream backs a JDBC cursor that the transaction manager must hold open.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use JPA metamodel constants** (`Entity_.FIELD`) in `@Field.value()` — survives refactors; string literals don't
+* {ok} **Default to `Restriction.EQ`** — let `@Field` annotations stay concise when the common case applies
+* {ok} **Use `IN` for multi-select filters** — the DTO field is a typed array / collection; user picks zero or more
+* {ok} **Use date-range converters** (`DateAtStartOfDay` / `DateAtEndOfDay` / `InstantAt*`) — spares you manual boundary arithmetic
+* {ok} **Keep `FilterListService` subclasses thin** — they're wiring; put business transformation in the row-view DTO mapper
+* {ok} **Populate `FilterValues` lazily** — `getFilterValues(locale)` runs on each panel render; heavy dropdown computations should cache
+* {ok} **Set `@Order` on every filter property** — deterministic UI order across deployments
+* {ok} **Override `getListView(entity)`** to return a thin row DTO — avoids serializing entire entities plus lazy proxies
+* {ok} **Use `defaultPredicate` for tenant/security scoping** — invisible to the UI, can't be bypassed via query params
+* {ok} **Prefer `@Fields` over union DTOs** for multi-column search — simpler DTO, same SQL
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Hardcoding paths as strings** — `"client.status"` survives a rename only by coincidence; use metamodel (`Client_.STATUS`)
+* {bad} **Mixing `Restriction` types in one `@Fields` group** — throws `Assert` at startup; different restrictions = different `@Field` on different DTO properties
+* {bad} **Using `Restriction.EQ` on collection-typed DTO fields** — fails because the value isn't `Comparable` or singular; use `IN`
+* {bad} **Forgetting `@Valid` / type conversion on the DTO** — Spring binds `?status=INVALID_VALUE` as `null` by default, silently dropping the filter
+* {bad} **Returning entire JPA entities as list rows** — serializing triggers lazy loads, returns circular references, bloats responses; override `getListView` to return a DTO
+* {bad} **Calling `readAll()` outside a transaction** — the stream backs a cursor; without TX it either drains into memory (if provider tolerates) or throws `LazyInitializationException`
+* {bad} **Stateful `Converter` / `FieldPathResolver`** — instances are cached and shared across threads; must be stateless
+* {bad} **Using `ListFilter` itself as the DTO** — fine for entities without filters, but add your own subclass as soon as you want a filter. Multiple controllers sharing one filter DTO leads to annotation pollution
+* {bad} **Exporting entire unfiltered result sets** — `readAll` without a filter streams the whole table; always require the user to pick at least one bounding filter for large entities
+* {bad} **Relying on implicit filter combinations** — document the `@Fields` OR / multi-property AND behavior in your panel UI so users know `status IN (...) AND dateRange` isn't the same as `OR`
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every list page has a filter DTO extending `ListFilter` (not reusing a sibling page's filter)
+* {todo} All `@Field.value()` paths use JPA metamodel constants
+* {todo} Date-range filters use start/end-of-day converters
+* {todo} `getFilterValues(locale)` registered for all `CustomEnum`-typed fields (enums are auto-registered; `CustomEnum` is not)
+* {todo} i18n keys `filter.<entityGroup>.<property>=Label` defined for every filter field
+* {todo} `@Order` set on every filter property for deterministic panel order
+* {todo} `getListView(entity)` overridden to return a minimal row DTO (avoid serializing entities)
+* {todo} `defaultPredicate` applied for multi-tenant / security scoping if relevant
+* {todo} `FilterListService` subclass annotated `@Service` (or Spring won't pick it up)
+* {todo} Excel export: template resource exists on classpath, tested with production data volumes
+* {todo} Excel export: `getRole()` permission code registered in the security layer
+* {todo} Excel export: `JexlCustomFunctions` formatters match the locale conventions of the target users
+* {todo} Streaming endpoints (`readAll`, export) run inside `@Transactional(readOnly = true)`
+* {todo} Pagination: page size capped per endpoint (e.g., `filter.setCount(Math.min(filter.getCount(), 500))`) to prevent memory spikes
+* {todo} Integration test per filter: verify every `@Field` produces the expected predicate
+* {todo} Test with UTF-8 search terms — URL-decoded in `FilterSpecification.toOrder`; broken encoding would break sort
+
+---
+
+**Related:** <<form-classes-setup-and-usage>>, <<credit-product-module-entity-model-lifecycle-rates>>, <<table-features>>, <<entity-module-sdk-reference-hierarchy>>
+
+**Next:** <<form-classes-setup-and-usage>>, <<table-features>>

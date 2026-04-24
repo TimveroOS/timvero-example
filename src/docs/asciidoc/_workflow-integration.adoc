@@ -522,3 +522,692 @@ public class RetryCreditCheckAction extends SimpleActionController<UUID, Borrowe
 5. If workflow fails → User can retry credit check for specific borrower
 
 **Key Pattern**: Business process (application) triggers subject evaluation (borrower), results flow back to update both subject and process.
+
+== Entity Tabs — Tab Controller Bases
+
+Everything above is the tutorial path — tie entities to workflows, start them, react to results. The rest of this chapter is SDK-internals reference: the supporting machinery that surfaces the workflow state in the admin UI, lets admins wire process types to process definitions, and runs the queue/event/post-processor plumbing between `DecisionProcessStarter.start(...)` and your `FinishedScoringEvent` listener.
+
+The `com.timvero.flowable.internal.tab` package ships four abstract `EntityTabController<UUID, E>` subclasses. Extend these on your entity's detail page to expose workflow state without re-implementing the templates or the visibility rules. Each one picks a different slice of the `ProcessExecution` / `PendingDecision` / `Feature` model described in <<flowable-internals>>.
+
+=== `AbstractPendingDecisionTab<P extends HasPendingDecisions & Persistable<UUID>>`
+
+Surfaces unresolved decisions — anything `FixedFactPostProcessor` wrote into the entity's `PendingDecisionHolder`. See <<has-notes>> and `HasPendingDecisions` for the holder contract.
+
+[source,java]
+----
+@Controller
+@RequestMapping("/borrower/{id}/pending-decisions")
+public class BorrowerPendingDecisionTab extends AbstractPendingDecisionTab<Borrower> {
+}
+----
+
+* **Element name**: `common.tab.pending-decision` (localize under that key)
+* **Visibility**: tab hides when `entity.getPendingDecisions()` is empty — no stub surface for approved subjects
+* **Template**: `/process-execution/pending-decision-tab` (ships with the SDK; decisions are sorted by ID descending so newest shows first)
+
+Use this tab when the entity is a subject and underwriters need a single place to act on DECLINED / PENDING / INFO rows produced by the latest scoring run. This is the tab that the <<launchpad>> rows deep-link into.
+
+=== `AbstractProcessExecutionTab<A extends ProcessEntity>`
+
+Full execution history for a subject — every `ProcessExecution` row, newest first, with a drill-down endpoint for per-execution `DecisionFact` and `FixedDecisionFact` data.
+
+[source,java]
+----
+@Controller
+@RequestMapping("/borrower/{id}/executions")
+public class BorrowerProcessExecutionTab extends AbstractProcessExecutionTab<Borrower> {
+}
+----
+
+* **Element name**: `common.tab.processExecution`
+* **Visibility**: `executionService.hasAnyExecution(entity)` — hides until at least one real execution exists
+* **Main template**: `/process-execution/process-execution-tab`
+* **Drill-down**: `GET /decision-fact/{executionId}` returns the `/process-execution/process-execution-details :: details` fragment with:
+** `decisionFacts` — grouped by `DecisionFactDTO.value()` (the scoring rule output)
+** `alertDecisionFacts` / `warningDecisionFacts` / `infoDecisionFacts` — `FixedDecisionFact` list partitioned by `FixedFactValue` (ALERT/WARNING/INFO — same three-way split that `FixedFactPostProcessor` uses to produce DECLINED/PENDING/INFO pending decisions)
+* **Security**: drill-down method is `@PreAuthorize("hasRole(this.role)")` — inherits whatever role the controller declares via `EntityTabController.getRole()`
+
+This is your debug/audit tab — use it when underwriters need to see why a decision came out a certain way, not just what the outcome was.
+
+=== `AbstractProfileTab<A extends ProcessEntity>`
+
+Collapses the latest successful execution **per process type** into a single `processType → (scoringValues, manualValues)` projection. Unlike `AbstractProcessExecutionTab` which shows every run, this shows the current state.
+
+[source,java]
+----
+@Controller
+@RequestMapping("/borrower/{id}/profile")
+public class BorrowerProfileTab extends AbstractProfileTab<Borrower> {
+}
+----
+
+* **Element name**: `common.tab.profile`
+* **Visibility**: `executionService.hasAnyExecution(entity)`
+* **Template**: `/process-execution/profile-tab`
+* **Selection rule**: iterates `DecisionProcessType.values(DecisionProcessType.class)`, filters to `DecisionProcessType` values whose `entityClass` is assignable to the tab's `getEntityClass()`, then takes `getLastRealExecution` for each
+* **Dual projection**: each `ProcessValueDTO` carries
+** `scoringValues` — `ProcessExecutionResult.getValues()` (automated scoring output)
+** `manualValues` — aggregated `PendingDecision.getValues()` for decisions whose `processGroup` matches the process type name (manual underwriter input)
+* **Empty-row filter**: process types with neither scoring nor manual values are dropped before rendering
+
+The split matters: scoring values are what the engine computed; manual values are what the reviewer typed into the pending-decision form. Templates typically render them side-by-side to show computed-vs-overridden.
+
+=== `AbstractFeaturesTab<E extends ProcessEntity>`
+
+Data-source features — the raw inputs the scoring engine pulled for this subject (credit bureau pulls, KYC responses, etc.). One tab per entity, grouped by `dataSourceName`, sorted by feature name then creation time.
+
+[source,java]
+----
+@Controller
+@RequestMapping("/borrower/{id}/features")
+public class BorrowerFeaturesTab extends AbstractFeaturesTab<Borrower> {
+}
+----
+
+* **Visibility**: `featureRepository.countByOwnerId(entity.getId()) > 0` — no features, no tab
+* **Template**: `/process-execution/features`
+* **Grouping**: `Collectors.groupingBy(Feature::getDataSourceName, TreeSet with FEATURE_COMPARATOR)` — features sorted stably within each data source
+* **No element name override**: defaults from `EntityTabController` — override `getElementName()` if you need a custom localization key
+
+This is the "why did the scoring engine decide that" tab — shows the upstream facts before any rules were applied. Pairs well with `AbstractProcessExecutionTab` for investigation workflows.
+
+=== Which tab to extend
+
+[cols="1,3", options="header"]
+|===
+| Tab base | Extend when
+
+| `AbstractPendingDecisionTab`
+| Entity implements `HasPendingDecisions` and users need an action surface for DECLINED/PENDING/INFO rows
+
+| `AbstractProcessExecutionTab`
+| Auditors need full history (including failed/interrupted) with per-execution fact drill-down
+
+| `AbstractProfileTab`
+| Detail page should show the *current* scoring snapshot — one row per `DecisionProcessType` the entity can run through
+
+| `AbstractFeaturesTab`
+| Underwriters need to see raw data-source inputs (credit report values, KYC check results)
+|===
+
+All four inherit the standard `EntityTabController` lifecycle — role check, entity loading via `loadEntity(id)`, `isVisible(entity)` gating. See <<entity-actions>> for how tab registration interacts with the action bar on the same detail page.
+
+== Decision-Tree Mapping — Admin Configuration
+
+The tutorial showed `workflowStarter.start(CREDIT_CHECK_WORKFLOW, borrower.getId())`. That call succeeds only if an admin has mapped the `CREDIT_CHECK_WORKFLOW` process type to a concrete `ProcessSpecification` (BPMN diagram version) through the admin UI. This section covers that mapping pipeline.
+
+=== `DecisionProcessType<A extends ProcessEntity>` — the type-safe handle
+
+[source,java]
+----
+public final class DecisionProcessType<A extends ProcessEntity> extends CustomEnum<DecisionProcessType<A>> {
+    private final Class<A> entityClass;
+
+    public DecisionProcessType(String name, Class<A> entityClass) {
+        super(name);
+        this.entityClass = entityClass;
+    }
+}
+----
+
+* Not a JVM `enum` — subclasses `CustomEnum<T>` (see <<sdk-utilities>>) so new values can be registered at runtime from any module, stored in a `@Type(CustomEnumType.class)` JPA column, and still behave like an enum for `.values()` / `.name()` / `equals`
+* The `entityClass` generic parameter is carried at runtime — `AbstractProfileTab.processTypes()` uses `DecisionProcessType.values(DecisionProcessType.class)` and filters by `t.getEntityClass().isAssignableFrom(...)` to discover relevant types per entity
+* Declare as `public static final` constants (see Step 5's `CREDIT_CHECK_WORKFLOW`) — never instantiate at a call site
+
+=== `DecisionTreeMapping` — the admin-editable link
+
+[source,java]
+----
+@Entity
+@Table(name = "decision_tree_mapping")
+@Audited
+@HideInDocs
+public class DecisionTreeMapping implements Persistable<DecisionProcessType<?>> {
+
+    @Id
+    @Type(CustomEnumType.class)
+    private DecisionProcessType<?> processType;      // primary key
+
+    @ManyToOne
+    @Audited(targetAuditMode = NOT_AUDITED)
+    private ProcessSpecification processDefinition;  // which BPMN version
+
+    @LastModifiedDate
+    private Instant mappedAt;
+    @LastModifiedBy
+    private Auditor mappedBy;
+}
+----
+
+* **One row per process type** — the PK is `DecisionProcessType<?>`, so a given `CREDIT_CHECK_WORKFLOW` maps to exactly one active `ProcessSpecification` at a time. Remapping updates the row in place
+* **Full audit trail via Envers** — `@Audited` plus `LastModifiedDate`/`LastModifiedBy` — every remap is historically reproducible, which matters for regulators asking "which scoring tree was live on date X"
+* **`isNew()` always returns `true`** — a quirk that works because `saveAll(...)` downstream uses `merge` semantics and the PK is externally assigned
+* **`@HideInDocs`** — excluded from auto-generated entity reference — this is an admin-only artifact, not part of any domain model
+
+=== `DecisionTreeMappingRepository`
+
+Standard `JpaRepository<DecisionTreeMapping, DecisionProcessType<?>>` plus `JpaSpecificationExecutor` and `SynchronousAccessRepository` — the sync-access interface matters because `DecisionProcessStarter.start(...)` calls `findById(processType)` on the transactional path and needs read-your-writes consistency.
+
+=== `DecisionTreeFormService` + `DecisionTreeMappingForm` — the admin pipeline
+
+The admin UI (`/admin/process-mapping` in typical setups) renders a single form with one `<select>` per process type. `DecisionTreeFormService` is the bridge:
+
+[source,java]
+----
+@Service
+public class DecisionTreeFormService {
+
+    public void assembleModel(Model model) {
+        List<DecisionTreeMapping> mappings = mappingRepository.findAll();
+        mappings.sort(Comparator.comparing(m -> m.getProcessType().name()));
+
+        model.addAttribute("processTypes", DecisionProcessType.values());
+        model.addAttribute("mappings", Lang.toMap(mappings, ...));
+        model.addAttribute("mappingsForm", new DecisionTreeMappingForm(getMappings(mappings)));
+        model.addAttribute("treeKeys", getTreeKeys());
+    }
+
+    @Transactional
+    public void updateMapping(DecisionTreeMappingForm form) {
+        // merge each entry back into DecisionTreeMapping rows
+    }
+}
+----
+
+Flow:
+
+. `assembleModel` loads every known `DecisionProcessType` (not just mapped ones — unmapped types show up with `null` so the admin can fill them in)
+. `getTreeKeys()` queries `ProcessDefinitionRepository.findActive()` and formats each as `"<key> | <version>"` so the dropdown shows both the BPMN key and its version — critical for distinguishing rolling deploys of the same tree
+. The admin picks a `processDefinitionId` per type; the form binds to `DecisionTreeMappingForm.mappings: Map<DecisionProcessType<?>, @NotBlank String>`
+. `updateMapping(form)` does an upsert-per-entry via `mappingRepository.findById(processType).orElseGet(DecisionTreeMapping::new)` and `saveAll(...)`
+
+=== Admin → runtime handoff
+
+[source,java]
+----
+// inside DecisionProcessStarter.start(processType, entityId):
+ProcessSpecification tree = decisionTreeMappingRepository.findById(processType)
+    .map(DecisionTreeMapping::getProcessDefinition)
+    .orElseThrow(() -> new ProcessStartException(
+        "Cant find active process definition for type: " + processType));
+----
+
+This is the runtime consequence of the admin mapping: if the admin hasn't mapped the type, `start(...)` throws `ProcessStartException`. There is no silent fallback. Applications must guarantee mappings exist before production traffic — usually by seeding default rows via Flyway or a `CommandLineRunner`.
+
+* {ok} **Seed default mappings at boot** — `CommandLineRunner` that inserts a row per `DecisionProcessType.values()` pointing at a baseline BPMN, so day-1 traffic never hits `ProcessStartException`
+* {bad} **Calling `workflowStarter.start(...)` without a guarded mapping check** — in test environments where seeds haven't run, this manifests as an opaque `ProcessStartException` chain; add an `@EventListener(ApplicationReadyEvent.class)` verifier instead
+
+== Process Queue & Events
+
+Between `DecisionProcessStarter.start(...)` (Step 2) and your `FinishedScoringEvent` listener (Step 3) there's a queue, a scheduler, a chain of post-processors, and three application events you don't normally see. This section walks the machinery in the order an execution flows through it.
+
+=== Execution flow
+
+[source]
+----
+ start(type,id)
+   │
+   ▼
+ ProcessExecution row  ─── CREATED ──→ PROCESSING ──→ STARTED ──→ COMPLETED / FAILED / INTERRUPTED
+   │                    (queue admit)  (engine call) (running)   (terminal)
+   │                                                                 │
+   │                                                                 ▼
+   │                                                       ProcessExecutionUpdateEvent
+   │                                                                 │
+   │                                                 ┌───────────────┼────────────────┐
+   │                                                 ▼               ▼                ▼
+   │                                       DecisionProcessPostProcessingListener   ProcessQueueCompletionListener
+   │                                             │                                  │
+   │                                             ▼                                  ▼
+   │                                 user post-processors + FixedFactPostProcessor   ProcessQueueTriggerEvent
+   │                                             │                                  │
+   │                                             ▼                                  ▼
+   │                                      FinishedScoringEvent                  next CREATED picked up
+   │
+   ▼
+ ProcessStartRequestEvent (if capacity)  → ProcessQueueService.handleProcessStartRequest → engine.startProcess
+----
+
+=== The three internal events
+
+[cols="1,1,3", options="header"]
+|===
+| Event | Kind | Purpose
+
+| `ProcessStartRequestEvent`
+| Spring `ApplicationEvent`
+| Carries `processExecutionId`. Published by `ProcessQueueService.requestProcessStart(...)` when capacity is available, and by `ProcessQueueScheduler` for each batch item. Handled in `@TransactionalEventListener(AFTER_COMMIT)` so the `ProcessExecution` is visible to the handler before it tries to claim it.
+
+| `ProcessQueueTriggerEvent`
+| Spring `ApplicationEvent`
+| Signal that the queue should re-drain now (capacity freed). Published by `ProcessQueueCompletionListener` when a process hits a terminal status.
+
+| `FinishedScoringEvent<P>`
+| SDK `EntityEvent` (fired via `EventService`)
+| The **public** event your code listens for — see Step 3. Published by `FixedFactPostProcessor` after it has materialized `PendingDecision` rows and persisted them. Generic parameter matches the `DecisionProcessType.getEntityClass()`.
+|===
+
+Only `FinishedScoringEvent` goes through `EventService` (the SDK's async/ordered event bus — see <<reload-infrastructure-live-ui-updates-on-entity-changes>>). The other two are Spring `ApplicationEvent` so that `@TransactionalEventListener(AFTER_COMMIT)` can sequence them against the outer transaction.
+
+=== `ProcessQueueCapacityService` — the gate
+
+Single source of truth for "can we start another process right now":
+
+* **Max**: `workflow.process.queue.max.concurrent` (default `50`)
+* **Current load**: `count(PROCESSING) + count(STARTED)` — CREATED (waiting) doesn't count, COMPLETED/FAILED/INTERRUPTED don't count
+* **Available capacity**: `max - current`, floored at zero
+* `LoadInfo` DTO bundles `processing`, `started`, `currentLoad`, `maxConcurrent`, `availableCapacity`, `healthy` — consumed by logging and by `ProcessQueueMonitoringService`
+
+=== `ProcessQueueService` — the immediate-start path
+
+Called from `DecisionProcessStarter.startProcess(...)` via `TransactionUtils.afterTransaction(...)`:
+
+. `requestProcessStart(id)` checks capacity; if available, publishes `ProcessStartRequestEvent`; if full, logs and returns — the row stays `CREATED` for the scheduler
+. `handleProcessStartRequest(event)` listens `AFTER_COMMIT` in `REQUIRES_NEW` — re-loads the row with `executionRepository.getSync(id)`, re-checks it's still `CREATED` (important: the scheduler might have claimed it concurrently), flips to `PROCESSING`, saves, then `TransactionUtils.afterTransaction(...)` calls `processEngineApi.startProcess(...)` outside the transaction
+. On `ProcessStartException`, `handleProcessStartFailure` opens a `REQUIRES_NEW` transaction, flips status to `FAILED`, stores the stack trace via `ExceptionEntityService`, and saves — the engine-call failure is audited, not lost
+
+Two nested `afterTransaction` calls (one in `DecisionProcessStarter`, one inside `startProcessAsync`) are deliberate: the first ensures the `ProcessExecution` row commits before the event fires; the second ensures the status flip commits before the blocking engine call runs.
+
+=== `ProcessQueueScheduler` — the drain path
+
+Two `@Scheduled` methods:
+
+[cols="1,1,3", options="header"]
+|===
+| Method | Interval property | What it does
+
+| `processQueue()`
+| `workflow.process.queue.processing.interval.millis` (default `30000` / 30s)
+| Finds up to `min(availableCapacity, batchSize)` `CREATED` rows ordered by `createdAt` ASC and publishes a `ProcessStartRequestEvent` for each — the same event `ProcessQueueService` uses for immediate starts, so both paths converge on `handleProcessStartRequest`
+
+| `checkStaleProcesses()`
+| `workflow.process.queue.stale.check.interval.millis` (default `300000` / 5min)
+| Marks `PROCESSING` rows older than `workflow.process.queue.processing.timeout` (default `PT10M`) and `STARTED` rows older than `workflow.process.queue.started.timeout` (default `PT24H`) as `INTERRUPTED` — recovers from crashes between the status flip and the engine call, or from hung engine calls
+|===
+
+Also handles `ProcessQueueTriggerEvent` (re-drain on completion) by calling the same internal drain logic with `source="trigger"` for different log output.
+
+The `workflow.process.queue.enabled` flag (default `true`) short-circuits both scheduled methods — useful in tests that don't want the queue running in the background.
+
+=== `ProcessQueueCompletionListener` — the feedback loop
+
+Listens on `ProcessExecutionUpdateEvent` (the SDK event fired by `ProcessExecutionService.notifyOfUpdate(...)` whenever an execution's fields change). When the new status is `COMPLETED`, `FAILED`, or `INTERRUPTED`, it publishes `ProcessQueueTriggerEvent` so the scheduler drains the backlog without waiting for the next 30-second tick. This is how bursty workloads still get throughput — completions directly pull work in.
+
+=== `ProcessQueueMonitoringService` — ops surface
+
+Pure read-only service returning a `Map<String, Object>` with:
+
+* `maxConcurrent`, `currentLoad`, `availableCapacity`, `queueLength` (count of `CREATED`)
+* `statusCounts` — breakdown across all six statuses
+* `queueHealthy` (`currentLoad <= maxConcurrent`), `hasBacklog` (`CREATED > 0`)
+
+Wire this into your ops dashboard or expose it as a JSON endpoint for Prometheus scraping. The external REST API described in <<flowable-external-api>> exposes a default endpoint built on top of this service.
+
+=== Post-processor chain
+
+After the engine finishes (`COMPLETED`), `DecisionProcessPostProcessingListener` runs in response to `ProcessExecutionUpdateEvent`. It does **two** things, in order:
+
+. **Runs every registered `DecisionProcessPostProcessor<?>`** whose `entityClass` and `processType` match — each in a `REQUIRES_NEW` transaction, with errors logged but not rethrown (one misbehaving post-processor does not block the others)
+. **If the entity implements `HasPendingDecisions`**, runs the built-in `FixedFactPostProcessor` — which is where `FinishedScoringEvent` is actually fired
+
+==== Custom post-processors
+
+Extend `DecisionProcessPostProcessor<A>` when you need computed scoring values written to your entity **before** `FinishedScoringEvent` fires:
+
+[source,java]
+----
+@Component
+public class BorrowerCreditScorePostProcessor extends DecisionProcessPostProcessor<Borrower> {
+
+    @Autowired
+    private BorrowerRepository borrowerRepository;
+
+    public BorrowerCreditScorePostProcessor() {
+        super(WorkflowConfiguration.CREDIT_CHECK_WORKFLOW);
+    }
+
+    @Override
+    public void postProcess(ProcessExecution execution, ProcessExecutionResult result, Borrower borrower) {
+        Integer score = (Integer) result.getValues().get("creditScore").getContent();
+        borrower.setCreditScore(score);
+        borrowerRepository.save(borrower);
+    }
+}
+----
+
+* **Constructor takes the `DecisionProcessType` it binds to** — same instance as your `workflowStarter.start(...)` call. Generic bound `A` is resolved at runtime via `ResolvableType.forClass(...).getGeneric(0)`
+* **Runs in its own `REQUIRES_NEW`** — a throw won't roll back sibling post-processors or the main execution update
+* **Runs before `FixedFactPostProcessor`** in the listener loop, so when `FinishedScoringEvent` fires, your scoring values are already persisted — the `EntityEventListener<FinishedScoringEvent<Borrower>>` can read them fresh
+
+==== `FixedFactPostProcessor` — pending-decision materialization
+
+The built-in terminal step for `HasPendingDecisions` entities. Only runs when `execution.getMode() == REAL` (TEST executions skip this — they don't dirty the pending-decision list):
+
+. Deletes existing `PendingDecision` rows for this entity whose `processGroup` matches the process type name — a re-run overwrites, it does not append
+. For each `FixedDecisionFact` in the result, creates a `PendingDecision` with status mapped:
+** `ALERT` → `DECLINED`
+** `WARNING` → `PENDING`
+** `INFO` → `INFO`
+. Persists them via `EntityManager.persist(...)` + `entityManager.merge(processEntity)` + `flush()`
+. Fires `FinishedScoringEvent` via `EventService` using `ResolvableType.forClassWithGenerics(...)` so generic-parameterized listeners resolve correctly
+. If any pending decisions were created, triggers `reloadPageHelper.reloadFragment(...)` for the launchpad paths — open admin sessions see the new rows immediately without refresh (see <<launchpad>> and <<counters>>)
+
+The comment in the source (`todo: normally a listener of FinishedScoringEvent should be added next to LaunchpadController...`) is an acknowledged abstraction leak — do not add your own launchpad refresh logic; it's already handled here.
+
+=== `ProcessExecutionFailedEvent` — notification hook
+
+Distinct from the queue's `handleProcessStartFailure` (which writes the DB row): this class is an `EntityEventListener<ProcessExecutionUpdateEvent>` that, when the update transitions to `FAILED`, wraps the entity in a `ProcessExecutionFailedEventNotificationModel` and fires a `NotificationEvent` of type `PROCESS_EXECUTION_FAILED`. Configure recipients and channels through the <<notifications>> pipeline — no code changes needed on the workflow side.
+
+=== `ProcessEntityFeatureService` — feature resolution during execution
+
+Called from BPMN service tasks (not by your application code directly). Given a `processInstanceId` and a `dataSource` name, resolves `Collection<Feature>` via `FeatureService.getFeatures(entity, dataSource, eager)`:
+
+* `eager = true` for `REAL` mode (fetch live data from the data source), `eager = false` for `TEST` mode (use cached/mock features)
+* On `FeatureResolvingException`, stores the exception on the execution via `ExceptionEntityService` before rethrowing — failures are auditable from the execution detail view without chasing logs
+
+=== Configuration reference
+
+Complete list of queue-tunable properties (all have defaults):
+
+[source,properties]
+----
+# capacity
+workflow.process.queue.enabled=true
+workflow.process.queue.max.concurrent=50
+workflow.process.queue.batch.size=10
+
+# scheduler cadence
+workflow.process.queue.processing.interval.millis=30000
+workflow.process.queue.processing.initial.millis=30000
+workflow.process.queue.stale.check.interval.millis=300000
+workflow.process.queue.stale.check.initial.millis=30000
+
+# staleness timeouts
+workflow.process.queue.processing.timeout=PT10M
+workflow.process.queue.started.timeout=PT24H
+----
+
+== Decision Departments
+
+Every pending decision needs a responsible party. `DecisionDepartment` is the catalog of those parties — underwriting, risk, compliance, fraud, whatever the credit policy defines — and the routing table that maps a `UserRole` to the department that role belongs to. When a workflow emits `FixedDecisionFact` instances with `DecisionType.ALERT`, the admin sees them grouped by department and only users whose role maps to that department are expected to resolve them.
+
+The SDK ships the entity, repository, admin CRUD, export pipeline, a per-role `EntityAction` for assignment, and an `EntityLabel` that decorates the `UserRole` row with its department badge. The actual "who can close which alert" check is enforced elsewhere (<<launchpad>>, <<flowable-internals>>) — this module only owns the catalog and the role mapping.
+
+=== `DecisionDepartment` — the catalog entity
+
+Standard `CatalogEntity` subclass with a unique `code` and a localizable `description`. `@Audited` so every rename is tracked in Envers:
+
+[source,java]
+----
+@Entity
+@Table(name = "decision_department",
+    uniqueConstraints = @UniqueConstraint(
+        columnNames = DecisionDepartment.CODE,
+        name = DecisionDepartment.CODE_UNIQUE_CONSTRAINT))
+@Audited
+public class DecisionDepartment extends CatalogEntity
+        implements Comparable<DecisionDepartment> {
+
+    public static final String CODE_UNIQUE_CONSTRAINT = "UK_decision_department_code";
+
+    public static final Comparator<DecisionDepartment> COMPARATOR =
+        Comparator.comparing(DecisionDepartment::getCode, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(DecisionDepartment::getId,
+                Comparator.nullsLast(Comparator.naturalOrder()));
+
+    @Column(name = CODE, nullable = false)  private String code;
+    @Column(name = "description", nullable = false) private String description;
+}
+----
+
+The `CODE_UNIQUE_CONSTRAINT` string is surfaced by the controller to translate a DB-level violation into a field-level form error (see below). `COMPARATOR` uses case-insensitive code order with a `nullsLast` tiebreaker on `id` — the natural order for admin dropdowns.
+
+=== `UserRoleDecisionDepartment` — the role → department mapping
+
+Not a `@ManyToMany` on `UserRole`. A separate join entity with `@MapsId` so the primary key *is* the `UserRole.id`:
+
+[source,java]
+----
+@Entity
+@Table(name = "user_role_decision_department")
+public class UserRoleDecisionDepartment {
+    @Id @Column(name = "user_role_id") private UUID userRoleId;
+    @OneToOne @JoinColumn(name = "user_role_id") @MapsId
+    private UserRole userRole;
+    @ManyToOne(fetch = LAZY) @JoinColumn(name = "department", nullable = false)
+    private DecisionDepartment decisionDepartment;
+}
+----
+
+One row per role, at most one department per role. The `@MapsId` ensures a role can't have two conflicting mappings — insert is effectively an upsert keyed by role id, and `DecisionDepartmentService.setForRole` takes a `PESSIMISTIC_WRITE` lock on the role before touching the mapping so concurrent admin edits serialize cleanly.
+
+=== `DecisionDepartmentRepository` — the three queries that matter
+
+[source,java]
+----
+@Repository
+public interface DecisionDepartmentRepository extends JpaRepository<DecisionDepartment, UUID> {
+
+    Collection<DecisionDepartment> findAllByActiveTrue();
+
+    @Query("from DecisionDepartment where code = :code and active is true")
+    Optional<DecisionDepartment> findActiveByCode(@Param("code") String code);
+
+    @Query("SELECT ua FROM UserAccount ua"
+        + " JOIN UserRoleDecisionDepartment urdd ON ua.role.id = urdd.userRoleId"
+        + " WHERE urdd.decisionDepartment.code = :code")
+    List<UserAccount> findByDecisionDepartmentCode(String code);
+}
+----
+
+`findByDecisionDepartmentCode` is the load-bearing one: it's what lets a notification template or launchpad filter enumerate "every user who can close an underwriting alert" without loading the whole role graph. Lookup is by `code`, not by id — codes are the stable contract (<<user-management>>), ids are not.
+
+=== `DecisionDepartmentService` — the API
+
+[source,java]
+----
+public Map<String, String> allDecisionDepartments();          // code -> description, active only, TreeMap
+public Optional<DecisionDepartment> getActiveByCode(String code);
+public Optional<DecisionDepartment> getForUser(UserAccount user);
+public Optional<DecisionDepartment> getForRole(UserRole role);
+
+@Transactional public void setForRole(UserRole role, DecisionDepartment department);
+@Transactional public void removeForRole(UserRole role);
+
+public List<UserAccount> getUsersByDecisionDepartment(DecisionDepartment department);
+----
+
+Two things to notice. First, `allDecisionDepartments()` returns a `TreeMap<String, String>` via `mergeNotExpected()` — codes are unique at the DB level, but the collector fails loudly if the uniqueness invariant is ever violated instead of silently dropping duplicates. Second, `getForUser` delegates to `getForRole(user.getRole())` — the association lives on the *role*, not on the user, so moving a user between roles automatically reassigns the department.
+
+=== Admin pipeline
+
+* `DecisionDepartmentController extends CatalogController` — templates at `/decision-department/table` and `/decision-department/fields`; the `validateConstraint` override translates `CODE_UNIQUE_CONSTRAINT` violations into a field-level `error.decision.department.code.duplicate` message instead of a 500
+* `DecisionDepartmentForm` — `@NotBlank` + `@Size(max = 255)` on both `code` and `description`; no separate `active` field (inherited from `CatalogEntity`)
+* `DecisionDepartmentFormMapper` — MapStruct `EntityToFormMapper` covering both directions; `createEntity` inherits the `toEntity` configuration via `@InheritConfiguration`
+* `DecisionDepartmentExporter` — `CatalogEntityExporter` at `@Order(5200)`, version `"2"`; exports code + description (not the `id`, not the `active` flag) via `DecisionDepartmentExportData` + `DecisionDepartmentToDtoMapper`. Use this to seed departments across environments — ordering 5200 runs *after* most user/role catalogs so the role mapping can be applied in a follow-up migration
+
+=== Assigning a department to a role
+
+Departments are not configured on the department page — they're configured from the *role* page via an `EntityActionController`:
+
+[source,java]
+----
+@Order(30_000)
+@Controller
+@RequestMapping("/update-department")
+public class UpdateDepartmentUserRoleAction
+        extends EntityActionController<UUID, UserRole, UpdateDepartmentForm> {
+
+    @Override
+    protected EntityAction<? super UserRole, UpdateDepartmentForm> action() {
+        return when(userRole -> true)  // every role is eligible
+            .then((userRole, form, user) -> {
+                if (StringUtils.hasText(form.getDepartmentCode())) {
+                    departmentService.getActiveByCode(form.getDepartmentCode())
+                        .ifPresent(d -> departmentService.setForRole(userRole, d));
+                } else {
+                    departmentService.removeForRole(userRole);
+                }
+                reloadPageHelper.reload(userRole);
+            });
+    }
+}
+----
+
+Empty `departmentCode` is the explicit un-assign signal — the action is reused for both set and clear. `reloadPageHelper.reload(userRole)` triggers a live refresh of the role row so the `DepartmentUserRoleLabel` (below) updates without a full page reload (<<reload-infrastructure-live-ui-updates-on-entity-changes>>).
+
+=== `DepartmentUserRoleLabel` — the badge on the role row
+
+`@Component @Order(1000) implements EntityLabel<UserRole>`. For every `UserRole` with a mapped department, it emits a localized badge. `getName(UserRole role)` returns the localized string via `EnumUtils.getLocalizedValue(getGroup(), "role.decision.department", ...)` — translators provide `role.decision.department.<description>` keys; the plain description is the fallback. `getName()` (no-arg) throws — this label is never surfaced outside a specific role binding.
+
+=== External exposure
+
+`UnderwritingOptionsController` (<<flowable-external-api>>) mounts `/options/decision-department` which calls `allDecisionDepartments()` verbatim — the admin UI that edits decision-tree mappings and fixed-fact schemas dereferences department codes through this endpoint. If you rename a department code, that endpoint's cache is the first place you'll notice stale values.
+
+== Decline Reasons
+
+`DeclineReason` is the structured catalog of *why* an application can be declined — "insufficient income," "fraud suspicion," "bureau score below threshold." The underwriter picks from this catalog when closing an `ALERT` fact with a decline outcome, and the chosen reason rides along with every downstream event (`LoanDeclinedEvent` — <<notifications>>) and document template rendering (<<document-templates>>).
+
+Structurally, `DeclineReason` is a near-clone of `DecisionDepartment` — same `CatalogEntity` base, same form/mapper/export wiring, same admin CRUD shape. What makes it different is *how* it's consumed: decline reasons bind to `FormSchema` (<<form-schema>>) so that each reason can prompt for extra context (free-text comment, attached evidence, required fields) before the decline is finalized. That binding is not declared on the entity itself — it lives on the `FormSchema` side, which references a `DeclineReason.code` in its `contextKey`.
+
+=== `DeclineReason` — the entity
+
+[source,java]
+----
+@Entity
+@Table(name = "decline_reason",
+    uniqueConstraints = @UniqueConstraint(
+        columnNames = DeclineReason.CODE,
+        name = DeclineReason.CODE_UNIQUE_CONSTRAINT))
+@Audited
+public class DeclineReason extends CatalogEntity implements Comparable<DeclineReason> {
+
+    public static final String CODE_UNIQUE_CONSTRAINT = "UK_decline_reason_code";
+
+    @Column(name = CODE, nullable = false)         private String code;
+    @Column(name = "description", nullable = false) private String description;
+}
+----
+
+Unique `code`, mandatory `description`, audited. The `toString()` falls back to `DeclineReason[id=...]` only if `code` is null — which in practice should never happen because the column is `nullable = false`, but the fallback makes pre-flush toString in loggers safe.
+
+=== `DeclineReasonRepository` — note the subtle difference
+
+[source,java]
+----
+@Repository
+public interface DeclineReasonRepository extends JpaRepository<DeclineReason, UUID> {
+
+    Collection<DeclineReason> findAllByActiveTrue();
+
+    @Query("from DeclineReason where code = :code")
+    Optional<DeclineReason> findActiveByCode(@Param("code") String code);
+}
+----
+
+The method is named `findActiveByCode`, but the JPQL has **no `active` predicate**. This is deliberate: decline reasons can be deactivated from the catalog so they don't appear in new-decline dropdowns, but an *existing* alert that was decided with a now-retired reason must still render correctly in audit trails, document templates, and notifications. The service-layer `getAllActive()` filters by `active=true` for pickers; the code lookup resolves regardless of flag. If you're writing code that should refuse retired reasons, filter `isActive()` yourself after resolution.
+
+=== `DeclineReasonService` — the minimal API
+
+[source,java]
+----
+@Service
+public class DeclineReasonService {
+    public Collection<DeclineReason> getAllActive();
+    public Optional<DeclineReason> getActiveByCode(String code);
+}
+----
+
+Two methods. No role-routing, no per-user query — decline reasons are globally enumerable and resolved by code. Mutations go through the generic `CatalogController` save path.
+
+=== Admin pipeline
+
+* `DeclineReasonController extends CatalogController` — templates `/decline-reason/table` and `/decline-reason/fields`; the uniqueness constraint translation mirrors `DecisionDepartmentController` but binds `error.decline.reason.code.duplicate`
+* `DeclineReasonForm` — same `@NotBlank` + `@Size(max = 255)` on `code` and `description`
+* `DeclineReasonFormMapper` — `EntityToFormMapper` with `@InheritConfiguration` on `createEntity`
+* `DeclineReasonExporter` — `CatalogEntityExporter` at `@Order(5100)` (runs *before* `DecisionDepartmentExporter@5200` — decline reasons seed first because `FormSchema` bindings and notification templates reference them); version `"2"`
+* `DeclineReasonExportData` + `DeclineReasonToDtoMapper` — plain `code`/`description` DTO, same pattern as decision department
+
+=== FormSchema integration
+
+`DeclineReason` does not own its form. The binding is inverted: a `FormSchema` (<<form-schema>>) entry with `contextKey = "decline_reason:<code>"` attaches prompt fields to a reason. When an underwriter closes an `ALERT` fact with a decline outcome, the UI resolves `DeclineReasonService.getAllActive()` for the dropdown, then on selection looks up the `FormSchema` by the composite context key to render "explain," "attach bureau report," "specify violated policy section," whatever the credit policy requires. The reason code is the durable identifier across this seam — *never bind the `FormSchema` to the reason's UUID*, because export/import flow re-ids entities on arrival.
+
+=== `LoanDeclinedEvent` integration
+
+`FixedDecisionFact` ALERT-type facts store the selected reason code on close. When the process transitions to a declined terminal state, `LoanDeclinedEvent` (<<notifications>>) is fired carrying the `DeclineReason.code` — notification templates dereference the code back through `DeclineReasonService.getActiveByCode` to render localized customer-facing text (or a redacted placeholder for regulatorily-sensitive reasons). The `code is :code` bare lookup (no active filter) is why old-but-active alerts still render the right description in past-dated notifications.
+
+=== External exposure
+
+`UnderwritingOptionsController` (<<flowable-external-api>>) exposes `/options/decline-reason` which serves the same `getAllActive()` collection the admin dropdown sees. This is the endpoint that feeds the decision-tree builder and the fact-schema editor — if a policy change adds a new reason, the front-end pickup is immediate on the next options fetch.
+
+== ExecutionResult
+
+`ExecutionResultType` is a single-class marker — a `NamedParameter` subtype that tags the `result` of a decision process execution:
+
+[source,java]
+----
+public final class ExecutionResultType extends NamedParameter {
+    public ExecutionResultType(String name) {
+        super(name);
+    }
+}
+----
+
+That is literally the whole class. It exists so that `CustomEnum` / `NamedParameter` infrastructure (<<sdk-utilities>>) can distinguish "execution result" values from the hundreds of other `NamedParameter` subtypes in the SDK (process types, fact types, user labels, etc.) without string-matching on names.
+
+Typical values — `APPROVED`, `DECLINED`, `MANUAL_REVIEW`, `CANCELLED` — are declared as `public static final ExecutionResultType` constants on the integrating module, registered once at class init, and then matched by identity in listener code:
+
+[source,java]
+----
+public static final ExecutionResultType APPROVED = new ExecutionResultType("APPROVED");
+public static final ExecutionResultType DECLINED = new ExecutionResultType("DECLINED");
+
+if (DECLINED.equals(execution.getResultType())) {
+    // route to LoanDeclinedEvent, materialize DeclineReason, etc.
+}
+----
+
+Because the class is `final` and carries no additional fields beyond `NamedParameter`'s `name`, the extension point is only "declare more constants of this type." If your process needs richer result metadata (a score band, a routing hint), put that on the execution's `FixedDecisionFact` payload — **don't** subclass `ExecutionResultType` (it's `final`) and **don't** stuff structured data into the name string.
+
+{ok} Use `ExecutionResultType` as the coarse branching key for post-execution listeners.
+{bad} Using the `name` string as a data channel ("APPROVED_WITH_CONDITIONS_SEE_NOTES") — the name is an identifier, not a message body.
+
+== Anti-Patterns
+
+* {bad} **Calling `workflowStarter.start(...)` outside a transaction** — `DecisionProcessStarter.start` is `@Transactional`, but the `afterTransaction` hook that triggers `ProcessQueueService.requestProcessStart` requires a committed outer transaction; no transaction means no hook fires, and the row sits in `CREATED` until the scheduler eventually finds it
+* {bad} **Firing `FinishedScoringEvent` manually from application code** — it's fired by `FixedFactPostProcessor` for `HasPendingDecisions` entities; duplicate firings cause listeners to run twice. If your entity doesn't implement `HasPendingDecisions`, use a `DecisionProcessPostProcessor` instead
+* {bad} **Using TEST-mode executions to clear pending decisions** — `FixedFactPostProcessor` short-circuits on `TEST` mode; pending decisions stay stale. TEST is for rehearsals, not for cleanup
+* {bad} **Catching `ProcessStartException` silently** — it almost always means the admin has not mapped the process type. A swallowed exception hides a production misconfiguration
+* {bad} **Mutating `PendingDecisionHolder.pendingDecisions` directly from post-processors** — `FixedFactPostProcessor` deletes and recreates them by `processGroup`; your edits will be overwritten on the next run
+* {bad} **Setting `workflow.process.queue.max.concurrent` higher than engine worker count** — the queue admits processes faster than the engine can run them; `PROCESSING → STARTED` transitions pile up and hit the stale-check timeout
+* {bad} **Extending `DecisionProcessPostProcessor` without binding a `DecisionProcessType` in the constructor** — the post-processor runs for every execution regardless of type, which is almost never what you want; the `processType` arg is not optional for a reason
+* {bad} **Registering a `DecisionProcessType` at a call site** (`new DecisionProcessType<>(...)` inline) — `CustomEnum` requires a stable identity; two instances with the same name but different object identity break `findById` lookups silently
+* {bad} **Assigning a `DecisionDepartment` directly on a `UserAccount`** — the association is on `UserRole` via `UserRoleDecisionDepartment`. A per-user override bypasses `DepartmentUserRoleLabel` and the `/options/decision-department`-driven launchpad filters; moving the user between roles will then silently strand the override
+* {bad} **Looking up a `DecisionDepartment` by UUID from notification templates** — `LoanDeclinedEvent` and template contexts carry the `code`, not the id; export/import re-ids entities, so any UUID-keyed reference breaks across environments. Use `DecisionDepartmentService.getActiveByCode` (or the `DeclineReasonService` equivalent)
+* {bad} **Filtering the decline-reason dropdown in one template but not in audit/notification renders** — `DeclineReasonRepository.findActiveByCode` deliberately ignores the `active` flag so past-dated references still resolve. Double-filtering on `isActive()` in legacy renders produces missing-reason gaps in historical documents
+* {bad} **Subclassing `ExecutionResultType` or encoding structured data in its `name`** — it's `final` for a reason. Put metadata on the `FixedDecisionFact` payload, not on the result type identifier
+
+== Production Checklist
+
+Before shipping workflow integration to production:
+
+* {todo} `DecisionTreeMapping` rows exist for every `DecisionProcessType` the application can start (seed via Flyway or `CommandLineRunner`)
+* {todo} `application.entityChangeHandler.enabled` is evaluated — if you want the launchpad and counter live-updates from `FixedFactPostProcessor.reloadFragment(...)` (<<launchpad>>, <<counters>>), the reload infrastructure must be enabled (<<reload-infrastructure-live-ui-updates-on-entity-changes>>)
+* {todo} `workflow.process.queue.max.concurrent` is sized against actual engine worker capacity — not the default `50` if the engine has 10 workers
+* {todo} `workflow.process.queue.processing.timeout` is larger than the slowest expected data-source resolution (`ProcessEntityFeatureService` blocks on `FeatureService.getFeatures`); default `PT10M` is aggressive for third-party credit bureau pulls
+* {todo} `workflow.process.queue.started.timeout` reflects business SLA — `PT24H` default is generous, but leaves orphaned workflows running for a full day
+* {todo} `ProcessExecutionFailedEvent` notification recipients are configured — `PROCESS_EXECUTION_FAILED` is fired on every `FAILED` status, including transient engine errors, so ops needs at least a pager route or a daily digest
+* {todo} `ProcessQueueMonitoringService.getQueueStatistics()` is scraped — `hasBacklog` > 0 trending up means capacity is undersized; `queueHealthy == false` means stale detection needs attention
+* {todo} One entity per subject extends `AbstractPendingDecisionTab`; the URL is reachable from `<<launchpad>>` deep links
+* {todo} `DecisionProcessPostProcessor` beans are bound to specific `DecisionProcessType` constants, not shared across types
+* {todo} TEST-mode executions are excluded from production monitoring queries — `executionMode=REAL` filter on any dashboard
+* {todo} Envers audit tables (`decision_tree_mapping_AUD`) are retained per regulatory policy — remapping history is the audit trail for "which scoring tree was live on date X"
+* {todo} Every `UserRole` that is expected to close `ALERT` facts has exactly one `DecisionDepartment` mapping — verify via `SELECT r.code, d.code FROM user_role r LEFT JOIN user_role_decision_department m ON m.user_role_id = r.id LEFT JOIN decision_department d ON d.id = m.department`; `NULL` department on an alert-owning role means the launchpad never surfaces the alert to that role
+* {todo} Seed exports run in order — `DeclineReasonExporter@5100` before `DecisionDepartmentExporter@5200` before any `FormSchema` seed that references a reason code, otherwise import fails on missing referential target
+* {todo} Envers audit retention also covers `decision_department_AUD` and `decline_reason_AUD` — renaming a department or retiring a reason must be reconstructible for regulator review
+* {todo} `role.decision.department.<description>` translation keys exist for every active department — missing keys fall back to raw description text, which is usually fine for English but exposes untranslated strings in locale-specific admin UIs
+* {todo} `/options/decision-department` and `/options/decline-reason` responses are not aggressively cached in the front-end layer — policy changes to the catalogs must be visible on the next admin session without a deploy
+* {todo} `ExecutionResultType` constants are declared as `public static final` fields on a single module class per process — not created inline at call sites; `NamedParameter` identity is fragile under duplicate construction
+
+**Related:** <<flowable-internals>>, <<flowable-external-api>>, <<entity-actions>>, <<counters>>, <<launchpad>>, <<user-management>>, <<user-roles>>, <<reload-infrastructure-live-ui-updates-on-entity-changes>>, <<notifications>>, <<has-notes>>, <<sdk-utilities>>, <<form-schema>>, <<catalog>>, <<entity-module-sdk-reference-hierarchy>>
+

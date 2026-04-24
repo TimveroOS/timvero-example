@@ -1,0 +1,765 @@
+[[pebble-filters]]
+[[pebble-templates]]
+= Pebble Template Engine — custom filters, functions, extensions
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The Pebble template module (`com.timvero.service.template.pebble`) is the SDK's string-template engine — used for document generation (contracts, statements), notification bodies (emails, SMS), and any other text output that needs to be rendered from a DB-stored template. It wraps `io.pebbletemplates:pebble` behind the SDK's `TemplateService` SPI, adds eight custom filters and two functions for domain-aware formatting, exposes every Spring singleton to templates as a global variable, and transparently unproxies Hibernate lazy associations. This doc is the parallel of <<thymeleaf-helpers-expression-objects-lazy-unwrapping>> — the same concerns (format-money, format-enum, unwrap-proxy) reappear, but with Pebble's `{{ value | filter }}` syntax instead of Thymeleaf's `${#object.method(value)}`.
+
+== What You Need to Know
+
+The module has **three pieces**:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |Role |Key types
+
+|**Filters**
+|Transforms applied via pipe syntax `{{ value \| filterName(args) }}`. Each one is a `Filter` implementation — registered in `TemplatePebbleExtension.getFilters()`. Covers monetary, decimal, boolean, enum, last-4-masking, spelling-out, and universal pretty-printing.
+|`CurrencyFilter`, `MonetaryFormatFilter`, `DecimalFormatFilter`, `BooleanFilter`, `EnumFilter`, `Last4Filter`, `SpellFilter`, `ObjectPrintFilter`
+
+|**Functions**
+|Callable from templates as `{{ name(arg) }}`. Two ship with the SDK: `spel(...)` for running a SpEL expression against the Pebble model + Spring bean factory, and `fraction(...)` for extracting the fractional cents of a decimal.
+|`SpelFunction`, `FractionFunction`
+
+|**Extension wiring**
+|The plumbing that makes the above available. `TemplatePebbleExtension` registers filters/functions; `TemplatePebbleExtensionCustomizer` installs the Hibernate-unproxying `AttributeResolver`; `PebbleTemplateService` is the `TemplateService` entry point; `PebbleTemplateConfig` activates the whole module behind `template.service=pebble`.
+|`TemplatePebbleExtension`, `TemplatePebbleExtensionCustomizer`, `PebbleEvaluationContext`, `PebbleTemplateService`, `PebbleTemplateConfig`
+|===
+
+Key characteristics:
+
+- **Activated by property `template.service=pebble`** — `PebbleTemplateConfig` is `@ConditionalOnProperty`. Without it, no Pebble beans exist and `TemplateService` resolves to a different implementation.
+- **Every Spring singleton is a template global** — `TemplatePebbleExtension.getGlobalVariables()` iterates `context.getBeanDefinitionNames()` and puts every instantiated singleton into the model under its bean name. `{{ myService.doSomething() }}` works out-of-the-box.
+- **Hibernate proxies are transparently unwrapped** — `TemplatePebbleExtensionCustomizer` wraps each `AttributeResolver` with a decorator that calls `Hibernate.unproxy(instance)` before attribute access. The Pebble equivalent of Thymeleaf's `HibernateProxyUnwrapper`.
+- **Filter pipeline is extensible via `Extension` beans** — register any Spring bean of type `io.pebbletemplates.pebble.extension.Extension` and it gets auto-injected into `PebbleTemplateService` alongside `TemplatePebbleExtension`.
+- **`currency` vs `monetaryFormat` are different** — `currency` uses `java.text.NumberFormat.getCurrencyInstance(locale)` on a `Number`; `monetaryFormat` uses JSR-354 `MonetaryAmountFormat` on a `javax.money.Money`. Not interchangeable.
+- **`spel()` gives templates a SpEL escape hatch** — anything too complex for a filter can be written as `{{ spel('someService.calculate(#input, 42)') }}` with full access to the bean factory and model variables.
+
+== Architecture Overview
+
+----
+application.properties
+   template.service=pebble
+        │
+        ▼
+PebbleTemplateConfig (@ConditionalOnProperty)
+   ├─ registers TemplatePebbleExtension bean
+   └─ registers PebbleTemplateService as TemplateService
+
+PebbleTemplateService.evaluate(template, model, locale)
+        │
+        │  build merged model:
+        │    globals (all Spring singletons + currentDate/Time)
+        │    + caller's model (overrides globals)
+        ▼
+PebbleEngine (lazily built, singleton)
+   .loader(StringLoader)
+   .registerExtensionCustomizer(TemplatePebbleExtensionCustomizer::new)
+   .extension(List<Extension> from Spring context)
+        │
+        ▼
+template.evaluate(writer, fullModel, locale)
+        │
+        │  while rendering...
+        ▼
+AttributeResolver chain (wrapped by Customizer)
+   │
+   │  instance = Hibernate.unproxy(instance)
+   │
+   └─► filter / function dispatch
+          │
+          ├─ {{ x | currency }}      → CurrencyFilter
+          ├─ {{ x | monetaryFormat }}→ MonetaryFormatFilter
+          ├─ {{ x | decimalFormat }} → DecimalFormatFilter
+          ├─ {{ x | enum('group') }} → EnumFilter (delegates to EnumUtils)
+          ├─ {{ x | boolean('Y','N')}}→ BooleanFilter
+          ├─ {{ x | last4 }}         → Last4Filter
+          ├─ {{ x | spell }}         → SpellFilter
+          ├─ {{ x | print }}         → ObjectPrintFilter (delegates to ObjectPrintUtils)
+          ├─ {{ spel('bean.m()') }}  → SpelFunction (SpEL parser + BeanFactoryResolver)
+          └─ {{ fraction(amount) }}  → FractionFunction
+----
+
+The engine is **built once, lazily**, on the first `evaluate` call — `PebbleTemplateService` uses double-checked locking around `pebbleEngine`. Rebuilding requires a fresh bean (no reload API).
+
+== Custom Filters
+
+Registered in `TemplatePebbleExtension.getFilters()`. Each filter is a Java `Filter` with a no-arg constructor (except `MonetaryFormatFilter`, which needs `ApplicationContext` for its default properties).
+
+=== Formatting filters
+
+==== currency — locale-driven number-to-currency
+
+[source,java]
+----
+public class CurrencyFilter implements Filter {
+    public Object apply(Object input, Map<String, Object> args, PebbleTemplate self,
+            EvaluationContext context, int lineNumber) {
+        if (input == null) return "";
+        Number amount = input instanceof Number ? (Number) input
+                                                : new BigDecimal(input.toString());
+        return NumberFormat.getCurrencyInstance(context.getLocale()).format(amount);
+    }
+}
+----
+
+- Input: any `Number` or a string parseable by `BigDecimal`.
+- Output: formatted with the JDK's locale currency symbol — e.g. `$10,000.00` / `10 000,00 €`.
+- Uses the **template's locale** (`context.getLocale()`) — the `Locale` passed to `PebbleTemplateService.evaluate(...)`.
+- Null-safe: `null → ""`.
+
+[source]
+----
+{{ 10000.5 | currency }}            → $10,000.50    (en-US)
+{{ "250.00" | currency }}           → $250.00
+{{ credit.amount | currency }}      → $5,000.00     (BigDecimal input)
+----
+
+Use when the template receives a raw `BigDecimal` / `Integer` / `Long` that represents money **without** an attached currency unit. If your domain uses `javax.money.Money`, prefer `monetaryFormat`.
+
+==== monetaryFormat — JSR-354 Money formatting
+
+[source,java]
+----
+public class MonetaryFormatFilter implements Filter {
+    // Argument names: "locale", "pattern", "currencyStyle"
+    // Defaults from environment:
+    //   document.template.monetary.format.locale
+    //   document.template.monetary.format.pattern   (default "¤ #,##0.00")
+    //   document.template.monetary.currency.style   (default CODE)
+
+    public Object apply(Object input, Map<String, Object> args, ...) {
+        if (input == null) return null;
+        if (!(input instanceof Money monetary))
+            throw new PebbleException("The input for 'MonetaryFormat' has to be a money.");
+        return getAmountFormat(args, context).format(monetary);
+    }
+}
+----
+
+- Input: **must be `org.javamoney.moneta.Money`** — throws `PebbleException` otherwise.
+- Output: formatted per the JSR-354 `MonetaryAmountFormat`.
+- Three optional named arguments:
+  - `locale` — BCP-47 tag (`"en-US"`, `"de-DE"`), overrides the template locale
+  - `pattern` — `DecimalFormat` pattern with `¤` as currency placeholder
+  - `currencyStyle` — one of `CODE`, `NAME`, `SYMBOL`, `NUMERIC_CODE` (from `org.javamoney.moneta.format.CurrencyStyle`)
+
+[source]
+----
+{{ credit.outstanding | monetaryFormat }}
+   → USD 5,000.00        (default style=CODE, pattern="¤ #,##0.00")
+
+{{ credit.outstanding | monetaryFormat(locale='de-DE', currencyStyle='SYMBOL') }}
+   → $ 5.000,00
+
+{{ credit.outstanding | monetaryFormat(pattern='#,##0.00 ¤', currencyStyle='NAME') }}
+   → 5,000.00 US Dollar
+----
+
+Application properties that drive the defaults:
+
+[source,properties]
+----
+document.template.monetary.format.locale=en-US
+document.template.monetary.format.pattern=¤ #,##0.00
+document.template.monetary.currency.style=CODE
+----
+
+Use when the value carries its own `CurrencyUnit` (the normal case for SDK `Credit`, `Operation`, `PaymentTransaction` entities that store `Money`). Never use `currency` filter on a `Money` — it'll call `toString()` via the `Number` branch and render garbage.
+
+==== decimalFormat — arbitrary numeric patterns
+
+[source,java]
+----
+public class DecimalFormatFilter implements Filter {
+    // Argument names: "format", "locale"
+    public Object apply(Object input, Map<String, Object> args, ...) {
+        if (input == null) return null;
+        if (!(input instanceof Number number))
+            throw new PebbleException("The input for 'DumberFormat' has to be a number.");
+        Locale locale = args.get("locale") != null
+            ? Locale.forLanguageTag((String) args.get("locale"))
+            : context.getLocale();
+        String pattern = (String) args.get("format");
+        return pattern != null
+            ? new DecimalFormat(pattern, new DecimalFormatSymbols(locale)).format(number)
+            : NumberFormat.getInstance(locale).format(number);
+    }
+}
+----
+
+- Input: any `Number` (throws on non-numeric).
+- Output: formatted via `DecimalFormat` with the supplied pattern + locale-specific symbols, or by `NumberFormat.getInstance(locale)` when no pattern given.
+
+[source]
+----
+{{ 0.0875 | decimalFormat(format='#0.00%') }}        → 8.75%
+{{ 1234567 | decimalFormat(format='#,##0') }}        → 1,234,567
+{{ rate | decimalFormat(format='0.0000') }}          → 0.0875
+{{ rate | decimalFormat(format='0,0000', locale='de-DE') }} → 0,0875
+----
+
+Use for interest rates, percentages, ratios, counters — anything numeric that is **not** money.
+
+==== last4 — masked trailing-4 display
+
+[source,java]
+----
+public class Last4Filter implements Filter {
+    public Object apply(Object input, ...) {
+        if (input == null) return "";
+        String s = input.toString();
+        return s.length() > 4 ? "***" + s.substring(s.length() - 4) : s;
+    }
+}
+----
+
+- Input: anything; `toString()` is called.
+- Output: `***` + last 4 chars if longer than 4, else the input unchanged.
+
+[source]
+----
+{{ "4111111111111234" | last4 }}      → ***1234
+{{ client.passport    | last4 }}      → ***6789
+{{ "1234"             | last4 }}      → 1234      (≤ 4 chars: no mask)
+----
+
+Use for PAN, SSN, passport, account numbers in receipts and emails — never log or render them in full.
+
+==== spell — insert spaces between characters
+
+[source,java]
+----
+public class SpellFilter implements Filter {
+    public Object apply(Object input, ...) {
+        if (input == null) return "";
+        StringBuilder b = new StringBuilder();
+        for (char c : input.toString().toCharArray()) { b.append(c).append(' '); }
+        if (b.length() > 0) b.deleteCharAt(b.length() - 1);
+        return b.toString();
+    }
+}
+----
+
+- Output: `"1234" → "1 2 3 4"`, `"ABC" → "A B C"`.
+
+[source]
+----
+<!-- Receipt with spaced code -->
+Transaction: {{ operation.id | spell }}     → Transaction: 4 2 8 1 7
+
+<!-- Verification code in email -->
+Code: {{ code | spell }}                    → Code: 9 4 2 7
+----
+
+Use for OTP / verification codes in notification templates where readability in monospace is more important than compactness.
+
+=== Logic filters
+
+==== enum — localized enum display
+
+[source,java]
+----
+public class EnumFilter implements Filter {
+    // Argument names: "group", "locale", "default"
+    public Object apply(Object input, Map<String, Object> args, ...) {
+        if (input == null) return "";
+        String group = (String) args.get("group");
+        String localeStr = (String) args.get("locale");
+        String def = (String) args.get("default");
+        Locale locale = StringUtils.isNotEmpty(localeStr)
+            ? Locale.forLanguageTag(localeStr)
+            : context.getLocale();
+        return EnumUtils.getLocalizedValue(group, input, def, locale);
+    }
+}
+----
+
+- Delegates to `com.timvero.ground.tools.EnumUtils.getLocalizedValue` — the same engine used by Thymeleaf's `#enums.name(...)`.
+- i18n key: `<group>.<value>`; if `group` is null, falls back to `EnumUtils.getDefaultGroup(enum.getClass())` (PascalCase → dotted lowercase, e.g. `ParticipantStatus` → `participant.status`).
+
+[source]
+----
+{{ credit.status | enum }}
+   → Approved
+
+{{ credit.status | enum(group='short.status') }}
+   → AP                                         (from message key short.status.APPROVED)
+
+{{ credit.status | enum(default='unknown') }}
+   → unknown                                    (if no message key exists)
+
+{{ credit.status | enum(locale='de-DE') }}
+   → Genehmigt
+----
+
+==== boolean — yes/no rendering
+
+[source,java]
+----
+public class BooleanFilter implements Filter {
+    // Argument names: "yesMsg", "noMsg"
+    public Object apply(Object input, ...) {
+        String yesMsg = (String) args.get("yesMsg");
+        String noMsg  = (String) args.get("noMsg");
+        if (input == null) return Boolean.FALSE;    // <1>
+        return (Boolean) input ? yesMsg : noMsg;
+    }
+}
+----
+<1> Note: null returns `Boolean.FALSE` (the value, not the string) — rendered as `false` by Pebble's default `toString()`. Supply `noMsg` to render a sane fallback.
+
+[source]
+----
+{{ application.approved | boolean(yesMsg='Yes', noMsg='No') }}
+   → Yes
+
+{{ application.hasGuarantor | boolean(yesMsg='Has guarantor', noMsg='Solo') }}
+   → Solo
+----
+
+Both messages must be passed as literals — this filter does not consult i18n. Use `{{ flag | boolean(yesMsg=i18n.get('yes'), noMsg=i18n.get('no')) }}` if you need localization (where `i18n` is a `MessageSource` bean — see <<pebble-filters-evaluationcontext,PebbleEvaluationContext>>).
+
+==== print — universal "any value" renderer
+
+[source,java]
+----
+public class ObjectPrintFilter implements Filter {
+    public Object apply(Object input, ...) {
+        if (input == null) return null;
+        return ObjectPrintUtils.name(input, context.getLocale());
+    }
+}
+----
+
+Delegates to `com.timvero.base.audit.printer.ObjectPrintUtils.name(...)` — the same "render anything" logic behind Thymeleaf's `#print.name`. Handles `Enum` / `CustomEnum`, `Temporal`, `Persistable<?>`, `NamedEntity`, `Collection<?>`, `BigDecimal`, `String`.
+
+[source]
+----
+{{ audit.oldValue | print }}      → whatever reads right for that value
+{{ client.roles  | print }}       → Borrower, Guarantor
+{{ change.value  | print }}       → works for heterogeneous audit payloads
+----
+
+Use in generic / audit fragments where the actual type varies. For known types, prefer the specific filter (`currency`, `monetaryFormat`, `enum`) — it's faster and the output format is more predictable. See <<audit-module-sdk-reference-internals>> for `ObjectPrintUtils` details.
+
+== Custom Functions
+
+Registered in `TemplatePebbleExtension.getFunctions()`. Unlike filters, functions are called directly as `{{ name(args) }}` and don't require a piped input.
+
+=== fraction — extract cents from a decimal
+
+[source,java]
+----
+public class FractionFunction implements Function {
+    // Argument: "number"
+    public Object execute(Map<String, Object> args, ...) {
+        Object input = args.get("number");
+        if (input == null) return "";
+        BigDecimal decimal = input instanceof BigDecimal
+            ? (BigDecimal) input
+            : new BigDecimal(input.toString());
+        int currencyScale = 2;
+        return decimal.remainder(BigDecimal.ONE).movePointRight(currencyScale).intValue();
+    }
+}
+----
+
+Returns the two-digit fractional part as an `int`. Always scale 2 (hard-coded).
+
+[source]
+----
+{{ fraction(number=12.34) }}       → 34
+{{ fraction(number=100.00) }}      → 0
+{{ fraction(number=credit.amount) }}→ 50     (if amount = 5000.50)
+----
+
+Typical use — documents that render amounts in words + cents:
+
+[source]
+----
+Amount: {{ amount | currency }}
+        ({{ spel('amountInWords(#amount)') }} dollars and {{ fraction(number=amount) }}/100)
+----
+
+=== spel — SpEL expression escape hatch
+
+[source,java]
+----
+public class SpelFunction implements Function {
+    // Argument: "expression"
+    public Object execute(Map<String, Object> args, ...) {
+        String expression = (String) args.get("expression");
+        PebbleEvaluationContext spelContext = new PebbleEvaluationContext(context);
+        spelContext.getPropertyAccessors().addAll(propertyAccessors);  // <1>
+        spelContext.setBeanResolver(beanResolver);                     // <2>
+        return getExpression(expression).getValue(spelContext);
+    }
+}
+----
+<1> Property accessors include `BeanExpressionContextAccessor`, `BeanFactoryAccessor`, `MapAccessor`, `EnvironmentAccessor` — SpEL can navigate the Pebble model, the Spring bean factory, the environment.
+<2> `BeanFactoryResolver` — SpEL's `@beanName` syntax resolves against Spring.
+
+Parsed expressions are **cached** in a `ConcurrentHashMap<String, Expression>` — same template source uses the same compiled `Expression`.
+
+[source]
+----
+<!-- Call a bean method -->
+{{ spel('@creditCalculator.monthlyPayment(#credit)') }}
+
+<!-- Arithmetic on model -->
+{{ spel('#credit.amount.subtract(#credit.paid)') | monetaryFormat }}
+
+<!-- Conditional rendering -->
+{% if spel('#application.status.name() == ''APPROVED''') %} Welcome {% endif %}
+
+<!-- Environment access -->
+{{ spel('@environment.getProperty(''company.name'')') }}
+----
+
+Use `spel()` sparingly — each call parses (then caches) a SpEL expression, and the escape hatch makes templates harder to reason about. Prefer adding a dedicated model variable or a project-specific filter. Good fit when a one-off calculation is needed for a document template that can't easily have Java code added to it (e.g., when a bank employee edits the template in the admin UI).
+
+[[pebble-filters-evaluationcontext]]
+== PebbleEvaluationContext
+
+Bridges Pebble's `EvaluationContext` to Spring's `StandardEvaluationContext`:
+
+[source,java]
+----
+public class PebbleEvaluationContext extends StandardEvaluationContext {
+
+    private EvaluationContext evaluationContext;
+
+    public PebbleEvaluationContext(EvaluationContext evaluationContext) {
+        this.evaluationContext = evaluationContext;
+    }
+
+    @Override
+    public Object lookupVariable(String name) {
+        Object result = evaluationContext.getVariable(name);
+        return result != null ? result : super.lookupVariable(name);
+    }
+}
+----
+
+Two-stage variable lookup — the Pebble model is consulted first (`#credit` in a SpEL expression reads from the Pebble variables), and falls through to the SpEL-native variable store when the Pebble context doesn't have the name. This is why `@beanName` works **and** `#modelVariable` works inside `spel(...)`.
+
+Used only by `SpelFunction`. If you write your own function that wants to evaluate SpEL against the Pebble context, reuse this class.
+
+== TemplatePebbleExtension + Customizer
+
+=== TemplatePebbleExtension — the registration hub
+
+[source,java]
+----
+public class TemplatePebbleExtension extends AbstractExtension {
+
+    @Autowired
+    private ApplicationContext context;
+
+    @Override
+    public Map<String, Filter> getFilters() { ... }     // <1>
+
+    @Override
+    public Map<String, Function> getFunctions() { ... } // <2>
+
+    @Override
+    public Map<String, Object> getGlobalVariables() {   // <3>
+        Map<String, Object> beans = new HashMap<>();
+        String[] all = context.getBeanDefinitionNames();
+        ConfigurableListableBeanFactory clbf =
+            ((AbstractApplicationContext) context).getBeanFactory();
+        for (String name : all) {
+            Object s = clbf.getSingleton(name);
+            if (s != null) {
+                beans.put(name, s);
+            }
+        }
+        beans.put("environment", context.getEnvironment());
+        model.putIfAbsent("currentDate", LocalDate.now());
+        model.putIfAbsent("currentDateTime", Instant.now());
+        model.putIfAbsent("now", LocalDate.now());
+        return beans;
+    }
+}
+----
+<1> 8 filters: `boolean`, `enum`, `currency`, `decimalFormat`, `monetaryFormat`, `last4`, `spell`, `print`
+<2> 2 functions: `spel`, `fraction`
+<3> **Every singleton bean** is added to the global model by bean name, plus `environment`, `currentDate`, `currentDateTime`, `now`
+
+The global-variables behavior is load-bearing. A template can call `{{ userService.findById(42).name }}` without any setup — the `userService` bean is already in scope. Downside: bean-name collisions with model keys (if a caller passes `model.put("userService", ...)`) silently override globals.
+
+=== TemplatePebbleExtensionCustomizer — Hibernate unproxying
+
+Not a Spring bean — instantiated per-extension by `PebbleEngine.Builder.registerExtensionCustomizer`:
+
+[source,java]
+----
+public class TemplatePebbleExtensionCustomizer extends ExtensionCustomizer {
+
+    @Override
+    public List<AttributeResolver> getAttributeResolver() {
+        return super.getAttributeResolver() == null
+            ? null
+            : super.getAttributeResolver().stream()
+                .map(UnproxingAttributeResolverWrapper::new)
+                .collect(Collectors.toList());
+    }
+
+    private record UnproxingAttributeResolverWrapper(AttributeResolver wrappedResolver)
+            implements AttributeResolver {
+        @Override
+        public ResolvedAttribute resolve(Object instance, Object attributeNameValue,
+            Object[] argumentValues, ArgumentsNode args, EvaluationContextImpl context,
+            String filename, int lineNumber) {
+
+            if (instance != null) {
+                instance = Hibernate.unproxy(instance);          // <1>
+            }
+            return wrappedResolver.resolve(instance, attributeNameValue, argumentValues,
+                args, context, filename, lineNumber);
+        }
+    }
+}
+----
+<1> Every attribute access (`{{ entity.association.field }}`) runs `Hibernate.unproxy(entity.association)` **before** property resolution. Parallel to Thymeleaf's `HibernateProxyUnwrapper`, but implemented as an `AttributeResolver` wrapper rather than a SpEL `PropertyAccessor` chain.
+
+The customizer is registered once, on engine build:
+
+[source,java]
+----
+new PebbleEngine.Builder()
+    .loader(new StringLoader())
+    .registerExtensionCustomizer(TemplatePebbleExtensionCustomizer::new)   // <1>
+    .extension(pebbleExtensions)                                           // <2>
+    .build();
+----
+<1> The customizer is applied to **every** extension, including user-supplied ones.
+<2> All Spring-registered `Extension` beans are injected — the SDK's built-in `TemplatePebbleExtension` plus any project-added ones.
+
+== PebbleTemplateService + Config
+
+=== PebbleTemplateConfig — conditional activation
+
+[source,java]
+----
+@Configuration
+@ConditionalOnProperty(name = "template.service", havingValue = "pebble")
+public class PebbleTemplateConfig {
+
+    @Bean
+    TemplatePebbleExtension templatePebbleExtension() {
+        return new TemplatePebbleExtension();
+    }
+
+    @Bean
+    TemplateService templateService() {
+        return new PebbleTemplateService();
+    }
+}
+----
+
+Controlled by a single property:
+
+[source,properties]
+----
+template.service=pebble
+----
+
+Without it, neither bean exists. The SDK ships with multiple `TemplateService` implementations (FreeMarker, Thymeleaf-based) — only one is active at a time, chosen by this property.
+
+=== PebbleTemplateService — the entry point
+
+[source,java]
+----
+public class PebbleTemplateService implements TemplateService {
+
+    private PebbleEngine pebbleEngine;
+
+    @Autowired
+    private Extension[] pebbleExtensions;    // <1>
+
+    public PebbleEngine getPebbleEngine() {   // <2>
+        if (pebbleEngine == null) {
+            synchronized (this) {
+                if (pebbleEngine == null) {
+                    this.pebbleEngine = new PebbleEngine.Builder()
+                        .loader(new StringLoader())
+                        .registerExtensionCustomizer(TemplatePebbleExtensionCustomizer::new)
+                        .extension(pebbleExtensions).build();
+                }
+            }
+        }
+        return pebbleEngine;
+    }
+
+    @Override
+    public String evaluate(String template, Map<String, ?> model, Locale locale)
+            throws TemplateEvaluatonException {
+        Map<String, Object> fullModel = new HashMap<>();
+        for (Extension ext : pebbleExtensions) {
+            Map<String, Object> vars = ext.getGlobalVariables();
+            if (vars != null) fullModel.putAll(vars);
+        }
+        fullModel.putAll(model);                          // <3>
+        // ... evaluate, wrap exceptions
+    }
+}
+----
+<1> **Every** `Extension` bean is auto-injected. To add your own filter/function set, declare a `@Bean Extension myExtension()` — it joins the array automatically.
+<2> Double-checked locking — engine built on first use, thereafter reused.
+<3> **Caller's model wins** — globals are merged first, then overlaid. A caller-supplied `"currentDate"` overrides the extension's default.
+
+Exceptions are wrapped:
+
+- `PebbleException` → `TemplateEvaluatonException(message, lineNumber, cause)` — retains the line number so UIs can highlight the problem
+- `IOException` → `TemplateEvaluatonException`
+- any other `RuntimeException` → `TemplateEvaluationRuntimeException` (unchecked variant — for programming errors in called beans)
+
+== Advanced Patterns
+
+=== Registering a project-specific Extension
+
+Add filters / functions without touching the SDK — drop an additional `Extension` into the Spring context:
+
+[source,java]
+----
+@Configuration
+public class ProjectPebbleExtensions {
+
+    @Bean
+    public Extension companyPebbleExtension(CompanyNumberFormatter formatter) {
+        return new AbstractExtension() {
+            @Override
+            public Map<String, Filter> getFilters() {
+                return Map.of("companyNumber", new CompanyNumberFilter(formatter));
+            }
+
+            @Override
+            public Map<String, Function> getFunctions() {
+                return Map.of("nextHoliday", new NextHolidayFunction());
+            }
+        };
+    }
+}
+----
+
+Because `PebbleTemplateService` injects `Extension[]`, the new bean is merged in automatically on engine build. Templates can immediately use `{{ tax.id | companyNumber }}` and `{{ nextHoliday(region='US') }}`.
+
+=== Invoking templates from Java
+
+[source,java]
+----
+@Service
+public class ContractRenderer {
+
+    @Autowired
+    private TemplateService templateService;
+
+    public String render(Credit credit, Locale locale) {
+        String template = documentTemplateRepository.findByCategory("CONTRACT").getBody();
+        Map<String, Object> model = Map.of(
+            "credit", credit,
+            "client", credit.getClient(),
+            "today", LocalDate.now()
+        );
+        try {
+            return templateService.evaluate(template, model, locale);   // <1>
+        } catch (TemplateEvaluatonException e) {
+            throw new ContractRenderingException("line " + e.getLineNumber() + ": "
+                + e.getMessage(), e);
+        }
+    }
+}
+----
+<1> Pebble-specific code is **never** visible to the caller — everything goes through the `TemplateService` interface. Swapping template engines is a property change.
+
+=== Using `spel()` for model-parent navigation
+
+A Pebble template can't walk up its scope (no `parent.foo`). SpEL can, via the bean factory. Pattern for document templates that need a system-wide setting:
+
+[source]
+----
+<!-- In a document template edited by admin users via UI -->
+<p>Issued by: {{ spel('@companyInfoService.current.legalName') }}</p>
+<p>Valid through: {{ spel('@environment.getProperty(''contract.expiry.years'')') }} years</p>
+----
+
+The template source lives in the DB; the SpEL expression binds to services at render time.
+
+=== Locale-aware rendering
+
+`PebbleTemplateService.evaluate(template, model, locale)` takes a `Locale` and passes it to `PebbleEngine.getTemplate(template).evaluate(writer, model, locale)`. From there, filter `context.getLocale()` returns that value. A single template can render correctly for many locales:
+
+[source,java]
+----
+for (Locale userLocale : recipients) {
+    String body = templateService.evaluate(emailTemplate, model, userLocale);
+    emailSender.send(recipient, body);
+}
+----
+
+Inside the template:
+
+[source]
+----
+Dear {{ client.fullName }},
+Your balance is {{ credit.outstanding | monetaryFormat }}
+   ({{ credit.outstanding.number | decimalFormat(format='#,##0.00') }} {{ credit.outstanding.currency }})
+Status: {{ credit.status | enum }}
+Due date: {{ credit.nextDueDate | print }}
+----
+
+Each filter respects the call-site locale without explicit plumbing.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `monetaryFormat` for `Money`, `currency` for `Number`** — they're not interchangeable; mixing them produces runtime `PebbleException` (`Money`) or meaningless output (`Number`-with-currency)
+* {ok} **Configure `document.template.monetary.*` properties** for production locales — the defaults (`¤ #,##0.00`, `CODE`) are intentionally neutral; production almost always wants a specific symbol and pattern
+* {ok} **Pass a `Locale` explicitly to `TemplateService.evaluate`** — don't rely on JVM default; it diverges between dev (OS locale) and prod (container UTC)
+* {ok} **Use `enum` filter for all enum display** — delegates to `EnumUtils`, so i18n keys, fallbacks, and grouping all work consistently with the rest of the SDK
+* {ok} **Register additional filters as `@Bean Extension`** — additive, no SDK fork
+* {ok} **Prefer adding a project filter over `spel()`** — filters are named, typed, and easier to test; `spel()` is an escape hatch
+* {ok} **Cache heavy model values before rendering** — `PebbleTemplateService` doesn't cache; build the model once per request, not per iteration
+* {ok} **Use `last4` for PAN / SSN / account numbers** — centralized masking logic; safer than ad-hoc substring in each template
+* {ok} **Use `fraction(number=amount)` with `currency`/`monetaryFormat`** — for receipts that render words + cents (`"one hundred and 00/100"`)
+* {ok} **Wrap `evaluate` calls in try/catch for `TemplateEvaluatonException`** — templates are data (often user-editable); a bad template should produce a clear error, not a 500
+* {ok} **Name custom beans unambiguously** — every Spring singleton lands in the template global scope under its bean name; name clashes lead to template behavior changing when unrelated beans are renamed
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Applying `currency` to a `Money`** — the filter falls through the `Number` branch, calls `new BigDecimal(money.toString())` and renders the string representation of the money object ("USD 5000.00") as a number — output is nonsense
+* {bad} **Applying `monetaryFormat` to a `BigDecimal`** — throws `PebbleException` at render time, and the line number is the filter's, not the template's original source if it's embedded
+* {bad} **Using `spel()` when a plain filter would do** — each call is a SpEL parse + resolve round-trip; templates get harder to audit
+* {bad} **Calling `TemplateService` from a hot loop without caching the compiled engine** — the service caches internally, but each `evaluate` still parses the template source (SDK uses `StringLoader`, no template cache). Parse once, evaluate many: expose a re-renderable function, not a per-row call in a 100k-row report
+* {bad} **Passing `Locale.getDefault()` as the evaluate locale** — server vs container vs JVM defaults diverge; tests pass locally, production drifts
+* {bad} **Colliding a bean name with a common model key** — `@Service("credit")` in the same app that calls `model.put("credit", credit)` — caller-model wins, but any filter that captured the global early sees the bean; bugs surface only when the order changes
+* {bad} **Relying on `null → false` behavior of `boolean` filter** — returns `Boolean.FALSE` (renders as `false`), not the `noMsg` argument. Always pass both `yesMsg` and `noMsg`
+* {bad} **Storing `Supplier<T>` in the Pebble model** — unlike Thymeleaf's lazy-unwrap layer, Pebble has **no** `SupplierUnwrapper`. The template would literally render `java.util.function.Supplier@abc123`. Unwrap in Java before populating the model
+* {bad} **Assuming Hibernate session is open during template render** — unproxying helps with `HibernateProxy`, but a `LazyInitializationException` on a detached entity still blows up. Render inside the transaction or use DTOs
+* {bad} **Writing filters that hit I/O (DB, HTTP)** — filters run per attribute access; a filter that calls the DB multiplies query count by each template reference. Do I/O in controllers and pass results into the model
+* {bad} **Using `{{ spel('...') }}` for security-sensitive decisions** — the SpEL expression is data; if template source is user-editable, you've created an arbitrary-code-execution path
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `template.service=pebble` present in `application.properties` (or the appropriate Spring profile)
+* {todo} `document.template.monetary.format.locale` / `.pattern` / `.currency.style` set for the production locale
+* {todo} Every `TemplateService.evaluate(...)` call site passes an explicit, user-appropriate `Locale` — never `Locale.getDefault()`
+* {todo} No project bean is named `environment`, `currentDate`, `currentDateTime`, or `now` (those are reserved by `TemplatePebbleExtension.getGlobalVariables`)
+* {todo} No project bean shares a name with a common model key used by renderers (`credit`, `client`, `application`, `operation`)
+* {todo} `TemplateEvaluatonException` is surfaced with its `getLineNumber()` to whatever UI renders template errors (admin template editor, notification-debug logs)
+* {todo} Project-added `Extension` beans do not shadow SDK filter names (`currency`, `monetaryFormat`, `decimalFormat`, `enum`, `boolean`, `last4`, `spell`, `print`) — collisions are silent overrides
+* {todo} Document templates edited by non-developers are rendered in a sandbox first (`template.service=pebble` + a staging model) — never render unreviewed user input directly to production-bound output
+* {todo} `spel()` usage is audited — each call is an escape hatch and may bypass output-encoding expectations
+* {todo} Template integration tests exercise: `Money` rendering, `Enum` rendering, null inputs, Hibernate-proxied inputs, locale switching
+* {todo} `last4` is used everywhere a PAN / SSN / full account number might leak into a template
+
+---
+
+**Related:** <<thymeleaf-helpers-expression-objects-lazy-unwrapping>>, <<document-templates>>, <<notifications>>, <<audit-module-sdk-reference-internals>>
+
+**Next:** <<document-templates>>, <<notifications>>

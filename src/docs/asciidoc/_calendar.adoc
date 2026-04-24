@@ -1,0 +1,569 @@
+[[calendar]]
+= Calendar — working days & day types
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The calendar module (`com.timvero.structure.calendar`) answers a single, universally-asked question: **"is this date a working day?"**. It persists per-date overrides (`CalendarDay`) with a `DayType` (workday / day-off / project-custom), exposes a `DayTypeService` for read-only lookups, and falls back to a pluggable `DayTypeProvider` when a date has not been explicitly configured. The default provider treats Mon–Fri as workdays and Sat–Sun as days off — swap it out to wire in a bank-holiday feed, regional schedule, or any business-specific rule.
+
+== What You Need to Know
+
+The module has **three clearly separated layers** — the service layer is the only public API most code touches:
+
+[cols="1,3,3", options="header"]
+|===
+|Layer |Purpose |Public API
+
+|**Persistence**
+|One row per explicitly-configured date in `calendar_day`. Primary key is the date itself — no surrogate id, no compound keys. Envers `@Audited` so changes have a revision trail. Sparse by design: only dates whose type differs from the provider default are stored.
+|`CalendarDay`, `CalendarDayRepository`
+
+|**Resolution**
+|`DayTypeService` resolves the type of any date: first looks up the stored override, falls back to the configured `DayTypeProvider`. Also offers range lookups and "find next/previous day of type X" walkers.
+|`DayTypeService`
+
+|**Strategy**
+|`DayTypeProvider` is the pluggable default — it decides the type for dates **not** in the table. The SDK ships with `DefaultDayTypeProvider` (Mon–Fri = workday). Override it with a `@Component` to plug in holiday calendars, regional schedules, etc.
+|`DayTypeProvider`, `DefaultDayTypeProvider`
+|===
+
+Key characteristics:
+
+- **Sparse storage** — `calendar_day` holds overrides, not a full calendar. An empty table is valid; the provider fills every gap.
+- **`LocalDate` as primary key** — inserts are idempotent by date. `repository.save(...)` for an existing date overwrites it; there's no unique-violation path.
+- **`DayType` is a `CustomEnum`, not a Java enum** — new types can be registered at runtime by project code without a schema migration. The `working` flag on each type drives "is it a workday?" semantics.
+- **Read-through fallback** — every `DayTypeService` method composes stored data with the provider; callers never see a gap.
+- **Form pipeline for admin UI** — the `form/` sub-package wires a year-view edit page: `CalendarDayFormService.getByYear(year)` returns one form per day of the year, merged from DB + provider, ready for a 365-row table.
+
+== Architecture Overview
+
+[source]
+----
+                      ┌──────────────────────────────────┐
+   Read path          │  DayTypeService.getDayType(d)    │
+                      └──────────────┬───────────────────┘
+                                     │
+                       ┌─────────────▼─────────────┐
+                       │  CalendarDayRepository    │
+                       │  findById(date)           │
+                       └─────────────┬─────────────┘
+                                     │
+                          present? ──┴── absent?
+                             │             │
+                             ▼             ▼
+                   ┌──────────────────┐  ┌──────────────────────────┐
+                   │ CalendarDay      │  │ DayTypeProvider          │
+                   │ .getDayType()    │  │ .getDayType(date)        │
+                   │ (stored override)│  │ (default or project impl)│
+                   └─────────┬────────┘  └──────────┬───────────────┘
+                             │                      │
+                             └──────────┬───────────┘
+                                        ▼
+                              ┌──────────────────┐
+                              │    DayType       │
+                              │  (WORKDAY /      │
+                              │   DAY_OFF /      │
+                              │   project type)  │
+                              └──────────────────┘
+
+-- Admin edit path --
+
+                      ┌──────────────────────────────────┐
+   Controller         │  GET /calendar?year=2026         │
+                      └──────────────┬───────────────────┘
+                                     ▼
+                      ┌──────────────────────────────────┐
+                      │ CalendarDayFormService           │
+                      │   getByYear(Year):               │
+                      │   1. load stored rows for year   │
+                      │   2. walk every day of year      │
+                      │   3. fill gaps via provider      │
+                      │   4. return List<Form> (365/366) │
+                      └──────────────┬───────────────────┘
+                                     ▼
+                      ┌──────────────────────────────────┐
+                      │ Thymeleaf form table             │
+                      │ user edits → POST                │
+                      └──────────────┬───────────────────┘
+                                     ▼
+                      ┌──────────────────────────────────┐
+                      │ CalendarDayFormService.save(f)   │
+                      │   mapper.createEntity(form)      │
+                      │   repository.save(day)           │
+                      └──────────────────────────────────┘
+----
+
+== Entity Model
+
+=== CalendarDay — The Persisted Override
+
+[source,java]
+----
+@Entity
+@Table(name = "calendar_day")
+@Audited
+public class CalendarDay {
+
+    @Id
+    @Column(name = "date", nullable = false, updatable = false)
+    private LocalDate date;                                   // <1>
+
+    @Column(name = "day_type")
+    @Type(CustomEnumType.class)
+    private DayType dayType;                                  // <2>
+
+    @Column(name = "note", columnDefinition = "text")
+    private String note;                                      // <3>
+
+    @Transient
+    public Year getYear() {
+        return Year.of(getDate().getYear());
+    }
+}
+----
+<1> **The date _is_ the primary key** — no surrogate id. Makes `findById(LocalDate)` the cheapest possible lookup, and `save()` is semantically upsert-by-date (Hibernate merges when a row already exists).
+<2> `CustomEnumType` is the Hibernate user type for `CustomEnum` values — serializes to a text column using the type's `name`. Unlike `@Enumerated(EnumType.STRING)`, it tolerates runtime-registered enum constants.
+<3> Free-text note (e.g., "Christmas Eve — half-day", "Regional holiday — Catalonia only"). No length limit — rendered in the admin UI only.
+
+Note `CalendarDay` does **not** extend `AbstractAuditable` / `AbstractPersistable`. It's a plain `@Entity`. That's intentional: no UUID id, no `createdAt`/`createdBy` columns on the row itself. History attribution lives in the Envers revision entity instead (`@Audited` writes to `calendar_day_aud`), and revisions carry the auditor id via the standard `AuditRevisionEntity`. See <<audit-module-sdk-reference-internals>> for how that wiring works.
+
+=== CalendarDayRepository
+
+[source,java]
+----
+@Repository
+public interface CalendarDayRepository extends JpaRepository<CalendarDay, LocalDate> {
+
+    @Query(nativeQuery = true,
+           value = "select * from calendar_day d where d.date between :start and :end")
+    Stream<CalendarDay> getAllByYear(LocalDate start, LocalDate end);
+}
+----
+
+Despite the method name, `getAllByYear` really queries **an arbitrary date range** — callers pass `year.atDay(1)` and `lastDayOfYear()`, but nothing stops you from passing any other boundaries. Streaming (`Stream<CalendarDay>`) matters for range reads: open the stream inside a transaction, consume it, let it close. Both callers in the SDK (`DayTypeService.getDayTypes` and `CalendarDayFormService.getByYear`) collect the stream inside a `@Transactional` boundary.
+
+[NOTE]
+====
+Native SQL is used here because `between` on a JPQL `@Id` path occasionally produces less optimal plans across DB dialects. The raw SQL yields predictable index-range scans on the `calendar_day` PK.
+====
+
+== DayType — The Custom Enum
+
+`DayType` extends `CustomEnum<DayType>` — it's **not** a Java `enum`. Two constants ship with the SDK:
+
+[source,java]
+----
+public final class DayType extends CustomEnum<DayType> {
+
+    public static DayType WORKDAY = new DayType("WORKDAY", true);
+    public static DayType DAY_OFF = new DayType("DAY_OFF", false);
+
+    private final boolean working;
+
+    public DayType(String name, boolean working) {
+        super(name);
+        this.working = working;
+    }
+
+    public boolean isWorking() {
+        return working;
+    }
+}
+----
+
+Why `CustomEnum` instead of a Java `enum`?
+
+- **Project-defined types** — a project can declare `HOLIDAY`, `HALF_DAY`, `REGIONAL_HOLIDAY` without patching the SDK. Instantiating `new DayType("HOLIDAY", false)` from a `@Component` at startup registers it permanently; it then round-trips through the DB (`CustomEnumType`) like a native enum.
+- **The `working` flag is the load-bearing data** — calculation engines, payment schedule builders, and SLA timers all care about "is this day working?", not the specific constant. A new type just has to answer that boolean.
+- **String-stable serialization** — the DB column holds the name (`"WORKDAY"`, `"HOLIDAY"`), so additions are purely additive at the schema level.
+
+To add a new type, declare a static `DayType` constant somewhere that's loaded at startup (a `@Configuration` class, a `@Component`, or a project-level `DayTypes` holder). Use `CustomEnum.valueOf(DayType.class, "HOLIDAY")` to resolve by name once registered.
+
+[WARNING]
+====
+Because `DayType` constants are plain `public static` fields (not `enum` values), they are **mutable references** — never re-assign them. Use `==` / `.equals()` against the canonical constants; `Enum.valueOf()`-style APIs do not apply. See the `CustomEnum` docs for the full contract.
+====
+
+== DayTypeProvider — The Strategy
+
+`DayTypeProvider` decides the type of any date that has **not** been explicitly stored in `calendar_day`. It's a single-method interface:
+
+[source,java]
+----
+public interface DayTypeProvider {
+    DayType getDayType(LocalDate date);
+}
+----
+
+=== DefaultDayTypeProvider
+
+The SDK's fallback — weekday / weekend split:
+
+[source,java]
+----
+public class DefaultDayTypeProvider implements DayTypeProvider {
+
+    @Override
+    public DayType getDayType(LocalDate date) {
+        return date.getDayOfWeek().getValue() <= 5 ? DayType.WORKDAY : DayType.DAY_OFF;
+    }
+}
+----
+
+`getValue()` returns 1–7 (Mon–Sun), so `<= 5` covers Mon–Fri. No holiday awareness, no regional variation — that's the point. The default works out-of-the-box for unit tests, local demos, and regions where bank holidays are already represented as rows in `calendar_day`.
+
+=== Replacing the Default
+
+Both `DayTypeService` and `CalendarDayFormService` accept a `DayTypeProvider` via optional setter injection:
+
+[source,java]
+----
+@Autowired(required = false)
+public void setDayTypeProvider(DayTypeProvider dayTypeProvider) {
+    this.dayTypeProvider = dayTypeProvider;
+}
+----
+
+The `required = false` means the field is pre-initialised to `new DefaultDayTypeProvider()` and swapped if any `DayTypeProvider` bean is present. To replace the default, declare a `@Component`:
+
+[source,java]
+----
+@Component
+public class HolidayAwareDayTypeProvider implements DayTypeProvider {
+
+    @Autowired private HolidayCalendarClient client;  // external feed
+
+    @Override
+    public DayType getDayType(LocalDate date) {
+        if (client.isPublicHoliday(date)) {
+            return DayType.DAY_OFF;                   // or a project-defined HOLIDAY type
+        }
+        return date.getDayOfWeek().getValue() <= 5 ? DayType.WORKDAY : DayType.DAY_OFF;
+    }
+}
+----
+
+Once registered, both services pick it up at startup. **Only one** `DayTypeProvider` bean should exist — multiple beans would cause Spring to fail injection on the `@Autowired` setter (ambiguous dependency).
+
+== DayTypeService — The Read API
+
+The only public query surface most code should use. Three resolution methods + two "find next / previous day of type X" walkers:
+
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`getDayType(LocalDate date)`
+|Type of a single date. Read-through: stored override → provider fallback.
+
+|`getDayTypes(LocalDate start, LocalDate end)`
+|Map of date → type across an **inclusive** range. Returns a `TreeMap` so iteration order is chronological. Range read is a single query + in-memory walk.
+
+|`getNextOfType(LocalDate from, DayType type)`
+|Smallest date `>= from` whose type equals `type`. Linear scan, day-by-day.
+
+|`getPreviousOfType(LocalDate from, DayType type)`
+|Largest date `<= from` whose type equals `type`. Linear scan, day-by-day.
+|===
+
+=== getDayType — Single Date
+
+[source,java]
+----
+public DayType getDayType(LocalDate date) {
+    return repository.findById(date)
+        .map(CalendarDay::getDayType)
+        .orElseGet(() -> dayTypeProvider.getDayType(date));
+}
+----
+
+One PK lookup, then the provider fills the gap. No caching — on a hot path, consider pre-loading a range via `getDayTypes`.
+
+=== getDayTypes — Range
+
+[source,java]
+----
+public Map<LocalDate, DayType> getDayTypes(LocalDate start, LocalDate end) {
+    Map<LocalDate, DayType> existing = repository.getAllByYear(start, end)
+        .collect(Collectors.toMap(CalendarDay::getDate, CalendarDay::getDayType));
+    Map<LocalDate, DayType> result = new TreeMap<>();
+    for (LocalDate date = start; !date.isAfter(end); date = date.plusDays(1)) {
+        DayType type = existing.get(date);
+        if (type == null) {
+            type = dayTypeProvider.getDayType(date);
+        }
+        result.put(date, type);
+    }
+    return result;
+}
+----
+
+Single DB round-trip, then walks every day in the range to merge with provider output. This is the right method when you need many consecutive days — building a payment schedule, drawing a year grid, computing a due-date table. Calling `getDayType` in a loop instead issues N queries.
+
+=== getNextOfType / getPreviousOfType — Walkers
+
+[source,java]
+----
+public LocalDate getNextOfType(LocalDate date, DayType type) {
+    while (!getDayType(date).equals(type)) {
+        date = date.plusDays(1);
+    }
+    return date;
+}
+----
+
+Linear walk, one `getDayType` call per step. For typical "next workday" queries, terminates in 1–3 steps. Worst case (consecutive holidays) stays within a handful of days for any realistic calendar — but it is **not bounded**. A misconfigured provider that never returns the requested type produces an infinite loop; the walker does not defend against this.
+
+[WARNING]
+====
+If your payment engine calls `getNextOfType` in a hot loop (e.g., computing many due dates), bulk-resolve via `getDayTypes(range)` first and walk the map in-memory. Each walker call hits the DB at least once.
+====
+
+== CalendarDayForm Pipeline — Admin UI
+
+The `form/` sub-package wires the admin edit page. Three classes, plus the shipped `CalendarController` (<<calendar-admin-web-controller>>) that binds them to URLs.
+
+=== CalendarDayForm
+
+Plain DTO with validation annotations:
+
+[source,java]
+----
+public class CalendarDayForm {
+
+    @NotNull
+    @DateTimeFormat(pattern = PATTERN_DATEPICKER_FORMAT)
+    @JsonFormat(shape = JsonFormat.Shape.STRING)
+    private LocalDate date;
+
+    @NotNull
+    @JsonFormat(shape = JsonFormat.Shape.STRING)
+    private DayType dayType;
+
+    @NotBlank
+    private String note;
+    /* getters/setters */
+}
+----
+
+Note the `@NotBlank` on `note`: when **saving** a calendar day, a note is required. This is a deliberate friction point — overrides without a reason end up lost to institutional memory. Year-view rendering (`getByYear`) fills `note = ""` for unsaved provider-computed days, which the UI treats as "not overridden".
+
+See <<form-classes-setup-and-usage>> for the broader form-class conventions this DTO follows.
+
+=== CalendarDayFormMapper
+
+MapStruct-generated converter — one each way:
+
+[source,java]
+----
+@Mapper
+public interface CalendarDayFormMapper {
+    CalendarDay createEntity(CalendarDayForm form);
+    CalendarDayForm view(CalendarDay day);
+}
+----
+
+No custom mapping — fields are named identically. MapStruct generates a direct field copy at build time.
+
+=== CalendarDayFormService
+
+Two methods — load a full year for the edit grid, and save a single day:
+
+[source,java]
+----
+@Transactional(readOnly = true)
+public List<CalendarDayForm> getByYear(Year year) {
+    LocalDate first = year.atDay(1);
+    LocalDate last = first.with(TemporalAdjusters.lastDayOfYear());
+    Map<LocalDate, CalendarDayForm> map = repository.getAllByYear(first, last)
+        .map(mapper::view)
+        .collect(Collectors.toMap(CalendarDayForm::getDate, Function.identity()));
+    for (LocalDate date = first; !date.isAfter(last); date = date.plusDays(1)) {
+        if (!map.containsKey(date)) {
+            CalendarDayForm dayView = new CalendarDayForm();
+            dayView.setDate(date);
+            dayView.setDayType(dayTypeProvider.getDayType(date));
+            dayView.setNote("");
+            map.put(date, dayView);
+        }
+    }
+    return new ArrayList<>(map.values());
+}
+
+@Transactional
+public void save(CalendarDayForm form) throws ValidationException {
+    CalendarDay day = mapper.createEntity(form);
+    repository.save(day);
+}
+----
+
+`getByYear` returns exactly 365 (or 366) entries: stored rows as-is, gaps filled from the provider with `note = ""`. The admin UI iterates the list into a year-grid table; only edited rows get POSTed to `save()`.
+
+`save()` upserts by date — no separate create/update methods. Because `CalendarDay.date` is the PK, `save(day)` of an existing date overwrites dayType + note in place (Hibernate `merge`).
+
+[NOTE]
+====
+`CalendarDayFormService` does not expose a delete method. To "reset a day to default", delete the row directly via the repository (`repository.deleteById(date)`) or submit a save with the same `dayType` the provider would return and accept that the row becomes a no-op override. The admin UI convention is usually the latter — deletion is rare enough that it's not worth a dedicated endpoint.
+====
+
+[[calendar-admin-web-controller]]
+=== CalendarController — Admin Web Controller
+
+A plain `@Controller` (not `ViewableFilterController` — the calendar is a grid, not a list) that glues `CalendarDayFormService` to four URLs:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/calendar")
+@PreAuthorize("hasRole('" + Permission.CALENDAR_MODIFY + "')")
+@MenuItem(order = 900_560, name = "calendar", group = "setting")
+public class CalendarController {
+
+    @GetMapping                                        // /calendar
+    public String view() { return "/calendar/view"; }
+
+    @GetMapping("/year/{year}")                        // /calendar/year/2026
+    @ResponseBody
+    public List<CalendarDayForm> views(@PathVariable Year year) {
+        return formService.getByYear(year);            // 365/366 entries, gaps filled from provider
+    }
+
+    @PostMapping                                       // /calendar  (form submit)
+    @ResponseStatus(HttpStatus.OK)
+    public void save(@Valid CalendarDayForm form) throws ValidationException {
+        formService.save(form);
+    }
+
+    @GetMapping("/model")                              // /calendar/model
+    @ResponseBody
+    public Map<String, Object> model(Locale locale) {  // DayType → {code, name, color}
+        /* see source — localized DayType catalogue for the grid legend */
+    }
+}
+----
+
+Key points:
+
+* **Single permission `CALENDAR_MODIFY` gates both reads and writes** — the view is meaningless without the right to edit (reading the admin grid without being able to fix days is a support-ticket waiting to happen). Contrast with `ViewableFilterController`'s split `*_VIEW` / `*_EDIT` pair.
+* **`@MenuItem(group = "setting", order = 900_560)`** puts the calendar in the **Settings** menu alongside other system-wide references (holidays are company policy, not tenant data).
+* **`/year/{year}`** is the hot read path — the UI navigates year-to-year and rebuilds the grid each time. The service method runs with `@Transactional(readOnly = true)` so the 365/366-row traversal is a single snapshot.
+* **`/model`** returns the `DayType` catalogue as `{code, name, color}` triples localized via `EnumUtils.getLocalizedValue`. The UI paints cells from `color` and labels from `name` — see `CustomEnum` localization conventions in <<entity-module-sdk-reference-hierarchy>>.
+* **No `/reset` or `/delete`** — matches the design note above; deletion is not part of the public admin surface.
+
+== Advanced Patterns
+
+=== Pre-load for Schedule Builders
+
+Building a repayment schedule that rolls weekend/holiday dates forward to the next workday? Don't call `getNextOfType` in a loop — batch-load the range once:
+
+[source,java]
+----
+@Service
+public class PaymentScheduleBuilder {
+
+    @Autowired private DayTypeService dayTypeService;
+
+    public List<LocalDate> buildSchedule(LocalDate firstDue, int instalments, int spacingDays) {
+        LocalDate lastPossible = firstDue.plusDays((long) instalments * spacingDays + 14);
+        Map<LocalDate, DayType> range = dayTypeService.getDayTypes(firstDue, lastPossible);
+
+        List<LocalDate> result = new ArrayList<>(instalments);
+        LocalDate cursor = firstDue;
+        for (int i = 0; i < instalments; i++) {
+            while (!range.get(cursor).isWorking()) {
+                cursor = cursor.plusDays(1);
+            }
+            result.add(cursor);
+            cursor = cursor.plusDays(spacingDays);
+        }
+        return result;
+    }
+}
+----
+
+One DB query for the entire schedule. Widen the upper bound enough to absorb worst-case weekend/holiday runs.
+
+=== Project-Defined DayType Constants
+
+Declare project-specific types at startup so they're registered before the first DB read:
+
+[source,java]
+----
+@Configuration
+public class ProjectDayTypes {
+
+    public static final DayType HOLIDAY      = new DayType("HOLIDAY", false);
+    public static final DayType HALF_WORKDAY = new DayType("HALF_WORKDAY", true);
+    public static final DayType REGIONAL     = new DayType("REGIONAL", false);
+
+    // Static initialization is enough — @Configuration instantiation forces classloading.
+}
+----
+
+Once loaded, they serialize/deserialize through `CustomEnumType` just like the built-ins. Any `DayTypeProvider` can return them; any stored row can reference them. `HALF_WORKDAY.isWorking() == true` means schedule builders treat it as a business day (`getNextOfType(d, WORKDAY)` will find them); use a separate `isHalfDay` flag or a dedicated type if you need finer-grained semantics.
+
+=== Replacing the Provider per Environment
+
+Different environments sometimes need different calendars — prod has a real holiday feed, test uses the default Mon–Fri. Use `@Profile`:
+
+[source,java]
+----
+@Component
+@Profile("production")
+public class ExternalHolidayDayTypeProvider implements DayTypeProvider { /* ... */ }
+----
+
+Outside `production`, no bean exists and both services fall back to `DefaultDayTypeProvider`. Because injection is `required = false`, no configuration error is raised.
+
+=== History of Calendar Edits
+
+Because `CalendarDay` is `@Audited`, every insert/update lands in `calendar_day_aud`. Combined with an `AbstractModifiedHistorySupplier` (see <<audit-module-sdk-reference-internals>>), you can surface "who changed which day's type and when" on an admin audit page. Typical tracked fields: `dayType`, `note`. The auditor id comes from `SecurityContextHolder` at the moment of `save()` — keep the admin UI session-authenticated so overrides carry attribution.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `DayTypeService`, not the repository, for reads** — the service implements the read-through fallback; hitting the repository directly skips the provider and returns `null` for unconfigured dates
+* {ok} **Bulk-load a range once when you need many days** — `getDayTypes(start, end)` is one query; `getDayType` in a loop is N
+* {ok} **Register a project `DayTypeProvider`** for any environment with real business rules — the default Mon–Fri provider is for tests and trivial cases only
+* {ok} **Define project-specific `DayType` constants in a single `@Configuration` or holder class** — concentrates type registration, avoids accidental duplicates
+* {ok} **Treat `DayType.isWorking()` as the decision boundary** — schedule engines and SLA timers should branch on the flag, not on type names
+* {ok} **Keep `CalendarDay.note` meaningful** — the admin UI requires it (`@NotBlank`); treat it as the audit-trail reason, not a throwaway field
+* {ok} **Authenticate admin sessions with an `AuditorUser` before saving overrides** — Envers needs the principal to attribute the revision
+* {ok} **Widen date ranges generously when building schedules** — holiday runs can push dates further than expected; a too-tight upper bound leads to `null` map lookups
+* {ok} **Use `Year` parameters in controller signatures** — `CalendarDayFormService.getByYear(Year)` is the idiomatic input; it resolves start/end boundaries correctly across leap years
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Calling `getNextOfType` in a tight loop** — every iteration is a DB round-trip; bulk-load via `getDayTypes` and walk the map in-memory instead
+* {bad} **Defining more than one `@Component` implementing `DayTypeProvider`** — Spring fails with `NoUniqueBeanDefinitionException` at startup; use `@Profile` or `@Primary` if you genuinely need multiple candidates
+* {bad} **Comparing `DayType` values with `==` across classloader boundaries** — `CustomEnum` constants are singletons per classloader; reflective or serialized values may break reference equality. Prefer `.equals()`
+* {bad} **Creating new `DayType` instances inside hot code paths** — every `new DayType("WORKDAY", true)` constructs a duplicate object that does not equal the canonical constant. Register types once at startup
+* {bad} **Hard-coding weekend logic in domain services** — if the calendar module is on the classpath, use `DayTypeService.getDayType(d).isWorking()`; inline `dayOfWeek >= SATURDAY` checks drift from the configured calendar
+* {bad} **Using the repository's `save` as "insert-only"** — it's upsert by date; treating it as insert silently overwrites an earlier administrator's override with no warning
+* {bad} **Walking `getDayTypes` range outside the returned `TreeMap`'s keys** — the map is contiguous from `start` to `end`; dates outside that window return `null`. Don't query it with arbitrary dates
+* {bad} **Forgetting `@Audited` assumptions when bulk-importing calendar rows** — bulk inserts via native SQL bypass Envers; the history will be empty for imported days. Prefer `repository.saveAll(...)` inside a transaction with a populated `SecurityContext`
+* {bad} **Assuming `DefaultDayTypeProvider` handles holidays** — it does not; overriding an entire country's holiday calendar with stored rows works but is brittle. Wire a real `DayTypeProvider` instead
+* {bad} **Calling `DayTypeService` from a non-transactional context** — `getDayTypes` opens a `Stream` via the repository; without an active transaction, the underlying `ResultSet` may close before you consume it
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `calendar_day` table exists with `date` PK, `day_type` text column, `note` text column (created by SDK migrations)
+* {todo} `calendar_day_aud` + `aud` + `revinfo` tables exist (Envers requirement — ships with the audit module)
+* {todo} A project-specific `DayTypeProvider` is registered for any environment where the default Mon–Fri rule is insufficient
+* {todo} All project-defined `DayType` constants are declared in a `@Configuration` / holder class that is guaranteed to load at startup
+* {todo} Admin UI at `/calendar?year=...` is gated to operations staff only — every saved row mutates `DayTypeService` output globally
+* {todo} Admin sessions authenticate with an `AuditorUser` so Envers captures the editor on each save
+* {todo} Payment-schedule / SLA / due-date code uses `DayTypeService.getDayTypes(range)` for bulk resolution rather than per-day calls
+* {todo} Schedule builders pass a generous upper bound to `getDayTypes` to absorb consecutive holidays
+* {todo} Monitoring captures slow `DayTypeService` calls — catches misconfigured providers that make external HTTP calls per lookup
+* {todo} If a holiday feed is used, its client is cached (e.g., in-memory or a `@Cacheable` layer) — calling an external API on every `getDayType` is a production footgun
+* {todo} Integration tests verify: (a) a stored override wins over the provider, (b) the provider fills gaps, (c) `isWorking()` reflects the combined result
+* {todo} A runbook entry exists for "add next year's holidays" — usually a batch script plus a UI review pass on each year boundary
+* {todo} `getNextOfType` / `getPreviousOfType` callers have explicit upper bounds or time budgets — the walkers do not terminate if no date of the requested type exists
+
+---
+
+**Related:** <<entity-module-sdk-reference-hierarchy>>, <<form-classes-setup-and-usage>>, <<list-filters-annotation-driven-jpa-query-dsl>>, <<audit-module-sdk-reference-internals>>, <<data-model>>
+
+**Next:** <<audit-module-sdk-reference-internals>>, <<form-classes-setup-and-usage>>

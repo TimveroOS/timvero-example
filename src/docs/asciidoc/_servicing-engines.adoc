@@ -1,0 +1,1289 @@
+[[servicing-engines]]
+= Servicing Engines — scheduled engine SDK reference
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The servicing engines subsystem computes **payment schedules** for active credits: given a principal, an interest rate, a term, a day count convention, and a start date, it produces an ordered list of `PaymentSegment` rows — each one carrying a payment date, principal/interest breakdown, and the remaining debt after that payment. Products reference engines by Spring bean name: `CreditProduct.engineName` maps to a `ScheduledEngine` bean, and `CreditScheduledService` resolves it at offer-acceptance time to build the `PaymentSchedule` stored against the application.
+
+This guide covers the **scheduled engine SDK** (`com.timvero.loan.engine.scheduled`) plus the servicing engine package (`com.timvero.servicing.engine`) that drives recalculation, accrual, and operation distribution at runtime. For the parallel "offer engine" concept — which generates personalized offers from products — see <<offer-engine>>. For the product entity model that wires engines by name, see <<credit-product>>.
+
+== What You Need to Know
+
+A servicing engine is not a single class — it is a **coordinated set of beans** that together turn a credit's timeline (start date, operations, rate changes) into a navigable map of daily snapshots. The entry point is the `ScheduledEngine` interface, but around it the SDK wires accrual engines, a distribution layer, a loan engine, operation handlers, and a scheduled recalculation task.
+
+.Subsystem map
+[cols="2,3", options="header"]
+|===
+|Component |Role
+
+|`ScheduledEngine<C extends CreditCondition>`
+|The extension point referenced by `CreditProduct.engineName`. Produces a list of `PaymentSegment` rows from a condition + principal.
+
+|`CreditScheduledService`
+|Spring service that looks up an engine by bean name, invokes `payments(...)`, and assembles a persisted `PaymentSchedule` entity.
+
+|`PaymentSchedule` + `PaymentSegment`
+|JPA entities that store the schedule on the application. Each segment carries date, principal, interest, and remaining balances.
+
+|`AccrualEngine<C>`
+|Calculates accruals (interest, fees, penalties) for a credit over a date range. Multiple engines can be registered; their results are summed into a `Debt`.
+
+|`CreditCalculationService`
+|The runtime recalculation API. Triggered on operation creation, rate change, or by the scheduled `CreditCalculationTask`.
+
+|`LoanEngine` + `OperationProcessor`
+|Walks the credit timeline day-by-day, applying operations and calling accrual engines to produce `CreditSnapshot` rows.
+
+|`CreditOperationHandler<O>`
+|Extension point for applying a specific `CreditOperation` subtype to the mutable debt during snapshot production.
+|===
+
+.Subpackages of `com.timvero.servicing.engine`
+[cols="1,3", options="header"]
+|===
+|Package |Purpose
+
+|`accural`
+|`AccrualEngine` interface plus abstract bases (`RecordableAccrualEngine`, `RangeBasedAccrualEngine`) that implement interest/fee accrual with day-count math.
+
+|`calculation`
+|`CreditCalculationServiceImpl`, `CreditCalculationRegister`, `InternalCalculationService`, `GeneralCreditCalculationConfiguration` — the recalculation orchestrator with transaction coalescing.
+
+|`distribution`
+|`DistributionService` plus `OperationRecord` / `SnapshotRecord` value types that materialize the timeline.
+
+|`general`
+|`LoanEngine`, `BasicLoanEngine`, `OperationProcessor`, `Snapshot`, `Operation`, `AccuralContext`, `CreditOperationHandler` — the timeline walker and its plugin surface.
+
+|`operation.payment`
+|`AbstractPaymentOperationHandler`, `CreditPaymentOperationHandler` — payment-specific handlers implementing waterfall (repayment order + overpayment account).
+
+|(root)
+|`ScheduledEngine` (interface), `AccrualService`, `CreditCalculationService`, `CreditCalculationTask`, `CreditCalculatorUtils` (math), `Prepayment`.
+|===
+
+== Architecture Overview
+
+The end-to-end flow from product selection to persisted schedule:
+
+----
+Application / Offer selection
+        │
+        │  (participant picks amount, term, start date)
+        ▼
+SelectConditionAction
+        │   builds ExampleCreditCondition {
+        │     principal, engineName = product.engineName,
+        │     interestRate, period, term, regularPayment
+        │   }
+        ▼
+CreditScheduledService.getPaymentSchedule(condition, amount, start)
+        │
+        │   scheduledEngines.get(condition.getScheduleEngineName())
+        ▼
+ScheduledEngine.payments(condition, interestStart, paymentStart,
+                         principal, interest)
+        │
+        │   iterates term periods, computes interest via
+        │   DayCounter.count(from, to) * rate / 100
+        │   peels principal off regularPayment
+        ▼
+List<PaymentSegment> (last segment must have remainingDebt == 0)
+        │
+        ▼
+PaymentSchedule (persisted, attached to Application)
+----
+
+At runtime — once the credit is active — the servicing engine takes over:
+
+----
+CreditCalculationTask (Spring @Scheduled cron)
+        │   for each alive credit id
+        ▼
+CreditCalculationService.calculate(creditId, from, to)
+        │   merges concurrent requests via CreditCalculationRegister
+        │   acquires PESSIMISTIC_WRITE lock on Credit
+        ▼
+InternalCalculationService._calculate
+        │   walks operations + existing snapshots
+        ▼
+LoanEngine.addNextSnapshots(credit, toDate, past, operations)
+        │   for each date:
+        │     OperationProcessor.proccess(...)
+        │       applies CreditOperationHandler beans
+        │       AccrualService.createAccuralContext(...)
+        │         for each AccrualEngine:
+        │           calculateAccurals(credit, snapshots, date)
+        ▼
+NavigableMap<LocalDate, CreditSnapshot> (persisted, fires events)
+----
+
+[[origination-engine-spi]]
+== Origination-Side Engine SPI — The Real Home of ScheduledEngine
+
+The `ScheduledEngine` interface does **not** live in `com.timvero.servicing.engine` — that subsystem drives runtime accrual. The extension point referenced by `CreditProduct.engineName` (see <<credit-product>>) lives on the origination side, in `com.timvero.loan.engine`. This is the authoritative source. Reading other locations first is the usual way developers get confused.
+
+The origination package is small — six classes in three subpackages — and it is the source of truth for: (a) the `ScheduledEngine` interface itself, (b) the Spring-scanned discovery service (`CreditScheduledService`), and (c) a curated set of pure math/helpers that any engine implementation is expected to lean on rather than reimplement.
+
+.Package layout under `com.timvero.loan.engine`
+[cols="1,2,3", options="header"]
+|===
+|Subpackage |Class |Role
+
+|`scheduled/`
+|`ScheduledEngine<C extends CreditCondition>`
+|The SPI interface. Two methods: `payments(...)` and `getConditionClass()`.
+
+|(root)
+|`CreditScheduledService`
+|Spring `@Service` that autowires every `ScheduledEngine` by bean name and assembles `PaymentSchedule` aggregates from the segment list.
+
+|`util/`
+|`APRCalculator`
+|Pure annual-percentage-rate numerical solver — iterates the discount rate until the discounted cash flow equals (amount − fee). Handles last-day-of-month schedules and fractional periods.
+
+|`util/`
+|`PaymentCalculator`
+|Classical `pmt`-style helpers — `calcAnnuityPayment(...)`, `calcPrincipalPayment(...)`, `calcAnnuityWithBaloon(...)`. Thin monetary wrappers around the double-precision `pmt` formula.
+
+|`mutator/`
+|`Mutator`
+|Chainable, boolean-comparing reference to a `MonetaryAmount` cell. Exposes `add/subtract/negate/eq/lt/gt/le/ge/positive/negative` plus two static helpers: `payAll(from, to, logs...)` and `payLimited(from, to, limit, logs...)` — the primitive behind every waterfall.
+
+|`mutator/`
+|`MutableMonetaryAmount`
+|Package-private box holding a single `MonetaryAmount`. Only exists so `Mutator.valueMutator(...)` has a stable get/set target. Not referenced outside the package.
+|===
+
+=== `scheduled/ScheduledEngine` — The Authoritative Interface
+
+Read from the real source (not paraphrased):
+
+[source,java]
+----
+package com.timvero.loan.engine.scheduled;
+
+public interface ScheduledEngine<C extends CreditCondition> {
+
+    List<PaymentSegment> payments(C condition, LocalDate interestStart, LocalDate paymentStart,
+            MonetaryAmount principal, MonetaryAmount interest);
+
+    Class<C> getConditionClass();
+
+}
+----
+
+Notes on what the source shows (vs what you might expect):
+
+* The interface is **generic over `C extends CreditCondition`** — your engine binds to a specific condition subclass; `CreditScheduledService` uses raw types internally and reconciles at the call site.
+* **No lifecycle, no `init()`, no `recalculate()`**. Schedule generation is a pure function of the five arguments — that is the entire contract. Runtime accrual lives on the servicing side (`AccrualEngine`) and is a separate concern.
+* `getConditionClass()` exists **purely for discovery**. `CreditScheduledService` does not call it on the hot path; it is read by form services and UI so the product edit page can render the correct condition fields.
+* `CreditCondition`, `PaymentSchedule`, and `PaymentSegment` are **not** in this package — they live under `com.timvero.scheduled.entity`. The origination engine package only owns the SPI, the service, and the math primitives.
+
+=== (root)`CreditScheduledService` — Discovery & Aggregation
+
+The discovery service is where engines are looked up by Spring bean name and where the last-segment-zero invariant is enforced:
+
+[source,java]
+----
+@Service
+@ConditionalOnBean(ScheduledEngine.class)
+public class CreditScheduledService {
+
+    @Autowired(required = false)
+    protected Map<String, ScheduledEngine> scheduledEngines = Collections.emptyMap();
+
+    public Set<String> getScheduledEngineKeys() { return scheduledEngines.keySet(); }
+
+    public ScheduledEngine getScheduledEngine(String engineName) { ... }
+
+    public PaymentSchedule getPaymentSchedule(CreditCondition condition,
+            MonetaryAmount amount, LocalDate start) {
+        ScheduledEngine engine = getScheduledEngine(condition.getScheduleEngineName());
+        MonetaryAmount interest = MonetaryUtil.zero(amount.getCurrency());
+        List<PaymentSegment> payments = engine.payments(condition, start, start.plusDays(1),
+                amount, interest);
+        return createSchedule(payments, start, condition);
+    }
+}
+----
+
+Three observable facts from the real source:
+
+. `@ConditionalOnBean(ScheduledEngine.class)` — the service only materializes when at least one engine is registered. A project with zero engines gets zero service, and `@Autowired CreditScheduledService` fails at startup. This is intentional: a product catalog without engines is a misconfiguration.
+. `getPaymentSchedule(...)` opens interest at **zero in the amount's currency** and calls `payments(start, start.plusDays(1), amount, interest)`. `interestStart == disbursement date`, `paymentStart == disbursement + 1 day`. Engines that need a grace period have to reinterpret `paymentStart` themselves.
+. `createSchedule` asserts `last.getRemainingDebt().isZero()` — the same invariant enforced in <<servicing-engines,the servicing-side contract>>. Violating it throws immediately; the engine never gets to produce a "mostly-correct" schedule.
+
+=== `util/` — The Math Floor
+
+The two `util/` classes are intentionally standalone (no Spring, no DI) so any engine can call them from anywhere — including unit tests — without bootstrapping a context:
+
+* **`PaymentCalculator`** — `calcAnnuityPayment(amount, initialFee, periodicInterest, term, overesimatePeriod)` and `calcAnnuityWithBaloon(..., baloon)` are the two you actually call. Internally they delegate to a private `pmt(r, n, p, i, t)` matching the Excel `PMT()` formula. `calcPrincipalPayment(amount, length, overesimatePeriod)` is the equal-principal variant (`amount / length`). All helpers return a `MonetaryAmount` rounded UP to currency scale.
+* **`APRCalculator.calculate(amount, fee, annualRate, from, payments)`** — iterative APR solver. Takes a `Map<LocalDate, BigDecimal>` of payment-date → payment-amount, detects last-day-of-month schedules, and bisects the discount rate until the discounted cash flow equals `amount − fee`. Returns a `BigDecimal` annual percentage rate scaled to 2 decimals, `HALF_UP`. Throws `IllegalArgumentException` if `fee >= amount`.
+
+Rule of thumb: if your engine needs to **produce** a regular payment or **verify** an APR disclosure, call these. Do not reimplement the `pmt` formula or the APR bisection.
+
+=== `mutator/` — The Waterfall Primitive
+
+`Mutator` is the single most-used non-framework primitive in the origination codebase. It wraps a getter/setter pair around any `MonetaryAmount`-valued field so the field can be mutated through chained method calls instead of temp variables and setter cascades:
+
+[source,java]
+----
+Mutator principal = new Mutator(segment, PaymentSegment::getRemainingPrincipal,
+        PaymentSegment::setRemainingPrincipal);
+Mutator interest  = Mutator.valueMutator(Money.of(0, "USD"));
+
+principal.subtract(paymentPortion);
+interest.add(accrualIncrement);
+if (principal.le(MonetaryUtil.zero(currency))) { /* fully repaid */ }
+----
+
+The two static helpers are the backbone of every payment waterfall:
+
+[source,java]
+----
+// pay from `from` into `to`, limited by `limit`, logging into every `logs` cell
+Mutator.payLimited(from, debtAccount, limit, distributionLog);
+
+// unlimited variant — pay until one side is zero
+Mutator.payAll(from, debtAccount, distributionLog);
+----
+
+`payLimited` picks `min(from, to, limit)`, subtracts from both sides, and **adds** the paid amount to every logging mutator — so a single call both advances the waterfall and emits the distribution record. `MutableMonetaryAmount` is the package-private box that backs `Mutator.valueMutator(...)`; you never touch it directly.
+
+=== Cross-Reference — How This Package Connects
+
+* **<<credit-product>>** — `CreditProduct.engineName` stores the Spring bean name. The product edit form calls `scheduledService.getScheduledEngineKeys()` to populate the dropdown.
+* **<<credit-servicing>>** — the servicing subsystem consumes the `PaymentSchedule` produced here; it does not build schedules itself. `AccrualEngine` is a **separate** SPI on the servicing side.
+* **<<offer-engine>>** — a related-but-different concept. `OfferEngine` produces `Offer` rows (eligibility, price points); `ScheduledEngine` produces `PaymentSegment` rows from an accepted offer's condition. An offer pipeline uses both.
+* **<<credit-management>>** — the user-facing tutorial that walks through picking a product, accepting an offer, and watching the schedule render on the credit screen.
+
+{ok} Build a custom `ScheduledEngine` by subclassing the interface in `scheduled/`, calling `PaymentCalculator` / `APRCalculator` for math, and using `Mutator` when your loop mutates monetary cells. +
+{bad} Do not duplicate `pmt` math with `double`. Do not recreate `Mutator` for "clarity" — the waterfall helpers (`payAll`, `payLimited`) are assumed by the rest of the codebase. +
+{todo} When adding an engine, verify the bean name matches the `CreditProduct.engineName` value used by every product that references it — the lookup is string-keyed and silently fails at offer acceptance if the names disagree.
+
+== ScheduledEngine — The Extension Point
+
+NOTE: This section covers the same interface from the servicing-integration angle. For the authoritative SDK source — including the `util/` and `mutator/` helpers that ship alongside the interface — see <<origination-engine-spi>>.
+
+`ScheduledEngine` lives in `com.timvero.loan.engine.scheduled` (origination module) and is deliberately minimal:
+
+[source,java]
+----
+public interface ScheduledEngine<C extends CreditCondition> {
+
+    List<PaymentSegment> payments(C condition, LocalDate interestStart, LocalDate paymentStart,
+            MonetaryAmount principal, MonetaryAmount interest);
+
+    Class<C> getConditionClass();
+}
+----
+
+Contract:
+
+- `condition` — your `CreditCondition` subtype. Must carry every parameter your math needs (rate, period, term, regular payment, day-count method).
+- `interestStart` — date from which interest accrues (typically the disbursement date).
+- `paymentStart` — date of the first payment (may differ from `interestStart` when there is a grace period or a funding delay).
+- `principal` / `interest` — opening balances. For a fresh schedule, interest is usually zero in the caller's currency.
+- Return — ordered `List<PaymentSegment>`. The final segment MUST have `remainingDebt.isZero()` or `CreditScheduledService.createSchedule` will throw.
+
+`getConditionClass()` is used by form services and diagnostics to advertise which condition type an engine expects, so the UI can render the right fields.
+
+=== Bean Discovery
+
+`CreditScheduledService` autowires every `ScheduledEngine` in the context:
+
+[source,java]
+----
+@Service
+@ConditionalOnBean(ScheduledEngine.class)
+public class CreditScheduledService {
+
+    @Autowired(required = false)
+    protected Map<String, ScheduledEngine> scheduledEngines = Collections.emptyMap();
+
+    public ScheduledEngine getScheduledEngine(String engineName) {
+        return Objects.requireNonNull(scheduledEngines.get(engineName),
+            "Product engine with name: '" + engineName + "' was not found.");
+    }
+    // ...
+}
+----
+
+Because the map key is the Spring bean name, the right way to register an engine is with an explicit name:
+
+[source,java]
+----
+@Service("SimpleScheduledEngine")
+public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondition> { ... }
+----
+
+Product form services expose `scheduledEngines.keySet()` as a dropdown on the product edit page, so the operator picks from the registered beans rather than typing a name by hand.
+
+=== CreditCondition Contract
+
+`CreditCondition` is the minimum interface your condition entity must implement:
+
+[source,java]
+----
+public interface CreditCondition {
+    MonetaryAmount getPrincipal();
+    String getScheduleEngineName();
+}
+----
+
+Everything else — rate, term, period, regular payment, day-count method, secured offer — is engine-specific and lives on your subclass. The SDK keeps the base interface minimal so different products can evolve independent shapes (revolving lines, step-up annuities, balloon loans).
+
+=== PaymentSegment & PaymentSchedule
+
+`PaymentSegment` is the row:
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_expected_payment")
+public class PaymentSegment extends BaseEntity<Long> {
+    private LocalDate date;
+    private CurrencyUnit currency;
+    private BigDecimal amount;           // principal + interest
+    private BigDecimal principal;
+    private BigDecimal interest;
+    private BigDecimal remainingPrincipal;
+    private BigDecimal remainingInterest;
+    // ...
+    public PaymentSegment(LocalDate date,
+            MonetaryAmount principal, MonetaryAmount interest,
+            MonetaryAmount remainingPrincipal, MonetaryAmount remainingInterest) { ... }
+}
+----
+
+`PaymentSchedule` is the aggregate, persisted as `credit_payment_schedule`:
+
+[source,java]
+----
+public PaymentSchedule(LocalDate startDate, LocalDate endDate, int term,
+        MonetaryAmount totalAmount, MonetaryAmount totalPrincipal, MonetaryAmount totalInterest,
+        List<PaymentSegment> payments) { ... }
+----
+
+`CreditScheduledService.createSchedule` builds the aggregate, asserts the last segment clears the balance, and returns a freshly constructed `PaymentSchedule` to the caller. The caller is responsible for attaching it to the `Application` (see <<offer-engine>> for the select-condition action that does this).
+
+== A Real Implementation — SimpleScheduledEngine
+
+The example project ships a single engine that implements straight annuity math with pluggable day counting:
+
+[source,java]
+----
+@Service(SimpleScheduledEngine.NAME)
+public class SimpleScheduledEngine implements ScheduledEngine<ExampleCreditCondition> {
+
+    public static final String NAME = "SimpleScheduledEngine";
+
+    @Autowired
+    protected Map<String, DayCountMethod> dayCountMethods;
+
+    @Override
+    public Class<ExampleCreditCondition> getConditionClass() {
+        return ExampleCreditCondition.class;
+    }
+
+    @Override
+    public List<PaymentSegment> payments(ExampleCreditCondition condition, LocalDate interestStart,
+            LocalDate paymentStart, MonetaryAmount principal, MonetaryAmount interest) {
+        DayCountMethod dayCountMethod = dayCountMethods.get(
+            condition.getSecuredOffer().getOriginalOffer()
+                .getCreditProduct().getDayCountMethod());
+        return payments(condition.getRegularPayment(), condition.getInterestRate(),
+            condition.getPeriod(), principal, interest, interestStart, paymentStart,
+            condition.getTerm(), dayCountMethod);
+    }
+    // ...
+}
+----
+
+The inner loop is classical annuity amortization with two twists:
+
+1. Interest is accrued by **day-count fraction**, not by a fixed periodic constant. That means a 30/360, ACT/360, ACT/365, or ICMA schedule differ only in which `DayCountMethod` bean is pulled from the map.
+2. The **last payment** takes everything remaining, so rounding never leaves a residual balance.
+
+[source,java]
+----
+for (int order = 1; order <= length; order++) {
+    to = startInterest.plus(period.multipliedBy(order));
+    if (from.isBefore(to)) {
+        BigFraction fraction = dayCounter.count(from, to);
+        MonetaryAmount increment = calcRangeAccural(principal, annualInterest, fraction);
+        interest = interest.add(increment);
+    }
+
+    if (order < length) {
+        interestPayment = Lang.min(regularPayment, interest);
+        principalPayment = Lang.min(principal, regularPayment.subtract(interestPayment));
+    } else {
+        interestPayment = interest;
+        principalPayment = principal;
+    }
+
+    principal = principal.subtract(principalPayment);
+    interest = interest.subtract(interestPayment);
+
+    payments.add(new PaymentSegment(to, principalPayment, interestPayment, principal, interest));
+    from = Lang.max(to, from);
+    if (principal.isNegativeOrZero()) break;
+}
+----
+
+This pattern is the reference blueprint: **produce a list of `PaymentSegment`, ensure the final row closes out principal and interest, and do all interest math through a shared `DayCounter` so the output agrees with the accrual engine at runtime**.
+
+== Day Count — The Shared Math Floor
+
+Schedule generation (origination) and accrual (servicing) both call the same day-count abstraction so the two stay consistent.
+
+[source,java]
+----
+public interface DayCountMethod {
+    BigFraction fractionOfYear(LocalDate from, LocalDate to, PaymentGrid grid);
+    long countDays(LocalDate from, LocalDate to, PaymentGrid grid);
+}
+----
+
+The SDK ships concrete implementations for every common market convention:
+
+- `Method_30_360_BB`, `Method_30E_360`, `Method_30E_360_ISDA`, `Method_30EPlus_360`, `Method_30U_360` — 30/360 family.
+- `Method_ACT_360`, `Method_ACT_364`, `Method_ACT_365F`, `Method_ACT_365L`, `Method_ACT_366`, `Method_NL_365` — actual-day conventions.
+- `Method_ACT_ACT_AFB`, `Method_ACT_ACT_ICMA`, `Method_ACT_ACT_ISDA` — actual/actual variants.
+
+A `PaymentGrid` captures the "payment calendar" — a maturity date, a day-of-month anchor, and a period (weekly, biweekly, monthly, bimonthly, quarterly, semiyearly, yearly). `DayCounter` composes a grid with a method:
+
+[source,java]
+----
+PaymentGrid paymentGrid = new PaymentGrid(maturityDate, startInterest.getDayOfMonth(), period);
+DayCounter dayCounter = new DayCounter(paymentGrid, dayCountMethod);
+BigFraction fraction = dayCounter.count(from, to);
+----
+
+The grid's `lower/flooring/ceiling/higher` methods map any date into the nearest payment anchor — that is what lets accrual engines figure out "which period does this accrual belong to" when the schedule changes mid-flight.
+
+== CreditCalculatorUtils — The Math Primitives
+
+All engines share one set of helpers, tested against every day-count convention:
+
+[cols="2,3", options="header"]
+|===
+|Helper |Purpose
+
+|`percent(amount, interest)`
+|Safe percent-of-amount — returns zero if the rate is null, keeps 12-fraction precision internally.
+
+|`calcRangeAccural(basis, rate, fraction)`
+|The core accrual primitive: `basis * rate/100 * fraction`, rounded HALF_UP to currency scale. Used by both `SimpleScheduledEngine` and `RangeBasedAccrualEngine`.
+
+|`calcInterest(annualInterest, principal, currentPeriodStart, prev, next, period, day)`
+|Proportional interest between two dates, accounting for fractional periods.
+
+|`periodicInterest(period, annualInterest)`
+|Annual rate → periodic rate for the configured payment frequency.
+
+|`proportionalCountPeriods(from, to, period, day)`
+|Counts a fractional number of payment periods between two dates.
+
+|`annuityPayment(principal, term, annualRate, annualPeriods)`
+|Classical annuity formula for computing the regular payment up-front.
+
+|`calcPercentDebt(countDays, mainDebt, percentPerDay)`
+|Simple daily interest for penalty-style accrual.
+
+|`divideWithUp(amount, divisor)`
+|Division that rounds up to currency scale (used when the last payment absorbs a remainder).
+|===
+
+These helpers exist precisely so custom engines do not reimplement rounding, scale handling, or the `BigFraction`/`BigDecimal` dance between the math library and the monetary library.
+
+== The Runtime Side — AccrualEngine
+
+Once a credit is active, operations (disbursements, payments, fees, rate changes) arrive and the system must **recompute daily snapshots**. This is the job of `AccrualEngine`:
+
+[source,java]
+----
+public interface AccrualEngine<C extends Credit> {
+    Debt calculateAccurals(C credit, NavigableMap<LocalDate, SnapshotRecord> snapshots, LocalDate date);
+}
+----
+
+Multiple accrual engines can be registered — one for interest, one for late fees, one for insurance premiums, and so on. `AccrualService` sums them into a single `Debt`:
+
+[source,java]
+----
+@Autowired(required = false)
+private List<AccrualEngine> accrualEngines = Collections.emptyList();
+
+private Debt _calculateAccurals(Credit credit, NavigableMap<LocalDate, SnapshotRecord> snapshots, LocalDate date) {
+    Debt debt = Debt.ZERO;
+    for (AccrualEngine engine : accrualEngines) {
+        debt = debt.add(engine.calculateAccurals(credit, snapshots, date));
+    }
+    return debt;
+}
+----
+
+=== RecordableAccrualEngine
+
+Most accrual engines extend `RecordableAccrualEngine`, which adds two things: an **accrual account** the result posts into, and **detailed accrual records** for audit/tracing:
+
+[source,java]
+----
+public abstract class RecordableAccrualEngine<C extends Credit> implements AccrualEngine<C> {
+
+    public abstract String getAccrualAccount();
+
+    public abstract List<AccrualRecord> calculateAccrualRecords(C credit,
+        NavigableMap<LocalDate, SnapshotRecord> snapshots, LocalDate date);
+
+    public record AccrualRecord(
+        LocalDate start, LocalDate end,
+        DayCountMethod dayCountMethod, long daysCount,
+        MonetaryAmount basis, BigDecimal rate,
+        BigFraction fraction, MonetaryAmount increment) { }
+}
+----
+
+The base class:
+
+1. Pulls **performed accruals** from the operation history (the amounts already posted, extracted from the final debt of each operation on the accrual account).
+2. Asks the subclass for **fresh accrual records** from `calculateAccrualRecords(...)`.
+3. Nets the two: `accrual = Σ(records) - Σ(performed)` — so calling the engine on a date in the past returns zero when everything is already booked.
+
+The `AccrualRecord` fields are what shows up in the "accrual history" UI: start/end, how many days, at what basis and rate, the exact `BigFraction` day-count, and the resulting monetary increment.
+
+=== RangeBasedAccrualEngine
+
+`RangeBasedAccrualEngine` goes one step further — it knows basis, rate, and day-count can all change mid-credit:
+
+[source,java]
+----
+public abstract class RangeBasedAccrualEngine<C extends Credit> extends RecordableAccrualEngine<C> {
+
+    protected abstract NavigableMap<LocalDate, MonetaryAmount> getBasisRanges(...);
+    protected abstract NavigableMap<LocalDate, BigDecimal> getLoanRateRanges(...);
+    protected abstract Set<LocalDate> getFixAccuralDays(...);
+    protected abstract NavigableMap<LocalDate, DayCounter> getDayCounters(...);
+}
+----
+
+At calculation time, the engine merges every boundary (basis changes, rate changes, day-count changes, fix days) into one sorted `NavigableSet<LocalDate>`, then computes one `AccrualRecord` per sub-range:
+
+[source,java]
+----
+for (LocalDate end : ranges) {
+    Optional<MonetaryAmount> basis = Optional.ofNullable(basisRanges.lowerEntry(end)).map(Map.Entry::getValue);
+    Optional<BigDecimal> rate = Optional.ofNullable(loanRates.lowerEntry(end)).map(Map.Entry::getValue);
+    Optional<DayCounter> counter = Optional.ofNullable(dayCounters.lowerEntry(end)).map(Map.Entry::getValue);
+    if (basis.isPresent() && rate.isPresent() && counter.isPresent()) {
+        BigFraction fraction = counter.get().count(start, end);
+        MonetaryAmount increment = calcRangeAccural(basis.get(), rate.get(), fraction);
+        accruals.add(new AccrualRecord(start, end, ...));
+    }
+    start = end;
+}
+----
+
+This is the pattern to follow for variable-rate credits — your subclass supplies rate change points from `LoanRateService.getLoanRateValueByRange(expression, from, to)` and the base class handles the date arithmetic.
+
+== The Recalculation Orchestrator
+
+=== CreditCalculationService — The API
+
+[source,java]
+----
+public interface CreditCalculationService {
+    CompletableFuture<Optional<CalculationResult>> calculate(UUID creditId, LocalDate from, LocalDate to);
+    NavigableMap<LocalDate, SnapshotRecord> extendCredit(UUID creditId, LocalDate to);
+    NavigableMap<LocalDate, SnapshotRecord> extendCredit(UUID creditId, LocalDate to,
+        List<CreditOperation> possibleOperations);
+
+    record CalculationResult(UUID creditId, LocalDate calculationDate, CreditStatus status, Debt debt,
+                    boolean calculationDateChanged, boolean snapshotChanged, boolean statusChanged) { }
+}
+----
+
+Two modes:
+
+- `calculate(...)` mutates the credit — new snapshots are written, events fire (`CreditSnapshotChangeEvent`, `CreditStatusChangeEvent`, `CreditCalculationDateChangeEvent`).
+- `extendCredit(...)` projects what the credit would look like at a future date without writing anything. Used for "preview" screens and for early-close/payoff quotes. The second overload lets callers probe hypothetical operations (e.g. "what if the client paid $500 tomorrow?").
+
+=== CreditCalculationServiceImpl — Transaction Coalescing
+
+The implementation wraps every `calculate(...)` call in a `CreditCalculationRequest`. If a transaction is already active, the request is registered with `CreditCalculationRegister` (a `TransactionSynchronization`) and merged with any other request for the same credit:
+
+[source,java]
+----
+public CompletableFuture<Optional<CalculationResult>> calculate(UUID creditId, LocalDate from, LocalDate to) {
+    CreditCalculationRequest request = new CreditCalculationRequest(creditId, from, to);
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+        CreditCalculationRegister register = intrenalService.getRegister();
+        register.addRequest(request);
+        return request.getFuture();
+    } else {
+        request.execute();
+        return request.getFuture();
+    }
+}
+----
+
+When the outer transaction commits, `afterTransaction()` drains the map and runs each merged request in a **requires-new** transaction, pessimistically locking the credit row:
+
+[source,java]
+----
+Optional<CalculationResult> result = transactionTemplateBuilder.requiresNew().execute(s -> {
+    Credit credit = LockUtils.lock(creditId, Credit.class, LockModeType.PESSIMISTIC_WRITE, entityManager);
+    return intrenalService._calculate(credit, from, to);
+});
+----
+
+This is how the platform avoids race conditions when multiple handlers (web action, checker, scheduled job) all try to recalculate the same credit in the same outer transaction — they get one consolidated call instead of N.
+
+=== CreditCalculationTask — The Cron Driver
+
+`CreditCalculationTask` keeps every active credit's snapshots current as calendar dates advance:
+
+[source,java]
+----
+@Scheduled(cron = "${credit.calculation.cron}")
+@SchedulerLock(name = "CreditCalculationTask_calculateActive", lockAtMostFor = "PT3H", lockAtLeastFor = "PT30M")
+public void calculateActive() {
+    LocalDate today = LocalDate.now();
+    for (UUID id : getAliveIds()) {
+        try {
+            creditCalculationService.calculate(id, null, today);
+        } catch (Exception e) {
+            logger.error("Credit " + id + " calculation fail", e);
+        }
+    }
+}
+----
+
+Key design points:
+
+- **`@SchedulerLock`** — Shedlock guarantees only one instance in a cluster runs the pass.
+- **`from = null`** — the call extends from the credit's existing `calculationDate`, not from the origin. This is cheap after the first pass.
+- **Per-id try/catch** — one broken credit does not poison the rest of the batch.
+- **Alive status filter** — `CreditStatus.values().filter(s -> !s.isEnding())` excludes CLOSED/CHARGED_OFF/etc.
+
+Configure the cron via `credit.calculation.cron` in `application.properties`.
+
+== The Timeline Walker — LoanEngine
+
+=== The Interface
+
+[source,java]
+----
+public interface LoanEngine {
+    Map<LocalDate, SnapshotRecord> addNextSnapshots(Credit credit, LocalDate toDate, boolean toDateOpened,
+        Map<LocalDate, SnapshotRecord> past, Map<LocalDate, List<CreditOperation>> operations);
+}
+----
+
+`LoanEngine` projects new snapshots from the last known state up to `toDate`. The `toDateOpened` flag is subtle: when extending to an open-ended future date, end-of-day operations on that date should **not** be applied (they will be applied tomorrow).
+
+=== BasicLoanEngine — The Reference Implementation
+
+[source,java]
+----
+public class BasicLoanEngine implements LoanEngine {
+    private final CreditStatus initialStatus;
+
+    @Override
+    public Map<LocalDate, SnapshotRecord> addNextSnapshots(Credit credit, LocalDate toDate, boolean toDateOpened,
+            Map<LocalDate, SnapshotRecord> past, Map<LocalDate, List<CreditOperation>> operations) {
+
+        NavigableMap<LocalDate, SnapshotRecord> newSnapshots = new TreeMap<>(past);
+        LocalDate fromDate = newSnapshots.isEmpty() ? credit.getStartDate() : newSnapshots.lastKey().plusDays(1);
+
+        NavigableSet<LocalDate> dates = new TreeSet<>(operations.keySet());
+        dates.add(credit.getStartDate());
+        dates = dates.subSet(fromDate, true, toDate, true);
+
+        for (LocalDate date : dates) {
+            AccuralContext accurals = accrualService.createAccuralContext(credit, newSnapshots, date);
+            SnapshotRecord next = operationProcessor.proccess(date, toDateOpened && date.equals(toDate),
+                current != null ? current.status() : initialStatus,
+                current != null ? current.debt() : Debt.ZERO,
+                operations.getOrDefault(date, Collections.emptyList()), accurals);
+            newSnapshots.put(next.date(), next);
+            current = next;
+            if (next.status().isEnding()) break;
+        }
+        return newSnapshots;
+    }
+}
+----
+
+Dates that drive a new snapshot:
+
+1. Every date with at least one operation.
+2. The credit's start date.
+3. The end date of the extend range.
+
+Everything in between is implicit — if no operation happens on a day, no snapshot is written. Accruals between sparse snapshots are recomputed on demand via `AccuralContext.calculateAccurals(snapshot)`.
+
+=== OperationProcessor & CreditOperationHandler
+
+[source,java]
+----
+public interface CreditOperationHandler<O extends CreditOperation> {
+    Class<O> getOperationType();
+    void apply(O operation, Snapshot snapshot);
+}
+----
+
+For each operation on a given date, `OperationProcessor` finds every registered `CreditOperationHandler` whose `getOperationType()` is assignable from the operation class and calls `apply(operation, snapshot)`. The handler mutates `snapshot.debt` — a `MutableDebt` keyed by account — and the processor diffs before/after to record the applied `Debt` on each `OperationRecord`.
+
+Important details:
+
+- Handlers run in the order Spring autowires them. If order matters (e.g., payment must process before a fee is added), express that via ordering / bean dependencies rather than relying on autowire order.
+- A handler that mutates nothing returns `Optional.empty()` — the operation is still recorded, just with no net change.
+- When `snapshot.status.isEnding()`, further operations are skipped (`operation.applied = Optional.empty()`).
+
+=== AbstractPaymentOperationHandler — The Waterfall
+
+[source,java]
+----
+public abstract class AbstractPaymentOperationHandler<T extends CreditPayment> implements CreditOperationHandler<T> {
+
+    @Override
+    public void apply(CreditPayment payment, Snapshot snapshot) {
+        Mutator amount = Mutator.valueMutator(payment.getAmount());
+        for (String account : getRepaymentOrder(payment)) {
+            snapshot.debt.get(account).ifPresent(debt -> pay(amount, debt));
+            if (amount.get().isZero()) break;
+        }
+        String ovpmt;
+        if ((ovpmt = getOverpaymentAccount(payment)) != null && amount.get().isPositive()) {
+            snapshot.debt.getOrCreate(ovpmt, amount.get().getCurrency()).subtract(amount.get());
+        }
+    }
+
+    protected abstract List<String> getRepaymentOrder(CreditPayment payment);
+    protected abstract String getOverpaymentAccount(CreditPayment payment);
+}
+----
+
+This is how payment distribution works: the handler walks a list of account names in order (e.g. `[LATE_FEE, PENALTY, INTEREST, PRINCIPAL]`), paying down each until the remittance is exhausted. Anything left lands in the overpayment account. `CreditPaymentOperationHandler` is the ready-to-use constructor-injected variant:
+
+[source,java]
+----
+public abstract class CreditPaymentOperationHandler extends AbstractPaymentOperationHandler<CreditPayment> {
+    private final String overpayment;
+    private final List<String> repaymentOrder;
+
+    public CreditPaymentOperationHandler(@Nullable String overpayment, List<String> repaymentOrder) { ... }
+    public CreditPaymentOperationHandler(List<String> repaymentOrder) { this(null, repaymentOrder); }
+}
+----
+
+== Distribution — Materializing the Timeline
+
+`DistributionService` is the seam between **operations** (rows in `credit_operation`) and **snapshots** (rows in `credit_snapshot`):
+
+[source,java]
+----
+public class DistributionService {
+
+    public Optional<Debt> getFinalDebt(CreditOperation operation) { ... }
+    public Collection<OperationRecord> getFinalDebts(Collection<? extends CreditOperation> operations) { ... }
+    public NavigableMap<LocalDate, SnapshotRecord> getSnapshotRecords(Credit credit) { ... }
+    public void saveDebts(Collection<? extends CreditOperation> operations, Collection<OperationRecord> newRecords) { ... }
+}
+----
+
+Two value types carry the output:
+
+[source,java]
+----
+public record OperationRecord(LocalDate date, CreditOperation operation, Optional<Debt> finalDebt) { }
+
+public record SnapshotRecord(LocalDate date, CreditStatus status, Debt debt, Collection<OperationRecord> operations) { }
+----
+
+`saveDebts` reconciles computed debts with stored `CreditOperationDistribution` rows, emitting `ADJUST` or `CANCEL` distributions as the snapshot evolves. This is why re-running a calculation on an unchanged credit is cheap — if the computed debt equals the stored debt, nothing is written.
+
+=== AccuralContext — The Accrual Hook Inside a Snapshot
+
+When `OperationProcessor` is mid-way through applying operations to a date, it needs to ask the accrual layer "what's accrued up to right now, including the mutations I've made in this snapshot?". That is what `AccuralContext` provides:
+
+[source,java]
+----
+public interface AccuralContext {
+    Debt calculateAccurals(SnapshotRecord currentSnapshot);
+    NavigableMap<LocalDate, SnapshotRecord> pastRecords(SnapshotRecord currentSnapshot);
+}
+----
+
+`AccrualService.createAccuralContext(...)` returns an implementation that splices the current in-flight snapshot into the historical map, then calls every `AccrualEngine` against that map. Handlers that need up-to-the-moment accruals (e.g., an interest-capitalization handler) call `snapshot.calculateAccurals()` to get a fresh `Debt`.
+
+== Implementing a Custom Engine
+
+=== Step 1 — Define Your CreditCondition
+
+Capture every parameter your math needs on the condition. The example uses principal, engine name, interest rate, late fee rate, period, term, regular payment, and a secured-offer reference back to the product:
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_condition")
+@Immutable
+public class ExampleCreditCondition extends UUIDPersistable implements CreditCondition {
+
+    @Embedded
+    private MonetaryAmount principal;
+
+    @Column(nullable = false)
+    private String engineName;
+
+    @Column(nullable = false, columnDefinition = NUMERIC)
+    private BigDecimal interestRate;
+
+    @Column(nullable = false)
+    private Period period;
+
+    @Column(nullable = false)
+    private Integer term;
+
+    @Embedded
+    @NotNull
+    private MonetaryAmount regularPayment;
+    // ...
+}
+----
+
+`@Immutable` matters: once a condition is created at offer selection, its terms should never drift. Any change to rate/term/amount should produce a new condition.
+
+=== Step 2 — Implement the Engine
+
+[source,java]
+----
+@Service(MyEngine.NAME)
+public class MyEngine implements ScheduledEngine<MyCreditCondition> {
+
+    public static final String NAME = "MyEngine";
+
+    @Autowired
+    protected Map<String, DayCountMethod> dayCountMethods;
+
+    @Override
+    public Class<MyCreditCondition> getConditionClass() {
+        return MyCreditCondition.class;
+    }
+
+    @Override
+    public List<PaymentSegment> payments(MyCreditCondition condition,
+            LocalDate interestStart, LocalDate paymentStart,
+            MonetaryAmount principal, MonetaryAmount interest) {
+        // 1. Resolve the day-count method from the product/condition.
+        // 2. Build a PaymentGrid from maturity date + day-of-month + period.
+        // 3. Loop term times, computing interest via DayCounter and peeling principal.
+        // 4. On the last iteration, take all remaining principal + interest.
+        // 5. Return the list.
+    }
+}
+----
+
+=== Step 3 — Reference the Engine from the Product
+
+The product's `engineName` field stores the bean name. Wire it through the product edit form via the form service:
+
+[source,java]
+----
+@Override
+public void assembleEditModel(Model model, ExampleCreditProduct product) {
+    model.addAttribute("productEngines", scheduledService.getScheduledEngineKeys());
+    // ...
+}
+----
+
+The operator picks from a dropdown; the value they pick is exactly the Spring bean name from `@Service("MyEngine")`.
+
+=== Step 4 — Verify With a Unit Test
+
+Because the engine is pure (no database, no mutation beyond local variables), it is trivial to test:
+
+[source,java]
+----
+@Test
+void generates_valid_schedule_for_standard_terms() {
+    MyCreditCondition condition = new MyCreditCondition(
+        Money.of(10_000, "USD"), MyEngine.NAME,
+        new BigDecimal("0.089"), Period.ofMonths(1), 12,
+        Money.of(875, "USD"), ...);
+
+    List<PaymentSegment> segments = engine.payments(condition,
+        LocalDate.of(2026, 1, 15), LocalDate.of(2026, 2, 15),
+        condition.getPrincipal(), Money.of(0, "USD"));
+
+    assertThat(segments).hasSize(12);
+    assertThat(segments.get(11).getRemainingDebt().isZero()).isTrue();
+}
+----
+
+The final assertion (`remainingDebt == 0`) is the same invariant `CreditScheduledService.createSchedule` enforces in production.
+
+== Advanced Patterns
+
+=== Pattern — Variable-Rate Schedules
+
+When the product carries a SpEL rate expression (e.g. `SOFR + 0.025`), the schedule must reflect future rate change points. Use `LoanRateService.getLoanRateValueByRange` at schedule-build time to pull the rate curve, then emit multiple `PaymentSegment` rows when a rate change falls inside a payment period. The matching runtime piece is `RangeBasedAccrualEngine` — supply the same rate curve as `getLoanRateRanges(...)` so accruals agree with the schedule.
+
+=== Pattern — Balloon / Bullet Payments
+
+Instead of deriving the regular payment from the annuity formula, carry it as an explicit field on the condition. The last segment already absorbs the remainder in the reference loop:
+
+[source,java]
+----
+if (order < length) {
+    interestPayment = Lang.min(regularPayment, interest);
+    principalPayment = Lang.min(principal, regularPayment.subtract(interestPayment));
+} else {
+    interestPayment = interest;
+    principalPayment = principal;   // balloon — whatever is left
+}
+----
+
+For interest-only loans, set `regularPayment = interestPerPeriod` and the balloon in the last period will be the full principal.
+
+=== Pattern — Grace Period
+
+`interestStart` and `paymentStart` are deliberately separate parameters. When there is a grace period:
+
+- `interestStart` is the disbursement date (interest accrues from here).
+- `paymentStart` is the date of the first payment (after the grace period).
+
+Your engine can either capitalize grace-period interest into principal at `paymentStart` or add an extra `PaymentSegment` for the grace interest — both are valid, but pick one and match it in the runtime accrual engine.
+
+=== Pattern — Multi-Currency Condition
+
+The SDK's monetary types (`MonetaryAmount`) carry currency, so the engine's math is currency-agnostic. For multi-currency products, store the currency on the product and construct `MonetaryUtil.zero(product.getCurrency())` as the opening interest.
+
+=== Pattern — Fee-Bearing Schedules
+
+If fees are scheduled up-front (not accrued at runtime), embed them in `PaymentSegment.interest` or add a parallel `fee` accrual engine and account. Keep the schedule's `totalAmount = totalPrincipal + totalInterest` invariant — if you carry fees separately, add them as additional `PaymentSegment` rows rather than mixing them into principal.
+
+[[day-count-methods-deep-dive]]
+== Day Count Methods — Deep Dive
+
+The day-count family lives under `com.timvero.scheduled.day_count` and consists of a flat set of `@Component`-registered `DayCountMethod` implementations plus two composition types: `DayCounter` (pairs a method with a grid) and `PaymentGrid` (a period/day-of-month calendar). Every implementation answers the same question in two shapes — `countDays(from, to, grid)` returns a raw day count, and `fractionOfYear(from, to, grid)` returns a `BigFraction` ready to multiply by an annual rate. Using `BigFraction` (Apache Commons Math) rather than `BigDecimal` is deliberate: day-count ratios like `29/366` stay exact until the final monetary rounding.
+
+All concrete method classes are named `Method_*` and register under their market name (the `NAME` constant equals the Spring bean name). Your engine should inject `Map<String, DayCountMethod> dayCountMethods` and resolve the method by the product-configured key — never by type reference.
+
+=== The Full Catalog — Fifteen Implementations
+
+[cols="2,1,2,4", options="header"]
+|===
+|Class |Bean name |Denominator |Numerator rule
+
+|`Method_30_360_BB`
+|`30_360_BB`
+|360
+|Bond-basis 30/360. `d1=31 -> 30`; `d2=31 -> 30` only if `d1==30`. Uses `PaymentGrid.flooringDate(from)` as a cell anchor so partial-period counts stay stable.
+
+|`Method_30E_360`
+|`30E_360`
+|360
+|European 30/360. Always clamp `d1==31 -> 30` and `d2==31 -> 30` (no `d1==30` pre-condition). Simplest of the 30/360 family; no February handling.
+
+|`Method_30E_360_ISDA`
+|`30E_360_ISDA`
+|360
+|ISDA variant. Same as `30E_360` plus: last day of February also clamps to 30 (both legs) — **except** when `to.equals(grid.getMaturityDate())`. That maturity exception is why `30E_360_ISDA` is the default inside `USAPRCalculator` (see below) — it makes the final period land on calendar day 30/31 cleanly.
+
+|`Method_30EPlus_360`
+|`30EPlus_360`
+|360
+|"+1" variant. If `to.getDayOfMonth() == 31`, increment `to` by one day before counting. Intended for instruments quoted with month-end extension rules.
+
+|`Method_30U_360`
+|`30U_360`
+|360
+|US 30/360 (NASD). Distinguishes EOM (`grid.dayOfMonth == 31`) from non-EOM schedules — if EOM and both legs are last-day-of-February, both clamp to 30. Uses `grid.flooringDate(from)` as an anchor, then computes the difference of two sub-counts.
+
+|`Method_ACT_360`
+|`ACT_360`
+|360
+|Money-market convention. `countDays = DAYS.between(from, to)`, divided by 360. Over a full year, returns `365/360 = 1.01389` — **more than one year**. This is intentional; APR conventions that use ACT/360 implicitly inflate yields.
+
+|`Method_ACT_364`
+|`ACT_364`
+|364
+|Used in some short-tenor money-market instruments (notably GBP discount bills). Otherwise identical shape to `ACT_360`.
+
+|`Method_ACT_365F`
+|`ACT_365F`
+|365
+|Actual/365 Fixed. `DAYS.between(from, to) / 365`. The `F` is important — the denominator never changes for leap years (contrast with `ACT_365L`).
+
+|`Method_ACT_365L`
+|`ACT_365L`
+|365 or 366
+|Actual/365 Leap. Denominator becomes 366 when `to.getYear()` is a leap year. Used in some GBP floating-rate notes.
+
+|`Method_ACT_366`
+|`ACT_366`
+|366
+|Fixed 366 denominator — rare, appears in a few Japanese instruments.
+
+|`Method_NL_365`
+|`NL_365`
+|365
+|No-Leap 365. Strips Feb 29 from both endpoints (shifts `from` to Mar 1 and `to` to Feb 28), then measures; subtracts one more day if `efy` crosses a leap year but `to` does not. Net effect: every year contributes exactly 365 days.
+
+|`Method_ACT_ACT_AFB`
+|`ACT_ACT_AFB`
+|variable
+|French AFB convention. Walks backward from `from` through the grid until the sub-period spans a Feb 28/29 (identifying the "reference year"), computes three fractions (partial start year, partial end year, whole years between), denominator per leg is that leg's `ChronoUnit.DAYS.between` of the enclosing year.
+
+|`Method_ACT_ACT_ICMA`
+|`ACT_ACT_ICMA`
+|variable
+|Bond convention. Uses `grid.flooring(from)` / `grid.ceiling(to)` to anchor payment indices, computes `endPayment - startPayment` minus the pre-period and post-period fractions, all divided by `grid.getYearPeriodCount()` (e.g. 2 for semi-annual). **This is the only method whose result depends meaningfully on the `PaymentGrid.period`** — a schedule where you pass a monthly grid when the instrument is semi-annual will quietly return the wrong fraction.
+
+|`Method_ACT_ACT_ISDA`
+|`ACT_ACT_ISDA`
+|variable
+|ISDA convention. Splits the interval at calendar year boundaries: the pre-boundary portion uses `from.lengthOfYear()` as its denominator, the post-boundary portion uses `to.lengthOfYear()`. Adds whole calendar years in between. Robust for any period.
+|===
+
+=== Equivalences and Pitfalls
+
+* **`Method_30E_360` and `Method_30E_360_ISDA` diverge only around February and at the maturity date.** Under a loan that never touches Feb 28/29, they produce identical schedules. Use `30E_360_ISDA` when the last period lands on month-end and you want the maturity exception.
+* **`Method_ACT_360`, `Method_ACT_364`, `Method_ACT_365F`, `Method_ACT_366` share one `countDays` body** — `DAYS.between(from, to)` — and differ only in the denominator. The bean selection is entirely about which "year" you multiply against. Injecting one of these and "switching to a different denominator" manually (e.g. `frac * 365 / 360`) breaks round-tripping against the accrual engine.
+* **`Method_ACT_ACT_ICMA` requires a matching `PaymentGrid`.** The ICMA definition assumes the grid describes the instrument's actual coupon frequency. If you pass a `MONTHLY` grid for a `SEMIYEARLY` bond, `grid.getYearPeriodCount()` will be 12 — the fraction will be off by a factor of 6.
+* **`Method_30EPlus_360`'s `to = to.plusDays(1)` rewrite is not symmetric.** `countDays(A, B) + countDays(B, C)` does not equal `countDays(A, C)` when `B.dayOfMonth == 31`. If you chain counts across segments, round-trip only through whole payment dates chosen from the grid.
+* **`Method_NL_365` does mutation of `from`/`to` via `if (from.monthValue == 2 && from.dayOfMonth == 29) from = from.plusDays(1);`**. Because `LocalDate` is immutable this is safe, but the net count can drop one day around leap transitions — useful for "no-leap" yields, unexpected if you thought the method was pure actual-day.
+* **`Method_30U_360` is the only 30/* method that consults `grid.getDayOfMonth()`.** Switching the product's payment day from 15 to 31 changes whether `eom` is true and therefore changes accrued interest on February stubs.
+* **The `countDays` return is `long`, the denominator is `long`, and `BigFraction(num, den)` is then built.** Accrual math multiplies this by a `BigDecimal` rate — the fraction stays exact until `calcRangeAccural` rounds to currency scale. Skipping the `BigFraction` and doing `days / 360.0` with `double` is the single most common source of "off-by-one-cent" reconciliation bugs.
+
+=== `PaymentGrid` — What the Methods Consult
+
+[source,java]
+----
+PaymentGrid grid = new PaymentGrid(maturityDate, paymentDayOfMonth, PaymentGrid.MONTHLY);
+LocalDate anchor = grid.flooringDate(some);      // greatest grid date <= some
+int anchorIdx    = grid.flooring(some);          // index of that date
+int yearPeriods  = grid.getYearPeriodCount();    // 12 for MONTHLY, 2 for SEMIYEARLY
+----
+
+`PaymentGrid` supports WEEKLY (52), BIWEEKLY (26), MONTHLY (12), BIMONTHLY (6), QUOTERLY (4), SEMIYEARLY (2), YEARLY (1). Passing any other `Period` to the constructor throws `Unsupported period`. The grid's `basisDate` is derived from `maturityDate.withDayOfMonth(min(dayOfMonth, maturityDate.lengthOfMonth()))`, which is also what `get(count)` uses to step — so a product paid on the 31st in a 30-day month lands on the 30th of that month and back on the 31st the following month. This logic is the reason `Method_ACT_ACT_ICMA.fractionOfYear` can trust `grid.get(startPayment + 1)` to return the next coupon date without additional clamping.
+
+[[apr-calculator-deep-dive]]
+== APR Calculator — Deep Dive
+
+`com.timvero.scheduled.apr` currently ships one jurisdiction-specific implementation: `com.timvero.scheduled.apr.us.USAPRCalculator`. It is a self-contained NPV solver that answers the Regulation Z question: "given this schedule of disbursements and payments, what constant monthly rate makes the net present value zero?". Unlike `APRCalculator` in `com.timvero.loan.engine.util` (which works period-by-period against a known annuity), `USAPRCalculator` accepts an **arbitrary timeline of cash flows** and uses monthly compounding throughout.
+
+=== The Cash Flow Model
+
+Three mutator methods populate a `NavigableMap<LocalDate, MonetaryAmount>` keyed by date:
+
+[source,java]
+----
+USAPRCalculator calc = new USAPRCalculator();
+calc.addDisbursement(Money.of(10_000, "USD"), LocalDate.of(2026, 1, 15));  // negative flow
+calc.addPayment(Money.of(900,    "USD"), LocalDate.of(2026, 2, 15));        // positive flow
+calc.addFinanceCharge(Money.of(50, "USD"), LocalDate.of(2026, 1, 15));      // positive flow
+double aprPercent = calc.calculateAPR();                                    // e.g. 12.4567
+BigDecimal disclosed = USAPRCalculator.roundAPRToEighthBigDecimal(aprPercent);
+----
+
+`addDisbursement` stores the amount **negated** (cash out of the lender). `addPayment` and `addFinanceCharge` both store positive. Multiple calls on the same date merge via `MonetaryAmount::add`, which is why a finance charge on the disbursement day correctly reduces the net negative flow rather than being silently overwritten.
+
+=== The Solver
+
+`calculateAPR()`:
+
+1. Grabs `maturityDate = cashFlows.lastKey()` and constructs a **monthly `PaymentGrid`** anchored on that date's day-of-month.
+2. Builds a `DayCounter` with `Method_30E_360_ISDA` — this is the canonical choice for TILA/Reg Z disclosures because of the maturity-date exception (see above).
+3. For each cash flow, computes `dayCounter.count(baseDate, flowDate).multiply(12)` to get a month fraction, and stores `(amount.doubleValue(), monthFraction)` into two parallel arrays.
+4. Calls `bisection(amounts, monthFractions)` which brackets `[0.00001, 2.0]` (annual rate 0.001% to 200%), checks the NPV signs, and falls back to `[-0.5, 5.0]` if both bounds produce the same-sign NPV.
+5. NPV is computed as `Σ amounts[i] * (1 + rate/12)^(-monthFractions[i])`, with an exact pass-through for `monthFractions[i] == 0` (cash flows on the base date contribute at face value).
+6. Iterates until `high - low < TOLERANCE (1e-7)` or `abs(npvMid) < TOLERANCE`, returns `(low + high) / 2`, and the public method multiplies by 100 to return a percentage.
+
+`roundAPRToEighthBigDecimal(double apr)` divides by `0.125` with `RoundingMode.HALF_UP` and multiplies back — this is the Regulation Z "nearest 1/8%" rule. When exactly between two eighths the rule rounds up, which is what `HALF_UP` implements.
+
+=== Edge Cases and Gotchas
+
+* **Empty cash flows throw.** `calculateAPR()` guards against `cashFlows.isEmpty()` with `IllegalArgumentException`. The calculator is safe to construct and never call — just don't invoke `calculateAPR()` without at least one disbursement and one payment.
+* **Base date is `cashFlows.firstKey()`, not the disbursement date.** If you add a finance charge before the disbursement date (unusual but legal), that charge becomes `t = 0` and the disbursement gets a positive month fraction. The APR is still mathematically correct but the interpretation shifts — prefer merging all origination charges onto the disbursement date.
+* **Same-sign NPV at both bounds widens the bracket to `[-0.5, 5.0]`.** A negative-APR loan (e.g. heavily subsidized products where total payments are less than the disbursement) will land on a negative solution; callers that assert "APR > 0" must be explicit.
+* **Monthly compounding is hard-coded.** `calculateNPV` divides by 12. Weekly or biweekly products should not reuse `USAPRCalculator` — the returned APR will agree with Reg Z but will **not** match a weekly `ScheduledEngine`'s internal periodic rate. For non-monthly disclosures, either build a jurisdiction-specific calculator in a sibling subpackage (`apr/uk`, `apr/eu`) or use `com.timvero.loan.engine.util.APRCalculator`, which accepts an arbitrary period.
+* **`double` arithmetic internally.** The bisection runs on primitives for performance — not on `BigDecimal`. The `TOLERANCE = 1e-7` is the safety margin. Do not feed the result back into monetary math without rounding to an appropriate scale (`roundAPRToEighthBigDecimal` exists for exactly this reason).
+* **`Method_30E_360_ISDA` + `MONTHLY` grid is baked in.** If your product uses a different day-count method, the APR disclosure computed here may disagree with your engine's internal schedule by a few basis points. That disagreement is legally correct (Reg Z mandates the disclosure method) but must be communicated to customers — do not "reconcile" the two numbers.
+
+=== When to Use Which Calculator
+
+[cols="1,2", options="header"]
+|===
+|Calculator |Use when
+
+|`com.timvero.scheduled.apr.us.USAPRCalculator`
+|US disclosures (Truth in Lending / Regulation Z). Arbitrary disbursement + payment timelines, multiple fees, monthly compounding.
+
+|`com.timvero.loan.engine.util.APRCalculator`
+|Engine-internal reconciliation — verifying that your schedule's implicit periodic rate round-trips to the product's annual rate. Works with any period.
+|===
+
+[[scheduled-entities-deep-dive]]
+== Scheduled Entities — CreditCondition, PaymentSchedule, PaymentSegment
+
+The `com.timvero.scheduled.entity` package is the **stored** side of schedule generation. `CreditCondition` is an interface your condition entity implements; `PaymentSchedule` and `PaymentSegment` are concrete `@Entity` classes persisted as `credit_payment_schedule` / `credit_expected_payment`. Everything the engines produce lands here; everything the UI renders reads from here.
+
+=== `CreditCondition` — The Minimum Interface
+
+[source,java]
+----
+public interface CreditCondition {
+    MonetaryAmount getPrincipal();
+    String getScheduleEngineName();
+}
+----
+
+Two methods, one purpose: route the condition to the right engine. `getPrincipal()` is the opening principal `CreditScheduledService.getPaymentSchedule` passes to `engine.payments(...)`. `getScheduleEngineName()` is the Spring bean name lookup key. Everything else — rate, term, period, regular payment, day-count key, secured-offer link — lives on your subclass and is known only to the engine that declared `getConditionClass()` for that subclass.
+
+This is why `ScheduledEngine<C extends CreditCondition>` is generic. The service does `Map.get(name)` with raw types, then the engine's `payments(C, ...)` signature constrains the cast — a misconfigured `engineName` produces a `ClassCastException` at the first method call, not silent corruption.
+
+=== `PaymentSchedule` — The Aggregate Root
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_payment_schedule")
+public class PaymentSchedule extends BaseEntity<Long> {
+
+    @Column(name = "start_date", nullable = false)       private LocalDate startDate;
+    @Column(name = "end_date", nullable = false)         private LocalDate endDate;
+    @Column(name = "term", nullable = false)             private Integer term;
+    @Column(name = "currency", length = CURRENCY_LENGTH) private CurrencyUnit currency;
+    @Column(name = "total_amount",   ...)                private BigDecimal totalAmount;
+    @Column(name = "total_principal", ...)               private BigDecimal totalPrincipal;
+    @Column(name = "total_interest",  ...)               private BigDecimal totalInterest;
+
+    @OneToMany(cascade = CascadeType.ALL, fetch = FetchType.LAZY, mappedBy = "schedule")
+    @Fetch(FetchMode.SELECT) @MapKey(name = "date") @SortNatural
+    private SortedMap<LocalDate, PaymentSegment> payments;
+}
+----
+
+Key facts from the source:
+
+* **`payments` is a `SortedMap<LocalDate, PaymentSegment>`** — each segment keyed by its `date`. Duplicate dates in the constructor throw `duplicate date <date>` at `TreeMap.put(...)`. Engines cannot emit two rows on the same calendar day; collapse them before returning.
+* **Totals are stored, not derived.** `totalAmount`, `totalPrincipal`, `totalInterest` are columns. When you construct a `PaymentSchedule`, you pass them explicitly — the schedule does not recompute from segments. Mismatched totals will pass persistence but will be wrong on every report. `CreditScheduledService.createSchedule` computes them from the list; callers that bypass the service must too.
+* **Currency is stored on the schedule.** Every `PaymentSegment` must match via `MonetaryUtil.checkAmountParameter(totalAmount, payment.getCurrency())`. Mixed-currency segments throw at construction time.
+* **`getPayments()` returns an `unmodifiableNavigableMap`.** The first call lazily wraps the internal `SortedMap` in a new `TreeMap` + `unmodifiable` view and caches it on the transient field `agregatedPayments`. Reads are safe; mutation requires going through a fresh `PaymentSchedule`.
+* **`hashCode()` is cached (`hashFound` guard) and spans every field including segment contents.** Do not mutate a segment after attaching it to a schedule — the cached hash will be stale and equality comparisons go wrong silently.
+* **`equals(other)` compares segment lists in iteration order.** Because both sides are `TreeMap`-backed, order is date-ascending; the comparison is correct by construction as long as no one clones the map into a `LinkedHashMap`.
+
+=== `PaymentSegment` — The Row
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_expected_payment")
+public class PaymentSegment extends BaseEntity<Long> {
+
+    @Column(name = "date", nullable = false)
+    private LocalDate date;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "payment_schedule_id", nullable = false, updatable = false)
+    private PaymentSchedule schedule;
+
+    @Column(name = "currency", length = CURRENCY_LENGTH) private CurrencyUnit currency;
+    @Column(name = "amount",   ...)                      private BigDecimal amount;
+    @Column(name = "principal", ...)                     private BigDecimal principal;
+    @Column(name = "interest",  ...)                     private BigDecimal interest;
+    @Column(name = "remaining_principal", ...)           private BigDecimal remainingPrincipal;
+    @Column(name = "remaining_interest",  ...)           private BigDecimal remainingInterest;
+}
+----
+
+What the source tells you:
+
+* **`amount = principal + interest`** — computed in the constructor as `principal.add(interest)` and stored. The split cannot be recovered from `amount` alone; reports must read `principal` / `interest` separately.
+* **Any of `principal`, `interest`, `remainingPrincipal`, `remainingInterest` may be `null`.** The getters return `null` in that case (not zero). This lets engines emit "pure-remaining" probe rows (a row with only `remainingPrincipal` / `remainingInterest` set, no payment) if they need to mark a date for downstream logic.
+* **`getRemainingDebt()` handles all four null-combinations.** Returns `null` only if both remaining fields are null; otherwise it sums whichever are present. The last-segment invariant (`last.getRemainingDebt().isZero()`) therefore relies on emitting **at least one** of the remaining fields on the final row.
+* **`@JoinColumn(updatable = false)`** — once attached to a schedule, a segment cannot be re-parented. Move a segment by cloning it into a new `PaymentSchedule` constructor call.
+* **`setSchedule(...)` is package-private.** The schedule wires itself into each segment during its constructor. Never call it from outside the package; it exists exclusively for the `PaymentSchedule` <-> `PaymentSegment` bidirectional link.
+
+=== The Invariant Chain
+
+Putting it together, an engine that returns a valid schedule satisfies every one of these:
+
+. Segments are monotonically non-descending in date (`TreeMap` enforces ordering; duplicates throw).
+. Every segment's currency matches the schedule's currency (`MonetaryUtil.checkAmountParameter`).
+. `totalPrincipal = Σ segment.principal`; `totalInterest = Σ segment.interest`; `totalAmount = totalPrincipal + totalInterest` (the service computes these from the list).
+. The last segment's `remainingDebt.isZero()` — enforced in `CreditScheduledService.createSchedule`.
+. `startDate <= first.date` and `last.date <= endDate` (the service passes `startDate` in; `endDate` is derived from `last.date`).
+
+Engines that pass all five round-trip against `AccrualEngine` on any of the shipped `DayCountMethod` implementations. Engines that skip one will usually show up in reconciliation as "schedule total does not match sum of segments" or "remaining debt after last payment" alerts.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Declare `@Service` with an explicit name** — `@Service("MyEngine")`, and expose the string as `public static final String NAME`. Do not rely on class-name-derived bean names; the product's `engineName` column stores the string, so refactoring the class name breaks every credit referencing it.
+* {ok} **Use `CreditCalculatorUtils.calcRangeAccural(...)`** — the rounding rules there match `RangeBasedAccrualEngine`. Hand-rolling the math risks schedule/accrual drift.
+* {ok} **Make `CreditCondition` entities `@Immutable`** — once an offer is accepted, the condition is part of the contract; mutating it silently corrupts all downstream calculations.
+* {ok} **Keep engines pure** — no entity manager, no repository. Everything the engine needs should be on the condition argument. Pure engines are unit-testable and re-runnable.
+* {ok} **Assert the last segment clears the balance** — `remainingDebt.isZero()` inside the engine, not only in the service layer. Fail fast in the right place.
+* {ok} **Share `DayCountMethod` beans between schedule and accrual** — inject the same `Map<String, DayCountMethod>` on both sides; pick the method by product-configured key.
+* {ok} **Register accrual engines for each account** — one for `INTEREST`, one for `PENALTY`, one for `LATE_FEE`. The framework sums them. Keep each engine single-purpose.
+* {ok} **Extend `RangeBasedAccrualEngine` for variable-rate / variable-basis runtime** — do not hand-roll the range merging; the base class has it right.
+* {ok} **Call `CreditCalculationService.extendCredit(...)` for previews** — it never writes, so it is safe to call inside a read-only request.
+* {ok} **Use `@Scheduled` + `@SchedulerLock` for recalculation** — the ShedLock pattern used by `CreditCalculationTask` is the platform's canonical cluster-safe job.
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Mutating the condition after offer acceptance** — voids the contract audit trail and desynchronizes schedule from actual terms. Create a new condition instead (and a new credit, if already disbursed).
+* {bad} **Reimplementing interest math with `double`** — rounding errors compound over a 60-month schedule. Always go through `BigDecimal` / `MonetaryAmount` / `BigFraction`.
+* {bad} **Using Spring's default bean naming for engines** — the default name (`"myEngine"`, lower-camel of the class) is a refactoring landmine. Always declare `@Service("ExplicitName")`.
+* {bad} **Building schedules inside the web request thread with `calculate(...)`** — that mutates the credit. Use `extendCredit(...)` for previews; reserve `calculate(...)` for state-changing events.
+* {bad} **Calling the engine directly from a controller** — always go through `CreditScheduledService` so the last-segment invariant is checked and the `PaymentSchedule` aggregate is built correctly.
+* {bad} **Registering multiple `ScheduledEngine` beans with the same name** — Spring will fail on startup, but even worse, partial fixes (one `@Service("X")` and one `@Bean("X")`) will silently pick one and hide the other.
+* {bad} **Skipping the `CreditCalculationRegister` coalescing** — calling `intrenalService._calculate(...)` directly from handlers bypasses the merge and locks; you will get race conditions under load.
+* {bad} **Writing accrual math in a `CreditOperationHandler`** — handlers mutate state based on operations, not time. Put time-based math in an `AccrualEngine` subclass.
+* {bad} **Relying on operation ordering when the dates collide** — if two operations share a date, the `OperationProcessor` sorts by `CreditOperation.compareTo`, not by insertion order. Make your `CreditOperation` ordering explicit.
+* {bad} **Storing calculated schedules without `PaymentSchedule`** — the aggregate enforces currency consistency and totals; loose `PaymentSegment` rows will not roll up correctly in reports.
+* {bad} **Mixing day-count methods between schedule and accrual** — the schedule uses one `DayCountMethod` bean, the runtime engine uses another, and every month the two disagree by a day or two. Inject the same `Map<String, DayCountMethod>` on both sides and resolve by the same product-configured key.
+* {bad} **Passing a `MONTHLY` `PaymentGrid` to `Method_ACT_ACT_ICMA` for a semi-annual bond** — `grid.getYearPeriodCount()` becomes 12 and the fraction is off by a factor of 6. The grid's `period` must match the instrument's coupon frequency.
+* {bad} **Using `double` or `BigDecimal(days / 360.0)` instead of `BigFraction`** — `DayCountMethod.fractionOfYear` returns `BigFraction` precisely so ratios like `29/366` stay exact. Round once, at the final `calcRangeAccural`, not at every intermediate step.
+* {bad} **Reusing `USAPRCalculator` for non-monthly products** — monthly compounding is hard-coded. Weekly / biweekly disclosures need their own calculator or the generic `com.timvero.loan.engine.util.APRCalculator`.
+* {bad} **Mutating a `PaymentSegment` after it is attached to a `PaymentSchedule`** — `PaymentSchedule.hashCode()` caches via `hashFound`; stale hashes silently break equality and map lookups.
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Engine registered as `@Service("ExplicitName")` with a matching `public static final String NAME` constant
+* {todo} Condition entity implements `CreditCondition` and is `@Immutable`
+* {todo} Condition carries principal, rate, period, term, regular payment, and day-count method key
+* {todo} Engine returns a list whose last `PaymentSegment` has `remainingDebt.isZero()`
+* {todo} Unit test covers standard-term, short-term, and edge-case (1-period, grace period, odd-day-of-month) schedules
+* {todo} Product edit form exposes `scheduledService.getScheduledEngineKeys()` as a dropdown
+* {todo} `CreditScheduledService` bean active (`@ConditionalOnBean(ScheduledEngine.class)` requires at least one engine)
+* {todo} At least one `AccrualEngine` registered for interest; additional engines for penalty/fees as needed
+* {todo} `LoanEngine` bean configured (subclass `BasicLoanEngine` with the right initial `CreditStatus`)
+* {todo} Payment handler subclass of `CreditPaymentOperationHandler` with explicit repayment order and overpayment account
+* {todo} `CreditCalculationTask` cron configured via `credit.calculation.cron` property
+* {todo} `@SchedulerLock` enabled (Shedlock configured against the database/Redis)
+* {todo} Event listeners handle `CreditSnapshotChangeEvent`, `CreditStatusChangeEvent`, `CreditCalculationDateChangeEvent` as needed
+* {todo} Day-count method beans registered for every method the product catalog uses
+* {todo} `LoanRateService` expression tested against every rate on the variable-rate curve before activation
+* {todo} Variable-rate engines extend `RangeBasedAccrualEngine` and share the rate curve with schedule generation
+* {todo} Load test validates `CreditCalculationRegister` coalescing under concurrent operation creation
+* {todo} Audit trail verified: `CreditOperationDistribution` rows round-trip to the computed `Debt`
+* {todo} Every `DayCountMethod` referenced by the product catalog has a matching `@Component(NAME)` bean resolvable by `Map<String, DayCountMethod>` injection
+* {todo} For `Method_ACT_ACT_ICMA` products, the `PaymentGrid.period` matches the instrument's coupon frequency (not the engine's internal iteration period)
+* {todo} Jurisdiction-specific APR calculator selected (`USAPRCalculator` for US / Reg Z; generic `APRCalculator` for others) and disclosure output rounded per regulation (`roundAPRToEighthBigDecimal` for Reg Z)
+* {todo} Last-segment invariant (`remainingDebt.isZero()`) asserted in engine unit tests for standard, short-term, grace-period, and odd-day-of-month schedules
+* {todo} Schedule totals (`totalAmount`, `totalPrincipal`, `totalInterest`) cross-checked against the sum of emitted `PaymentSegment` rows before persistence
+
+---
+
+**Related:** <<credit-product>>, <<offer-engine>>, <<credit-management>>, <<payment-transactions>>, <<operations>>, <<entity-module-sdk-reference-hierarchy>>
+
+**Next:** <<credit-servicing>>, <<credit-management>>

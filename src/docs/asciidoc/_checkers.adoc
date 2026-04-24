@@ -1,3 +1,6 @@
+[[checkers]]
+[[entity-checkers]]
+[[entity-checkers-setup-usage]]
 = Entity Checkers — setup & usage
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -43,7 +46,7 @@ Each checker has three core parts:
 |`entityChange`
 |`Class<T> entityClass` — entity being monitored +
 `Function<T,E> mapper` — map changed entity to target
-|Create a listener for changes on a *different* type. See <<using-entitychange-method>>.
+|Create a listener for changes on a *different* type.
 
 |`entityChange`
 |_(none)_

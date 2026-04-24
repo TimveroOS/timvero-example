@@ -1,0 +1,359 @@
+[[catalog]]
+= Catalog — Reference Data Entities with Soft-Disable
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The catalog module (`com.timvero.structure.catalog`) is a thin scaffold for **reference data** — lookup tables, classifiers, product-configuration entries, anything admins maintain but users only read. It gives you a `@MappedSuperclass` base with a built-in `active` flag, a generic CRUD service that works across any subclass, a MapStruct DTO-mapper contract, and a reusable exporter base that plugs into the SDK's import/export pipeline. Four classes, no runtime magic, no subpackages.
+
+== What You Need to Know
+
+The module has four pieces — each independent, combine as needed:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |Role |Key type
+
+|**Base class**
+|`@MappedSuperclass` with an `active` boolean and Envers auditing. Subclasses declare their own `@Table` and fields.
+|`CatalogEntity`
+
+|**Generic service**
+|`find` / `persist` / `merge` / `enable` / `disable` / `listAll` / `listActive` across any `CatalogEntity` subclass via a `Class<E>` parameter.
+|`CatalogService`
+
+|**Mapper contract**
+|MapStruct interface pairing `toEntity(dto)` and `toForm(entity)` with `active` excluded from the inbound mapping.
+|`CatalogEntityToDtoMapper`
+
+|**Exporter base**
+|`EntityExporter` implementation — loads active keys, maps to DTO for export, reconstructs on import.
+|`CatalogEntityExporter`
+|===
+
+Key characteristics:
+
+- **Soft-disable, not soft-delete** — `active = false` removes the row from `listActive()` but leaves history, FK references, and Envers revisions intact. Enforced by `@Undeletable(propertyName = "active")`.
+- **No repository required** — `CatalogService` uses `EntityManager` directly with JPA Criteria queries. One service handles every catalog entity in the project.
+- **Comparable-aware sort** — if the subclass implements `Comparable`, `listAll` / `listActive` sort by natural order; otherwise the DB-returned order is kept.
+- **Generic-by-reflection exporter** — `CatalogEntityExporter` resolves its `E`/`D` type parameters at construction via `ResolvableType`, so a subclass with no overrides is a complete exporter.
+- **Audited by default** — `@Audited` on the base means every catalog change produces an Envers revision; pair with <<audit-module-sdk-reference-internals,the audit module>> for history UIs.
+
+== CatalogEntity — The Base Class
+
+A minimal `@MappedSuperclass` — your entity adds its own table, columns, and business methods:
+
+[source,java]
+----
+@MappedSuperclass
+@Undeletable(propertyName = CatalogEntity_.ACTIVE)                     // <1>
+@EntityListeners(AuditingEntityListener.class)
+@Audited                                                                // <2>
+public abstract class CatalogEntity extends AbstractPersistable<UUID> {
+
+    @Column(name = "active", nullable = false)
+    private boolean active = true;                                      // <3>
+
+    public boolean isActive() {
+        return active;
+    }
+
+    void setActive(boolean active) {                                    // <4>
+        this.active = active;
+    }
+
+    @Override
+    protected void setId(UUID id) {
+        super.setId(id);
+    }
+}
+----
+<1> `@Undeletable` is an SDK marker: generic "delete" endpoints refuse to hard-delete the row; they flip `active = false` instead. The `propertyName` tells the interceptor which column carries the flag.
+<2> Envers tracks every change; subclasses get history for free. Make sure the SDK's `_AUD` migrations run.
+<3> `active` defaults to `true` — new rows are visible in `listActive()` without extra code.
+<4> **Package-private setter** — callers cannot flip `active` directly. Use `CatalogService.enable` / `disable`, which runs inside a managed transaction.
+
+Typical subclass:
+
+[source,java]
+----
+@Entity
+@Table(name = "loan_purpose")
+@Audited
+public class LoanPurpose extends CatalogEntity implements Comparable<LoanPurpose> {
+
+    @Column(nullable = false)
+    private String code;
+
+    @Column(nullable = false)
+    private String displayedName;
+
+    // getters, setters, business methods
+
+    @Override
+    public int compareTo(LoanPurpose other) {
+        return this.code.compareTo(other.code);
+    }
+}
+----
+
+Implementing `Comparable` is optional but recommended — `CatalogService.listAll` / `listActive` will apply natural-order sorting automatically. Without it the service returns the list in the order the DB chose.
+
+== CatalogService — Generic CRUD
+
+A single `@Service` bean that works for every `CatalogEntity` subclass in the project. No repository per entity, no boilerplate.
+
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`find(Class<E>, UUID)`
+|Direct `EntityManager.find` — returns `null` if missing. Not transactional; caller controls the context.
+
+|`persist(E)`
+|`@Transactional` insert of a new entity. `active` stays at its default (`true`) unless the caller set it.
+
+|`merge(Class<E>, UUID, ValidateConsumer<E>)`
+|`@Transactional`. Loads the entity, applies the validating callback, returns the merged result. Throws `ValidationException` if the callback rejects the input.
+
+|`enable(Class<E>, UUID)` / `disable(Class<E>, UUID)`
+|`@Transactional`. Flips the `active` flag via the package-private setter; automatic dirty-check commits the change.
+
+|`listAll(Class<E>)`
+|`@Transactional`. All rows, active and inactive. Sorted via `Comparable` if implemented.
+
+|`listActive(Class<E>)`
+|`@Transactional`. Only `active = true` rows. Same sort rules.
+|===
+
+The `ValidateConsumer` hook lets `merge` reject updates without duplicating try/catch at every call site:
+
+[source,java]
+----
+@FunctionalInterface
+public static interface ValidateConsumer<T> {
+    void accept(T t) throws ValidationException;
+}
+----
+
+Typical admin-controller usage:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/admin/loan-purpose")
+public class LoanPurposeAdminController {
+
+    @Autowired private CatalogService catalogService;
+    @Autowired private LoanPurposeMapper mapper;
+
+    @PostMapping("/create")
+    public String create(@Valid LoanPurposeForm form) {
+        LoanPurpose entity = mapper.toEntity(form);
+        catalogService.persist(entity);
+        return "redirect:/admin/loan-purpose";
+    }
+
+    @PostMapping("/{id}/edit")
+    public String edit(@PathVariable UUID id, @Valid LoanPurposeForm form) throws ValidationException {
+        catalogService.merge(LoanPurpose.class, id, entity -> {
+            if (!entity.getCode().equals(form.getCode())) {
+                throw new ValidationException("code", "loan-purpose.code.immutable");
+            }
+            entity.setDisplayedName(form.getDisplayedName());
+        });
+        return "redirect:/admin/loan-purpose";
+    }
+
+    @PostMapping("/{id}/disable")
+    public String disable(@PathVariable UUID id) {
+        catalogService.disable(LoanPurpose.class, id);
+        return "redirect:/admin/loan-purpose";
+    }
+}
+----
+
+[NOTE]
+====
+**`find` is not `@Transactional`.** Wrap it in your own transaction (or call it from an already-transactional controller method) when you plan to access lazy associations — otherwise a `LazyInitializationException` fires on the first `.get...()` call. The write methods (`persist`, `merge`, `enable`, `disable`) each open their own TX and are safe to call standalone.
+====
+
+== CatalogEntityToDtoMapper — The DTO Contract
+
+A two-way MapStruct interface your project-level mapper extends:
+
+[source,java]
+----
+public interface CatalogEntityToDtoMapper<E extends CatalogEntity, D> {
+
+    @Mapping(target = "active", ignore = true)           // <1>
+    E toEntity(D form);
+
+    @InheritInverseConfiguration                          // <2>
+    D toForm(E entity);
+}
+----
+<1> **`active` is deliberately excluded from the inbound mapping.** Enable/disable is a separate action (`CatalogService.enable` / `disable`); a form that could flip `active` would sidestep audit expectations.
+<2> The reverse mapping inherits the field-name correspondences automatically — you only write them once on `toEntity`.
+
+Project-level implementation:
+
+[source,java]
+----
+@Mapper(componentModel = "spring")
+public interface LoanPurposeMapper
+        extends CatalogEntityToDtoMapper<LoanPurpose, LoanPurposeForm> {
+    // MapStruct generates both directions; override methods only for custom field mappings
+}
+----
+
+The generated bean is a `@Component`; inject it directly into your controllers, services, and into `CatalogEntityExporter` subclasses (see below).
+
+== CatalogEntityExporter — Import/Export Integration
+
+A `@MappedSuperclass`-style base for the SDK's `EntityExporter` pipeline: wire a concrete subclass as a `@Component`, and the entity participates in bulk exports/imports without further code.
+
+[source,java]
+----
+public abstract class CatalogEntityExporter<E extends CatalogEntity, D> implements EntityExporter<D> {
+
+    @Autowired private EntityManager entityManager;
+    @Autowired private CatalogEntityToDtoMapper<E, D> mapper;            // <1>
+
+    private final Class<E> entityClass;
+    private final Class<D> dtoClass;
+
+    public CatalogEntityExporter() {
+        ResolvableType resolvableType = ResolvableType.forClass(CatalogEntityExporter.class, this.getClass());
+        this.entityClass = (Class<E>) resolvableType.getGeneric(0).resolve();   // <2>
+        this.dtoClass   = (Class<D>) resolvableType.getGeneric(1).resolve();
+    }
+
+    @Override public Class<D> getDTOClass() { return dtoClass; }
+
+    @Override
+    public Iterable<UUID> loadKeys() {
+        // SELECT id FROM <table> WHERE active = true                    // <3>
+    }
+
+    @Override
+    public D load(UUID key) {
+        return mapper.toForm(entityManager.find(entityClass, key));
+    }
+
+    @Override
+    @Transactional
+    public void save(UUID key, D dto) {
+        E entity = entityManager.find(entityClass, key);
+        if (entity == null) {                                             // <4>
+            entity = mapper.toEntity(dto);
+            entity.setId(key);
+            try {
+                entityManager.persist(entity);
+            } catch (ConstraintViolationException e) {
+                log.debug("Ignore import of ...: " + e.getMessage());    // <5>
+            }
+        }
+    }
+}
+----
+<1> The mapper is injected by type — Spring resolves `CatalogEntityToDtoMapper<E, D>` to the project-level MapStruct bean that matches the subclass's concrete type parameters.
+<2> **Zero-arg constructor resolves generics at runtime** via `ResolvableType`. A subclass that only declares its type parameters (see below) is a complete exporter — no overrides required.
+<3> Only **active** rows are exported. Disabled entries don't travel to other environments — that's by design; they're considered environment-local state.
+<4> **Insert-only on import.** If a row with the same id already exists on the target, it is left alone — existing rows aren't overwritten. Reimporting a catalog file is therefore idempotent and safe.
+<5> Constraint-violation logging (unique-constraint clashes on business keys, for example) is **silent** at INFO/WARN — demoted to DEBUG. Importing into a populated DB is expected to hit these.
+
+A concrete exporter is empty:
+
+[source,java]
+----
+@Component
+public class LoanPurposeExporter extends CatalogEntityExporter<LoanPurpose, LoanPurposeForm> {
+    // nothing else — generics drive the behavior
+}
+----
+
+The SDK's `EntityExporter` pipeline picks the bean up, uses `getDTOClass()` for format routing (JSON / Excel / whatever the project configures), calls `loadKeys()` + `load(key)` on export, and `save(key, dto)` on import.
+
+== Advanced Patterns
+
+=== Controller on Top of `CatalogService`
+
+A single generic admin template per entity is practical because the service is type-agnostic. A project-specific base controller can carry the boilerplate:
+
+[source,java]
+----
+public abstract class CatalogAdminController<E extends CatalogEntity, D> {
+
+    @Autowired protected CatalogService catalogService;
+
+    protected abstract Class<E> entityClass();
+    protected abstract CatalogEntityToDtoMapper<E, D> mapper();
+
+    @GetMapping("/list")
+    public String list(Model model) {
+        model.addAttribute("items", catalogService.listAll(entityClass()));
+        return "admin/catalog/list";
+    }
+    // edit, disable, enable — all delegating to catalogService
+}
+----
+
+Concrete subclasses only declare the entity and mapper; the template is shared.
+
+=== Composing With List Filters
+
+For larger catalog tables (hundreds of entries, multiple columns), `listAll` is too coarse. Pair the entity with an `@Filter`-driven list controller — see <<list-filters-annotation-driven-jpa-query-dsl>> for the DSL. `CatalogService.listActive` is still useful for select-box options even when the main admin page uses filters.
+
+=== Read-Only Caching
+
+Reference data is a natural fit for second-level cache or application-level memoization. Since the base class is `@Audited` and mutations flow through `CatalogService`, you can invalidate on the `@Transactional` method exit. Keep TTLs short enough that a production enable/disable propagates — a minute is usually fine; never cache indefinitely.
+
+=== Skipping the Exporter
+
+`CatalogEntityExporter` is optional. If a catalog is environment-local (e.g., feature flags), just don't declare an exporter bean — the entity still works through `CatalogService`, but it won't be part of the project's export bundle.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `CatalogEntity` for reference data only** — things admins edit and business code reads; not for user-generated content, not for transactional entities
+* {ok} **Implement `Comparable` when display order matters** — `listAll` / `listActive` pick it up automatically; avoids sorting in every template
+* {ok} **Expose forms via the MapStruct mapper, not the entity** — keeps `active` out of form binding so users can't flip it by tampering with inputs (see <<form-classes-setup-and-usage>>)
+* {ok} **Prefer `disable` over `DELETE`** — `@Undeletable` enforces it at the endpoint level; historical references stay valid and Envers keeps the audit trail coherent
+* {ok} **Declare exporters as `@Component` with empty bodies** — the base class resolves generics via reflection; writing methods adds noise and risks drift
+* {ok} **Register a reverse-filter on `active` for admin views** — default to `active = true`; add an "include disabled" checkbox so admins can re-enable entries without SQL
+* {ok} **Seed data via Flyway/Liquibase, not via `CatalogEntityExporter` import** — exporters are for environment promotion, migrations are for baseline
+* {ok} **Keep `CatalogService.merge`'s validation callback total** — throw `ValidationException` for every rule; the callback is the single enforcement point for edit-time invariants
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Exposing `CatalogEntity.setActive` to templates or form binders** — the setter is package-private for a reason; reflection-based binders (Spring's `DataBinder`) would still reach it unless `active` is explicitly blacklisted in the `@InitBinder`
+* {bad} **Hard-deleting rows via `entityManager.remove`** — FKs from transactional entities break, Envers history becomes stranded, `@Undeletable` assumes it won't happen
+* {bad} **Mapping `active` in the DTO** — contradicts `@Mapping(target = "active", ignore = true)`; a save via `merge(form)` would silently flip the flag
+* {bad} **Using `CatalogService` for non-catalog entities** — the service has no ownership, no tenant filter, no soft-audit. It is trivially generic because reference data is trivially generic
+* {bad} **Relying on `listAll` in hot-path user queries** — no pagination, no filter; scans the whole table. Use a project-specific repository + `@Filter` instead
+* {bad} **Overriding `CatalogEntityExporter.save` to do "upsert"** — the insert-only behavior is what makes re-imports idempotent; upsert silently overwrites production fixes
+* {bad} **Omitting `@Audited` on catalog subclasses** — the base class is `@Audited`, but Envers requires subclasses to be audited explicitly too; without it, no revisions are written and the audit story is broken
+* {bad} **Calling `CatalogService.find` from a non-transactional scheduler to read lazy associations** — fails with `LazyInitializationException`; wrap in `@Transactional(readOnly = true)`
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every catalog entity extends `CatalogEntity`, declares `@Table`, and has `@Audited` on the subclass
+* {todo} Every entity has a corresponding `CatalogEntityToDtoMapper` with `componentModel = "spring"` on the `@Mapper`
+* {todo} Every exportable catalog has a `@Component`-annotated `CatalogEntityExporter` subclass registered
+* {todo} `_AUD` tables exist for each catalog entity (check Flyway/Liquibase migrations)
+* {todo} Admin UI uses `CatalogService.disable` (not an HTTP `DELETE` mapped to `remove`)
+* {todo} Form classes omit the `active` field — or, if present, are cleared in `@InitBinder`
+* {todo} Foreign keys from business tables to catalog tables are **not** `ON DELETE CASCADE` — deletion shouldn't be possible, so cascade is a trap
+* {todo} `listAll` / `listActive` callers understand the Comparable-based sort (either implement `Comparable` or document the lack of order)
+* {todo} Export bundle produced on the source environment imports cleanly into a staging DB — re-running the import does nothing (idempotency check)
+* {todo} Disabled catalog entries render distinctly in the UI (gray / strikethrough) so admins don't accidentally recreate them
+* {todo} Audit / history tab on catalog detail pages surfaces `active` toggles — users can answer "who disabled this?"
+* {todo} Integration tests cover: create → disable → listActive excludes → enable → listActive includes
+
+---
+
+**Related:** <<entity-module-sdk-reference-hierarchy>>, <<list-filters-annotation-driven-jpa-query-dsl>>, <<form-classes-setup-and-usage>>, <<audit-module-sdk-reference-internals>>
+
+**Next:** <<form-classes-setup-and-usage>>, <<list-filters-annotation-driven-jpa-query-dsl>>

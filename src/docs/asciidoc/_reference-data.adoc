@@ -1,0 +1,542 @@
+[[reference-data]]
+= Reference Data — amounts and rates
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The reference-data subsystem (`com.timvero.loan.reference_amount` + `com.timvero.loan.reference_rate`) is the SDK layer that stores time-series market inputs — interest-rate benchmarks (SOFR, PRIME, EURIBOR, …) and monetary reference values (daily FX quotes, regulated minimum amounts, index values) — and exposes them to the product / offer / servicing engines. Both subsystems are backed by a shared `BaseReference` mapped superclass, registered as admin catalogs, `@Audited`, and exported via the `CatalogEntityExporter` pipeline.
+
+This guide documents the SDK internals of both subsystems — the entity model, the service-level time-series queries, the admin catalog wiring, and the SpEL validator that gates product rate expressions. For the product-facing tutorial (writing rate expressions, evaluating them during servicing) see <<credit-product>> — this guide is where those reference values are actually managed.
+
+== What You Need to Know
+
+The reference-data subsystem is **two parallel catalogs** that share a common base. Skip past a row only after you're sure which catalog applies to your use case:
+
+[cols="1,2,3,2", options="header"]
+|===
+|Subsystem |Stores |Primary key on ...date |Public API
+
+|**`reference_amount`**
+|A time series of `(value, currency, date)` tuples. A single row per date — there is no abbreviation because the catalog represents **one** monetary series (typically the project's active reference amount, e.g. a regulatory minimum or a daily FX quote).
+|`UniqueConstraint(date)` — at most one amount per calendar date.
+|`ReferenceAmountController` admin catalog + `ReferenceAmountExporter` import/export. No runtime service — consumers read the entity directly.
+
+|**`reference_rate`**
+|A time series of `(abbreviation, description, value, date)` tuples. Multiple rates coexist; each rate (SOFR, PRIME, EURIBOR, …) is identified by `abbreviation` and evolves over time via dated rows.
+|`UniqueConstraint(abbreviation, date)` — at most one row per rate per day.
+|`ReferenceRateService.getOnDate()` / `getOnRangeChanges()` + `ReferenceRateController` admin catalog + `ReferenceRateExporter` import/export + `@LoanRateExpression` Bean Validation.
+|===
+
+Key characteristics:
+
+- **Time-series, not snapshots** — neither entity is "updated"; you **insert a new row** for a new date. Historical rows stay forever, so schedule engines can price credits opened in 2019 with 2019 SOFR values.
+- **Soft-delete only via `active`** — `BaseReference` extends `CatalogEntity`, so toggling `active=false` hides a row from the admin list and from `findAllByActiveTrue()` but keeps it in the audit history.
+- **Second-level cache on rates** — `ReferenceRateRepository.findAllByActiveTrue()` is annotated `@QueryHint(HINT_CACHEABLE)`. This is the hot path used by every rate evaluation in `LoanRateService`; entries are invalidated by Hibernate on any write to `reference_rate`.
+- **`CurrencyUnit` (JSR-354) column on amounts** — rates are currency-agnostic (they are percentages), amounts are not. Admin UI restricts the currency picker to `${application.available.currency}`.
+- **Shared `BaseReferencePair` helper** — a lightweight record that holds `(current, next)` references; used by range queries to hand out "value from / to" windows without forcing the caller to compute adjacency.
+
+== Architecture Overview
+
+[source]
+----
+                ┌──────────────────────────────────────────────┐
+  Admin UI      │  /reference-rate     /reference-amount        │
+                │  CatalogController<R, F>   (both)             │
+                └────────────────┬─────────────────────────────┘
+                                 │ form ← MapStruct → entity
+                                 ▼
+                ┌──────────────────────────────────────────────┐
+  Persistence   │  reference_rate        reference_amount       │
+                │  (abbrev, date, val)   (currency, date, val)  │
+                │  @Audited              @Audited               │
+                │  UK(abbrev, date)      UK(date)               │
+                └────────────────┬─────────────────────────────┘
+                                 │
+                  ┌──────────────┴──────────────┐
+                  ▼                             ▼
+     ┌──────────────────────────┐  ┌──────────────────────────┐
+     │ ReferenceRateService     │  │ (no dedicated service)    │
+     │  getOnDate(date)         │  │ direct JpaRepository or   │
+     │  getOnRangeChanges(f, t) │  │ project-level query       │
+     │  @Cacheable query        │  │                          │
+     └──────────────┬───────────┘  └──────────────────────────┘
+                    │                         │
+                    ▼                         ▼
+     ┌──────────────────────────┐  ┌──────────────────────────┐
+     │ LoanRateService (xtns/   │  │ Product / offer / pricing│
+     │ product.rate) resolves   │  │ code that needs a dated  │
+     │ SOFR / PRIME variables   │  │ monetary index value     │
+     │ in SpEL expressions      │  │                          │
+     └──────────────┬───────────┘  └──────────────────────────┘
+                    │
+                    ▼
+     ┌──────────────────────────┐
+     │ @LoanRateExpression JSR- │
+     │ 303 validator            │
+     │  → compile-time check of │
+     │    product rate strings  │
+     └──────────────────────────┘
+
+                      -- import / export pipeline --
+     ┌──────────────────────────┐  ┌──────────────────────────┐
+     │ ReferenceRateExporter    │  │ ReferenceAmountExporter  │
+     │  @Order(2100) v=2        │  │  @Order(2000) v=2        │
+     └──────────────────────────┘  └──────────────────────────┘
+----
+
+== Shared Base — `BaseReference`
+
+Both entities extend the same `@MappedSuperclass`. Knowing what it contributes saves looking at the per-entity classes twice.
+
+[source,java]
+----
+@MappedSuperclass
+@Audited
+public abstract class BaseReference extends CatalogEntity {
+
+    public static final String DATE = "date";
+
+    @Column(name = "index", nullable = false, columnDefinition = NUMERIC)    // <1>
+    private BigDecimal value;
+
+    @Column(name = DATE)                                                     // <2>
+    private LocalDate date;
+
+    /* getters / setters */
+}
+----
+<1> Column is named `index` (SQL keyword — hence the explicit `@Column(name = "index")`) and uses the project-wide `NUMERIC` column definition (`numeric(19,4)` by default). Applies to both rates and amounts.
+<2> The `DATE` constant is what `@UniqueConstraint` references on both subclasses — keeps the table DDL synced with the attribute name.
+
+`CatalogEntity` itself contributes:
+
+[cols="1,3", options="header"]
+|===
+|Feature |Effect
+
+|UUID `id` via `@GeneratedValue`
+|Every reference row gets a stable UUID — safe for exports and cross-environment imports.
+
+|`active` boolean + soft-delete
+|Admin "delete" sets `active=false`; `findAllByActiveTrue()` filters. Audit trail is preserved.
+
+|`createdAt` / `createdBy` / `updatedAt` / `updatedBy`
+|JPA auditing fields — populated automatically by the auditing listener registered on `AbstractAuditable`.
+
+|Included in Envers
+|`@Audited` on `BaseReference` cascades to every concrete subclass. Every insert / update / soft-delete of a reference row creates a row in `aud_reference_rate` / `aud_reference_amount`. See <<audit-module>>.
+|===
+
+=== BaseReferencePair
+
+A tiny two-field helper type used by consumers of the range query — holds `(current, next)` so rate/amount consumers can render "value from X until Y" windows without recomputing adjacencies.
+
+[source,java]
+----
+public class BaseReferencePair {
+    private BaseReference current;
+    private BaseReference next;
+
+    public BaseReferencePair(BaseReference current, BaseReference next) { /* ... */ }
+    public BaseReference getCurrent() { return current; }
+    public BaseReference getNext()    { return next; }
+}
+----
+
+NOTE: The type is parameter-free — it holds the abstract `BaseReference`, so callers cast or switch on the concrete subclass. In practice project code does `(ReferenceRate) pair.getCurrent()` right after obtaining it. If you need a typed version, subclass `BaseReferencePair` in your app and add generics.
+
+== Reference Rates
+
+=== Entity — `ReferenceRate`
+
+[source,java]
+----
+@Entity
+@Table(name = "reference_rate",
+    uniqueConstraints = {
+        @UniqueConstraint(columnNames = {ReferenceRate.ABBREVIATION, BaseReference.DATE},
+            name = ReferenceRate.ABBREVIATION_DATE_UNIQUE_CONSTRAINT)})
+@Audited
+public class ReferenceRate extends BaseReference implements Comparable<ReferenceRate> {
+
+    public static final String ABBREVIATION = "abbreviation";
+    public static final String ABBREVIATION_DATE_UNIQUE_CONSTRAINT =
+        "UK_reference_rate_abbreviation_date";
+
+    public static final Comparator<ReferenceRate> COMPARATOR =
+        Comparator.comparing(ReferenceRate::getAbbreviation, String.CASE_INSENSITIVE_ORDER)    // <1>
+            .thenComparing(ReferenceRate::getDate,  Comparator.nullsLast(Comparator.naturalOrder()))
+            .thenComparing(ReferenceRate::getId,    Comparator.nullsLast(Comparator.naturalOrder()));
+
+    @Column(name = ABBREVIATION, nullable = false) private String abbreviation;    // <2>
+    @Column(nullable = false)                      private String description;     // <3>
+}
+----
+<1> Case-insensitive sort on `abbreviation` — `sofr`, `SOFR`, `Sofr` land adjacent in the admin list.
+<2> `abbreviation` is the SpEL variable name injected into product rate expressions. `"SOFR"` in the DB becomes `#SOFR` in a rate expression. Case matters for SpEL but not for the unique constraint — conventionally stored uppercase.
+<3> `description` is a free-text label shown in admin lists — "Secured Overnight Financing Rate" — no behavioural meaning.
+
+=== Repository + Caching
+
+[source,java]
+----
+public interface ReferenceRateRepository extends JpaRepository<ReferenceRate, UUID> {
+
+    @QueryHints({ @QueryHint(name = HibernateHints.HINT_CACHEABLE, value = "true") })
+    List<ReferenceRate> findAllByActiveTrue();
+}
+----
+
+Characteristics:
+
+- **Single query** — returns **every active rate row across all abbreviations and all dates**. The service filters by date in memory (see below).
+- **Second-level cache** — `HINT_CACHEABLE = true` enables Hibernate L2 caching for this exact query. On a warm cache, rate evaluation is a pure in-memory map lookup.
+- **Cache invalidation** — Hibernate invalidates the query cache region on any write to `reference_rate`. No manual eviction required.
+- **Scales to thousands of rows** — a ten-year SOFR history is ~2 600 rows; loading them all is cheap. If your project ingests hourly rates rather than daily, replace this query with a date-bounded one.
+
+=== Service — Time-Series Queries
+
+`ReferenceRateService` is the **only** runtime entry point — product code must not use the repository directly.
+
+[source,java]
+----
+@Service
+public class ReferenceRateService {
+    private final Collector<ReferenceRate, ?, Map<String, ReferenceRate>> toMap = Collectors.toMap(
+        ReferenceRate::getAbbreviation,
+        Function.identity(),
+        (r1, r2) -> r1.getDate().isAfter(r2.getDate()) ? r1 : r2);    // <1>
+
+    @Autowired private ReferenceRateRepository repository;
+
+    @Transactional(readOnly = true)
+    public Map<String, ReferenceRate> getOnDate(LocalDate date) {
+        return repository.findAllByActiveTrue().stream()
+            .filter(rate -> !rate.getDate().isAfter(date))            // <2>
+            .collect(toMap);
+    }
+
+    @Transactional(readOnly = true)
+    public Map<LocalDate, Map<String, ReferenceRate>> getOnRangeChanges(LocalDate from, LocalDate to) {
+        return repository.findAllByActiveTrue().stream()
+            .filter(r -> r.getDate().isAfter(from))                   // <3>
+            .filter(rate -> rate.getDate().isBefore(to))
+            .collect(Collectors.groupingBy(ReferenceRate::getDate, toMap));
+    }
+}
+----
+<1> Merge function: when two rows collide on `abbreviation`, keep the one with the **later** date. Combined with the filter on line 2, this yields "latest row ≤ `date`" per abbreviation.
+<2> `!date.isAfter(date)` = "`rate.date <= date`". All historical rows are kept; they are collapsed by the `toMap` merge into one row per abbreviation.
+<3> Range semantics are **exclusive on both sides**: `from < rate.date < to`. Use this to feed schedule engines the dates where a variable rate would step — typically called with `from = credit.startDate`, `to = credit.endDate`.
+
+.Output shape of `getOnRangeChanges`
+[cols="1,3", options="header"]
+|===
+|Key |Value
+
+|`LocalDate`
+|A date on which **at least one** rate had a new row. If SOFR changed on 2024-01-15 and PRIME didn't, the key is `2024-01-15` and the inner map contains only `"SOFR"`.
+
+|`Map<String, ReferenceRate>`
+|Rate rows effective from that date, keyed by abbreviation. Only abbreviations with a row on that date appear — absent keys mean "no change on this date".
+|===
+
+=== Admin Catalog — `ReferenceRateController`
+
+A ~20-line `CatalogController` subclass. All CRUD + toggle-active + validation routing is inherited.
+
+[source,java]
+----
+@Controller
+@RequestMapping("reference-rate")
+public class ReferenceRateController extends CatalogController<ReferenceRate, ReferenceRateForm> {
+
+    @Override
+    protected String getTableTemplate(Model model) throws Exception { return "/reference-rate/table"; }
+
+    @Override
+    protected String getFieldsTemplate(ReferenceRate entity, Model model) throws Exception {
+        return "/reference-rate/fields";
+    }
+
+    @Override
+    protected void validateConstraint(String constraint, Binding binding) {
+        if (ReferenceRate.ABBREVIATION_DATE_UNIQUE_CONSTRAINT.equalsIgnoreCase(constraint)) {    // <1>
+            binding.rejectValue("abbreviation", "error.reference.rate.abbreviation.date.duplicate",
+                "Reference rate with this abbreviation and date already exists");
+        }
+    }
+}
+----
+<1> `CatalogController` catches `ConstraintViolationException` from the JPA layer and dispatches to `validateConstraint()`. Bind the unique-constraint name to the user-facing field so the error surfaces on `abbreviation` rather than as a generic form-level error.
+
+=== Form + Mapper
+
+`ReferenceRateForm` captures all four mutable fields with JSR-303 constraints (`@NotBlank`, `@Size`, `@DecimalMin("0.0")`, `@DateTimeFormat`). `ReferenceRateFormMapper` is a bare MapStruct interface extending `EntityToFormMapper<ReferenceRate, ReferenceRateForm>` — no custom code. The base interface handles `toEntity`, `createEntity`, `toForm` uniformly across all catalog forms.
+
+=== Export / Import — `ReferenceRateExporter`
+
+[source,java]
+----
+@Service @Order(2100)
+public class ReferenceRateExporter
+    extends CatalogEntityExporter<ReferenceRate, ReferenceRateExportData> {
+
+    @Override public String getVersion() { return "2"; }
+}
+----
+
+Order `2100` places rates **after** amounts (`2000`) and **before** downstream entities (products at 3000+) — so a full-environment import loads reference values first, then anything that references them. `version = "2"` is the DTO schema version — bumped when the DTO shape changes so old exports can't silently mis-map.
+
+`ReferenceRateExportData` is a flat POJO: `value`, `date`, `abbreviation`, `description`. `ReferenceRateToDtoMapper` is a plain MapStruct interface — no currency serialization (rates are currency-agnostic).
+
+=== Validator — `@LoanRateExpression`
+
+The validation sub-package ties reference rates to the product-level SpEL evaluator. Place `@LoanRateExpression` on any field that stores a rate expression string and it will be compile-checked against `LoanRateService` at form-validation time.
+
+[source,java]
+----
+@Target({METHOD, FIELD, ANNOTATION_TYPE})
+@Retention(RUNTIME)
+@Constraint(validatedBy = LoanRateExpressionValidator.class)
+@Documented
+public @interface LoanRateExpression {
+    String message() default Messages.EXPRESSION_COMPILATION_ERROR;
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+----
+
+[source,java]
+----
+public class LoanRateExpressionValidator implements ConstraintValidator<LoanRateExpression, String> {
+
+    @Autowired private LoanRateService loanRateService;
+
+    @Override
+    public boolean isValid(String value, ConstraintValidatorContext context) {
+        if (value == null) return true;
+        try {
+            loanRateService.getLoanRateValueByDate(value, LocalDate.now());    // <1>
+            return true;
+        } catch (RateEvaluationException e) {
+            context.buildConstraintViolationWithTemplate(e.getMessage())       // <2>
+                .addConstraintViolation();
+        }
+        return false;
+    }
+}
+----
+<1> Full evaluation against **today's** rate snapshot — catches typos (`SOFF + 0.025`), missing abbreviations, malformed SpEL, division-by-zero in constant expressions, unknown variables. Non-cheap — it touches the DB — but runs only on form submit.
+<2> Replaces the default `EXPRESSION_COMPILATION_ERROR` message with the evaluator's actual diagnostic ("EL1007E: Property or field 'SOFF' cannot be found…"), giving product admins a concrete hint.
+
+NOTE: The validator is instantiated by Bean Validation's default provider but relies on Spring's autowiring — this works because Spring Boot registers a `SpringConstraintValidatorFactory`. In a non-Spring context (plain Hibernate Validator), inject the service manually.
+
+== Reference Amounts
+
+=== Entity — `ReferenceAmount`
+
+[source,java]
+----
+@Entity
+@Table(name = "reference_amount",
+    uniqueConstraints = {
+        @UniqueConstraint(columnNames = {BaseReference.DATE},
+            name = ReferenceAmount.DATE_UNIQUE_CONSTRAINT)})                 // <1>
+@Audited
+public class ReferenceAmount extends BaseReference implements Comparable<ReferenceAmount> {
+
+    public static final String DATE_UNIQUE_CONSTRAINT = "UK_reference_amount_date";
+
+    public static final Comparator<ReferenceAmount> COMPARATOR =
+        Comparator.comparing(ReferenceAmount::getDate, Comparator.nullsLast(Comparator.naturalOrder()))
+            .thenComparing(ReferenceAmount::getId,    Comparator.nullsLast(Comparator.naturalOrder()));
+
+    @Column(length = CURRENCY_LENGTH, nullable = false)                      // <2>
+    private CurrencyUnit currency;
+}
+----
+<1> **Unique on `date` alone** — `ReferenceAmount` represents **one** monetary series, so at most one row per calendar day. If your project needs multiple named amount series (e.g. min-wage index + poverty-line index + regulatory-minimum), subclass `BaseReference` analogously to `ReferenceRate` with your own `series` + `date` composite key — don't try to overload `reference_amount`.
+<2> `CurrencyUnit` is the JSR-354 type (`javax.money.CurrencyUnit`), stored as a 3-character ISO currency code via the project's `MonetaryAmountType` Hibernate type. `CURRENCY_LENGTH = 3`.
+
+NOTE: There is **no `ReferenceAmountService`** in the SDK — the `reference_amount` catalog is a passive data store. Consumers that need dated amount lookups do `entityManager.find(ReferenceAmount.class, ...)` or inject `JpaRepository<ReferenceAmount, UUID>` directly. If your project uses amounts heavily, write a thin service mirroring `ReferenceRateService` — the SDK deliberately leaves this unopinionated.
+
+=== Admin Catalog — `ReferenceAmountController`
+
+The amount controller is slightly richer than the rate controller because the form needs the `availableCurrencies` list injected into the edit template:
+
+[source,java]
+----
+@Controller
+@RequestMapping("reference-amount")
+public class ReferenceAmountController extends CatalogController<ReferenceAmount, ReferenceAmountForm> {
+
+    @Value("${application.available.currency}")                     // <1>
+    private String[] currencies;
+
+    @Override
+    protected String getFieldsTemplate(ReferenceAmount entity, Model model) throws Exception {
+        model.addAttribute("availableCurrencies", currencies);      // <2>
+        return "/reference-amount/fields";
+    }
+
+    @Override
+    protected void validateConstraint(String constraint, Binding binding) {
+        if (ReferenceAmount.DATE_UNIQUE_CONSTRAINT.equalsIgnoreCase(constraint)) {
+            binding.rejectValue("date", "error.reference.amount.date.duplicate",
+                "Reference amount with this date already exists");
+        }
+    }
+}
+----
+<1> `application.available.currency` is the project's list of permitted currencies (comma-separated ISO codes). Same property is used by the offer engine and pricing modules — single source of truth.
+<2> Template renders `<select>` over `availableCurrencies` so the admin can only pick currencies the rest of the system understands.
+
+=== Form + Mapper
+
+`ReferenceAmountForm` mirrors the entity with JSR-303 validation on `value`, `date`, `currency`. `ReferenceAmountMapper` is the `EntityToFormMapper` MapStruct interface — one line of wiring per direction, no custom code.
+
+=== Export / Import — `ReferenceAmountExporter`
+
+[source,java]
+----
+@Service @Order(2000)
+public class ReferenceAmountExporter
+    extends CatalogEntityExporter<ReferenceAmount, ReferenceAmountExportData> { /* ... */ }
+----
+
+`@Order(2000)` places amounts **first** — before rates (`2100`) — so that in projects where product / offer catalogs reference amounts at import time, the amounts already exist.
+
+The DTO stores `currency` as `String` (ISO code); the mapper handles the `CurrencyUnit ↔ String` round-trip:
+
+[source,java]
+----
+@Mapper
+public interface ReferenceAmountToDtoMapper extends CatalogEntityToDtoMapper<ReferenceAmount, ReferenceAmountExportData> {
+
+    default CurrencyUnit parseCurrency(String code)      { return MonetaryUtil.getCurrency(code); }
+    default String       printCurrency(CurrencyUnit c)   { return c.getCurrencyCode(); }
+}
+----
+
+MapStruct picks up `parseCurrency` / `printCurrency` automatically because their signatures match the unmapped field's source/target types — no `@Mapping` annotation required.
+
+== Advanced Patterns
+
+=== Pairing Consecutive Rates Into Effective Windows
+
+`getOnRangeChanges()` returns a map keyed by change-date. To build effective-from/effective-to windows (one `BaseReferencePair` per abbreviation per step) stitch neighbouring entries:
+
+[source,java]
+----
+public Map<String, List<BaseReferencePair>> buildWindows(LocalDate from, LocalDate to) {
+    var base = referenceRateService.getOnDate(from);                       // <1>
+    var changes = new TreeMap<>(referenceRateService.getOnRangeChanges(from, to));   // <2>
+
+    Map<String, List<BaseReferencePair>> windows = new HashMap<>();
+    base.forEach((abbr, current) -> windows.put(abbr, new ArrayList<>(List.of(new BaseReferencePair(current, null)))));
+
+    changes.forEach((date, changed) ->
+        changed.forEach((abbr, next) -> {
+            var list = windows.computeIfAbsent(abbr, k -> new ArrayList<>());
+            if (!list.isEmpty()) {
+                var prev = list.get(list.size() - 1);
+                list.set(list.size() - 1, new BaseReferencePair(prev.getCurrent(), next));    // <3>
+            }
+            list.add(new BaseReferencePair(next, null));
+        }));
+    return windows;
+}
+----
+<1> Seed — latest row for each abbreviation as of `from`.
+<2> Use a `TreeMap` wrapper to iterate change-dates in calendar order (the service returns a `HashMap`).
+<3> Patch the previous pair's `next` with the new row so the previous window closes at the new change.
+
+This pattern shows up inside schedule-engine evaluation (see <<servicing-engines>>) when a variable-rate product needs the rate-change schedule over the credit's full lifetime.
+
+=== Driving the Validator From the Product Form
+
+Apply `@LoanRateExpression` directly on the product form field that holds the SpEL string:
+
+[source,java]
+----
+public class CreditProductForm {
+    @LoanRateExpression                                // <1>
+    @NotBlank(message = "Rate expression is required")
+    private String rateExpression;                     // e.g. "SOFR + 0.025"
+    /* ... */
+}
+----
+<1> Triggers on every form submit. A product admin who types `SOFF + 0.025` sees the error on the rate field immediately, not after deploying and running a credit through the schedule engine.
+
+This is the **only** compile-time guard the platform has on rate strings — runtime `RateEvaluationException` from `LoanRateService` surfaces as a generic server error in downstream calls. Prefer the annotation on every user-editable field that ends up in `LoanRateService.getLoanRateValueByDate()`.
+
+=== Cache Warmup on Startup
+
+Because `findAllByActiveTrue()` is L2-cached, the first request after deploy pays the DB round-trip. Warm the cache in a startup listener if your first request is latency-sensitive:
+
+[source,java]
+----
+@Component
+class ReferenceRateCacheWarmer {
+
+    @Autowired private ReferenceRateService referenceRateService;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void warm() {
+        referenceRateService.getOnDate(LocalDate.now());    // fills cache
+    }
+}
+----
+
+The warming call runs in the `ApplicationReadyEvent` thread — a few hundred milliseconds against a ~3 000-row table. Enable only if you observe cold-start latency; otherwise the first real request populates the cache just as well.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Treat reference rows as immutable once dated** — to "correct" a rate, soft-delete the wrong row (toggle `active=false`) and insert a corrected one. Editing a past row breaks reproducibility for every credit already scheduled against it.
+* {ok} **Use `ReferenceRateService`, not the repository** — going through the service gets you the cache, the date filter, and the "latest row ≤ date" semantics for free. Direct repository access is an invitation to skew rate math.
+* {ok} **Annotate every rate-expression field with `@LoanRateExpression`** — catches typos at form submit instead of at the first schedule recalculation.
+* {ok} **Upper-case rate abbreviations consistently** — `SOFR`, not `Sofr` / `sofr`. The unique constraint is case-insensitive in practice (DB collation dependent) but SpEL variable binding is case-sensitive.
+* {ok} **Register new abbreviations with a seed row dated far in the past** — e.g. inserting `PRIME` with date `2000-01-01`. Guarantees `getOnDate()` returns a value for any realistic credit start-date without "rate not available" failures.
+* {ok} **Bump `getVersion()` when you change the export DTO** — old exports stop importing cleanly, which is the correct failure mode. Silent mis-mapping across schema versions is worse than a hard fail.
+* {ok} **Keep the catalog admin page permission tight** — reference amounts and rates drive money. A bad row changes every credit's schedule. Scope the admin role to treasury / risk, not "all admins".
+* {ok} **For multi-series amounts, subclass `BaseReference`** — `reference_amount` is intentionally single-series. Don't try to overload it by encoding a "name" into `date`.
+* {ok} **Exploit the L2 cache in high-traffic paths** — rate evaluation in schedule engines is cache-local after warmup; don't add your own caching layer on top.
+* {ok} **Reference the `ABBREVIATION` / `DATE` constants, not literal strings** — both entities expose them as `public static final String` so callers survive column renames.
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Editing an existing `ReferenceRate` row to "update today's SOFR"** — past credits computed their rates from the old value; editing rewrites history. Insert a new dated row instead.
+* {bad} **Calling `ReferenceRateRepository.findAllByActiveTrue()` directly** — bypasses the date filter. The returned list mixes all historical rows across all abbreviations; consumers that iterate naively pick up the wrong effective value.
+* {bad} **Storing a rate value inside a product entity** — rates are a time series; products point at them by abbreviation. Baking a value into the product freezes the schedule at product-creation time. See <<credit-product>> best practices.
+* {bad} **Omitting `@LoanRateExpression` on product rate fields** — a typo like `SOFF + 0.025` saves cleanly and blows up only when the first credit tries to schedule.
+* {bad} **Ingesting rates in a loop without batching** — `repository.save()` per row round-trips the DB; for historical backfills use `saveAll()` or JDBC batch.
+* {bad} **Deleting a row hard** — `CatalogController.delete` is already soft. If you bypass it with native SQL and hard-delete, Envers loses the revision and any credit that retro-scheduled against that row breaks.
+* {bad} **Reusing `ReferenceAmount` for multiple named series** — you'll fight the `UniqueConstraint(date)`. Subclass `BaseReference` instead.
+* {bad} **Mixing currencies on `reference_amount`** — the unique constraint is on `date` alone. Two rows with different currencies on the same date violate it. Pick one currency per environment / per series.
+* {bad} **Mutating `CurrencyUnit` after insert** — changes what every historical reader interprets as "the reference". If the regulation changes, insert a new dated row rather than updating an old one.
+* {bad} **Hard-coding rate abbreviations in Java (e.g. `"SOFR"` literal) instead of reading from config** — couples the code to a specific market. Project code that must know about "SOFR" should read it from a property (`application.rate.default-benchmark`).
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `reference_rate` has at least one row for every abbreviation referenced by an active product's rate expression, dated before the earliest active credit's start-date
+* {todo} `@LoanRateExpression` is present on every user-editable field that stores a rate expression (product forms, offer forms, servicing adjustments)
+* {todo} `application.available.currency` property lists all currencies used on `reference_amount` rows — no orphaned currencies
+* {todo} Admin role granting edit access to `/reference-rate` and `/reference-amount` is scoped to treasury / risk staff
+* {todo} Ingestion job (scheduled import / vendor feed / manual upload) is in place and monitored — missing daily SOFR means tomorrow's schedule engine falls back to stale values
+* {todo} Export pipeline (`ReferenceRateExporter` / `ReferenceAmountExporter`) runs in non-prod imports ahead of product / offer imports (orders 2000 / 2100 < product orders)
+* {todo} Hibernate L2 cache is enabled in `application.properties` — `spring.jpa.properties.hibernate.cache.use_query_cache=true` and `use_second_level_cache=true` — otherwise `HINT_CACHEABLE` is a no-op
+* {todo} `aud_reference_rate` + `aud_reference_amount` schemas exist (Envers-managed via Flyway/Liquibase)
+* {todo} Monitoring alerts on unexpected rate / amount writes outside business hours (potential unauthorized edit)
+* {todo} Failover plan documented for "rate feed down" — either a manual admin path to insert a stand-in row, or an SLA with the upstream vendor
+* {todo} Back-filled history covers the oldest `credit.startDate` in production — not just the last 90 days
+* {todo} Unit tests cover `ReferenceRateService.getOnDate()` with edge cases: no rows at all, row dated exactly on query date, row dated in the future (should be ignored)
+* {todo} `LoanRateExpressionValidator` smoke-tested on startup via a well-known expression — catches misconfigured Spring context before the first product admin sees a confusing "validation error"
+
+---
+
+**Related:** <<credit-product>>, <<offer-engine>>, <<credit-servicing>>, <<servicing-engines>>, <<entity-module-sdk-reference-hierarchy>>, <<audit-module>>
+
+**Next:** <<credit-product>>

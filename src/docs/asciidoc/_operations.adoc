@@ -1,3 +1,5 @@
+[[operations]]
+[[credit-operations-framework]]
 = Credit Operations Framework
 
 :sourcedir: ../../main/java/com/timvero/example/admin

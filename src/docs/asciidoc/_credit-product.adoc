@@ -1,0 +1,782 @@
+[[credit-product]]
+= Credit Product Module — entity model, lifecycle & rates
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:libdir: ../../main/java/com/timvero/loan/product
+
+The Credit Product module defines loan product templates — amount ranges, terms, interest rates, and fee structures — that feed into the Offer Engine to generate personalized offers. This guide covers the entity model, state lifecycle, rate evaluation service, form validation, and filtering. For web layer setup (controllers, actions, tabs, templates), see <<product-web-components-configuration>>.
+
+== What You Need to Know
+
+A credit product is a **loan template** — not a loan itself. It defines the boundaries (min/max amounts, terms, fees) within which individual offers are generated for participants. The hierarchy:
+
+----
+CreditProduct (template)
+  └── CreditProductAdditive (specific configuration)
+        └── ProductOffer (personalized for participant)
+              └── SecuredOffer (with collateral/procuring)
+                    └── CreditCondition (selected terms)
+                          └── Credit (active loan)
+----
+
+Key characteristics:
+
+- Products use **single-table inheritance** — your subclass adds columns to `credit_product`
+- Products have a **three-state lifecycle**: DRAFT -> ACTIVE -> INACTIVE
+- Each product has one or more **additives** that define interest rates and offer engine mappings
+- The **LoanRateService** evaluates SpEL expressions with reference rate bindings for variable-rate products
+- Products are **cached** (Hibernate L2 cache, READ_WRITE strategy)
+
+== Entity Model
+
+=== CreditProduct — Abstract Base
+
+`CreditProduct` extends `AbstractAuditable` and provides the core product structure. You must subclass it to add your business-specific fields.
+
+.SDK base class fields
+[cols="2,1,3", options="header"]
+|===
+|Field |Type |Purpose
+
+|`creditType`
+|`CreditType`
+|Custom enum identifying the loan category (e.g., PERSONAL, MORTGAGE)
+
+|`state`
+|`CreditProductState`
+|Lifecycle state — DRAFT, ACTIVE, or INACTIVE
+
+|`title`
+|`String`
+|Human-readable product name
+
+|`code`
+|`String`
+|Unique product code for internal reference
+
+|`engineName`
+|`String`
+|Spring bean name of the `ScheduledEngine` for payment calculation
+
+|`uuidContractTemplate`
+|`UUID`
+|Reference to the contract document template
+
+|`copiedFrom`
+|`UUID`
+|Self-reference tracking which product this was copied from
+
+|`offerEngineTypes`
+|`Set<ExecutionResultType>`
+|Which offer engine types this product supports
+
+|`additives`
+|`List<CreditProductAdditive>`
+|Active additives (filtered by `@SQLRestriction("active = true")`)
+|===
+
+.Your subclass adds business fields
+[source,java]
+----
+include::{sourcedir}/product/entity/ExampleCreditProduct.java[lines=13..36]
+----
+
+Key points:
+
+- `@Entity` without `@DiscriminatorValue` — JPA uses class name as discriminator by default
+- `currency` is `@Column(updatable = false)` — cannot change after creation
+- Amount fields use `AMOUNT_PRECISION` / `AMOUNT_SCALE` for monetary consistency
+- `dayCountMethod` stores the interest calculation method (e.g., `30_360_BB`)
+
+=== CreditProductAdditive — Product Variations
+
+Additives define specific configurations within a product — interest rates, term ranges, and offer engine mappings. Each additive can generate offers independently.
+
+.SDK base class structure
+[cols="2,1,3", options="header"]
+|===
+|Field |Type |Purpose
+
+|`product`
+|`CreditProduct`
+|Parent product (EAGER fetch, immutable after creation)
+
+|`offerEngines`
+|`Map<ExecutionResultType, UUID>`
+|Mapping from engine type to offer engine script UUID
+
+|`procuringType`
+|`ProcuringType`
+|Collateral/guarantee requirement for this additive
+|===
+
+`CreditProductAdditive` extends `UndeletableEntity<Long>` — deactivation sets `active = false` rather than deleting the row. The parent product's `@SQLRestriction("active = true")` filters inactive additives from the collection automatically.
+
+.Your additive subclass
+[source,java]
+----
+include::{sourcedir}/product/entity/ExampleCreditProductAdditive.java[lines=13..36]
+----
+
+The `createOffer()` method is the factory hook — the framework calls it during offer generation to create your specific `ProductOffer` subclass:
+
+[source,java]
+----
+include::{sourcedir}/product/entity/ExampleCreditProductAdditive.java[lines=86..90]
+----
+
+=== CreditType — Custom Enum
+
+`CreditType` is not a standard Java enum — it extends `CustomEnum<CreditType>`, which means types are defined as static constants and stored as strings in the database. This allows adding new types without schema changes.
+
+.Defining credit types
+[source,java]
+----
+include::{sourcedir}/credit/ExampleCreditType.java[lines=5..9]
+----
+
+[NOTE]
+====
+The `@Configuration` annotation ensures Spring instantiates the class at startup, which registers the static constant with the `CustomEnum` registry. Without it, `CreditType.values(CreditType.class)` returns an empty collection.
+====
+
+The SDK provides `CreditTypeDeserializer` for JSON deserialization — it calls `CreditType.valueOf()` which looks up the registered constant by name.
+
+=== CreditProductState — Lifecycle
+
+`CreditProductState` is a standard Java enum with three values:
+
+----
+DRAFT ──activate──> ACTIVE ──deactivate──> INACTIVE
+                                               │
+                                          (no return)
+----
+
+.State permissions
+[cols="1,1,1,1,1", options="header"]
+|===
+|Operation |DRAFT |ACTIVE |INACTIVE
+
+|Edit product
+|{ok}
+|{bad}
+|{bad}
+
+|Add/edit/remove additives
+|{ok}
+|{bad}
+|{bad}
+
+|Activate product
+|{ok} (requires >= 1 additive)
+|{bad}
+|{bad}
+
+|Deactivate product
+|{bad}
+|{ok}
+|{bad}
+
+|Copy product
+|{ok}
+|{ok}
+|{ok}
+
+|Generate offers
+|{bad}
+|{ok}
+|{bad}
+|===
+
+WARNING: Activation is a one-way gate for editing. Once a product moves to ACTIVE, its configuration is locked. The only way to modify it is to copy to a new DRAFT product. This protects existing offers and credits from retroactive changes.
+
+== Rate Evaluation
+
+=== LoanRateService
+
+The `LoanRateService` evaluates interest rate expressions using Spring Expression Language (SpEL). It supports both fixed rates and variable rates that reference external rate indices.
+
+.How it works
+----
+Expression: "SOFR + 0.025"
+                │
+    ┌───────────┘
+    ▼
+ReferenceRateService.getOnDate(date)
+    → { "SOFR": 0.053, "PRIME": 0.085, ... }
+    │
+    ▼
+Replace abbreviations with bindings
+    → "rate12345 + 0.025"
+    │
+    ▼
+SpEL evaluation
+    → 0.078 (BigDecimal)
+----
+
+=== Rate Expression Syntax
+
+Rate expressions are standard SpEL with reference rate abbreviations injected as variables:
+
+.Expression examples
+[cols="2,3", options="header"]
+|===
+|Expression |Meaning
+
+|`0.089`
+|Fixed 8.9% rate
+
+|`SOFR + 0.025`
+|SOFR + 2.5% spread
+
+|`PRIME * 0.5 + 0.01`
+|Half of prime rate + 1%
+
+|`T(java.lang.Math).max(SOFR + 0.03, 0.05)`
+|Floor of 5% on SOFR + 3%
+|===
+
+Reference rate abbreviations (like `SOFR`, `PRIME`) are replaced at evaluation time with their current values from the `ReferenceRateService`.
+
+=== Point-in-Time vs Range Evaluation
+
+The service provides two evaluation modes:
+
+**Single date** — `getLoanRateValueByDate(expression, date)`:
+
+Returns the evaluated rate for a specific date. Used when calculating interest for a single day or when displaying the current rate.
+
+**Date range** — `getLoanRateValueByRange(expression, from, to)`:
+
+Returns a `NavigableMap<LocalDate, BigDecimal>` containing only the dates where the rate changed. Used for variable-rate credits where the interest rate shifts when reference rates change.
+
+[source,java]
+----
+// Fixed rate — returns single entry
+NavigableMap<LocalDate, BigDecimal> fixed = rateService
+    .getLoanRateValueByRange("0.089", startDate, endDate);
+// → { startDate: 0.089 }
+
+// Variable rate — returns entries at each change point
+NavigableMap<LocalDate, BigDecimal> variable = rateService
+    .getLoanRateValueByRange("SOFR + 0.025", startDate, endDate);
+// → { 2026-01-01: 0.078, 2026-02-15: 0.081, 2026-03-20: 0.076 }
+----
+
+[NOTE]
+====
+Parsed SpEL expressions are cached in a `ConcurrentHashMap` for performance. The cache is unbounded — in practice this is fine because the number of distinct rate expressions is small (one per product).
+====
+
+== Form & Validation
+
+=== BaseCreditProductForm
+
+The SDK provides `BaseCreditProductForm` with the core product fields. Your form extends it to add business-specific fields:
+
+[source,java]
+----
+include::{sourcedir}/product/form/CreditProductForm.java[lines=15..40]
+----
+
+Note that `BaseCreditProductForm` marks `engineName`, `offerEngineTypes`, and `uuidContractTemplate` with `@JsonIgnore` — these fields are populated from the form service's model data, not from JSON payloads.
+
+=== Product Form Service
+
+The form service assembles dropdown data for the edit form:
+
+[source,java]
+----
+include::{sourcedir}/product/form/ExampleCreditProductFormService.java[lines=15..28]
+----
+
+Key model attributes:
+
+- `productEngines` — available `ScheduledEngine` bean names (auto-discovered via Spring's `Map<String, ScheduledEngine>` injection)
+- `offerEngineTypes` — which `ExecutionResultType` values this project supports
+- `creditTypes` — all registered `CreditType` constants
+- `templates` — contract document templates filtered by category
+- `dayCountMethods` — available day count methods (e.g., `30_360_BB`, `ACT_365`)
+
+=== Additive Form Validation
+
+Additive amounts and terms must fall within the parent product's bounds. The `AdditiveFormValidator` enforces this:
+
+[source,java]
+----
+include::{sourcedir}/product/form/AdditiveFormValidator.java[lines=9..63]
+----
+
+The validator checks:
+
+1. **Amount bounds** — additive min/max amounts must be within product min/max amounts
+2. **Term bounds** — additive min/max terms must be within product min/max terms
+3. **Min < Max** — additive's own min must not exceed its max (for both amounts and terms)
+
+=== Additive Form Service
+
+The additive form service extends `CreditProductAdditiveFormService` and provides three hooks:
+
+[source,java]
+----
+include::{sourcedir}/product/form/ExampleCreditProductAdditiveFormServiceImpl.java[lines=13..36]
+----
+
+- `findAdditiveModelsByProduct()` — retrieves additives for the tab display
+- `assembleEditModel()` — populates form dropdowns (procuring types, etc.)
+- `assembleProductData()` — provides product context for the additive tab (offer engine types, engine descriptors)
+
+== Filtering
+
+=== BaseCreditProductFilter
+
+The SDK provides a base filter with state-based filtering:
+
+[source,java]
+----
+public abstract class BaseCreditProductFilter extends ListFilter {
+
+    @Field(restriction = Restriction.IN, value = "state")
+    private CreditProductState[] state = {};
+}
+----
+
+This gives the product list page a multi-select state filter out of the box (DRAFT, ACTIVE, INACTIVE).
+
+To add custom filters, extend it:
+
+[source,java]
+----
+public class ExampleCreditProductFilter extends BaseCreditProductFilter {
+
+    @Field(restriction = Restriction.LIKE, value = "title")
+    private String title;
+
+    @Field(restriction = Restriction.EQ, value = "creditType")
+    private CreditType creditType;
+
+    // getters/setters
+}
+----
+
+== Integration Points
+
+The product module connects to the rest of the platform through these flows:
+
+.Product → Credit pipeline
+----
+CreditProduct + Additive
+    │
+    ▼ (OfferEngine evaluates scripts)
+ProductOffer (personalized)
+    │
+    ▼ (ProcuringEngine adds collateral)
+SecuredOffer
+    │
+    ▼ (Participant selects offer)
+CreditCondition (locked terms)
+    │
+    ▼ (Contract signed → EntityChecker)
+Credit (active loan servicing)
+----
+
+**Key integration classes:**
+
+- `ScheduledEngine` — product's `engineName` references a Spring bean that calculates payment schedules
+- `OfferEngineDataProcessor` — maps participant data for offer script evaluation
+- `ProcuringEngine` — generates secured offer variants based on additive's `procuringType`
+- `CreditCondition` — captures the selected offer's terms, including product references
+- `LoanRateService` — evaluates rate expressions for variable-rate products during servicing
+
+== Product Subsystem — SDK Internals
+
+This section maps the SDK package layout at `com.timvero.loan.product` (28 classes in 8 subpackages). Read it when you need to override default behavior, debug wiring, or understand why the framework does something "magically". If you only need to stand up a product module, the previous sections are enough.
+
+.Package layout
+[cols="1,3", options="header"]
+|===
+|Subpackage |Role
+
+|`product`              |`CreditProductService` (state transitions) and `ProductWebConfigurationSupport` (bean registry)
+|`product.entity`       |JPA entities (`CreditProduct`, `CreditProductAdditive`), repositories, state enum, `CreditType` custom enum, Jackson deserializer
+|`product.form`         |`BaseCreditProductForm` (product DTO base), `CreditProductAdditiveFormService` (additive form hooks)
+|`product.filter`       |`BaseCreditProductFilter` (state filter)
+|`product.rate`         |`LoanRateService` (SpEL rate evaluation), `RateEvaluationException`
+|`product.controller`   |`CreditProductController` (list page + menu registration)
+|`product.action`       |Entity actions: create, edit, copy, activate, deactivate, add-additive (+ nested `additive/` for additive-scoped actions)
+|`product.tab`           |Detail tabs: `CreditProductDetailsTab`, `CreditProductAdditivesTab`
+|===
+
+=== Root — `CreditProductService` and `ProductWebConfigurationSupport`
+
+==== `CreditProductService` — transactional state flips
+
+A minimal, deliberately-thin service that flips `CreditProductState` by calling `entityManager.getReference()`. It does **not** load the full entity — it only acquires a proxy and sets the state. This avoids loading the `additives` collection just to change a single column.
+
+[source,java]
+----
+@Service
+public class CreditProductService {
+    @Autowired
+    private EntityManager entityManager;
+
+    @Transactional
+    public void deactivate(UUID id) {
+        entityManager.getReference(CreditProduct.class, id).setState(INACTIVE);
+    }
+
+    @Transactional
+    public void activate(UUID id) {
+        entityManager.getReference(CreditProduct.class, id).setState(ACTIVE);
+    }
+}
+----
+
+NOTE: Because transitions bypass Hibernate dirty-checking in the usual edit flow, `EnableCreditProductAction` calls `reloadPageHelper.reload(...)` via `AddCreditProductAdditiveAction` — the browser must refresh to see the new state. Callers of `CreditProductService` directly must do the same.
+
+==== `ProductWebConfigurationSupport` — programmatic bean registry
+
+Instead of a dozen `@Bean` declarations, `ProductWebConfigurationSupport` implements `BeanDefinitionRegistryPostProcessor` and registers every controller/action/tab with explicit generics via `ResolvableType.forClassWithGenerics(...)`. This is load-bearing: Spring's dependency resolution uses the resolvable type to match `CreditProductAdditiveFormService<ExampleCreditProductAdditive, ExampleCreditProductAdditiveForm>` against the injection point in each action.
+
+Bean types registered by the base `initDefinitions()`:
+
+[cols="1,2,3", options="header"]
+|===
+|Count |Bean |Generic signature
+
+|1 |`CreditProductController`          |`<E, FR>`
+|1 |`CreditProductDetailsTab`          |`<E>`
+|1 |`CreditProductAdditivesTab`        |`<E>`
+|1 |`CreateProductAction`              |`<E, F>`
+|1 |`EditProductAction`                |`<E, F>`
+|1 |`CopyProductAction`                |`<E, F, A, AF>`
+|1 |`AddCreditProductAdditiveAction`   |`<E, A, AF>`
+|1 |`EnableCreditProductAction`        |`<E>`
+|1 |`DeactivateCreditProductAction`    |`<E>`
+|1 |`ActivateAdditiveAction`           |`<A>`
+|1 |`DeactivateAdditiveAction`         |`<A>`
+|1 |`EditAdditiveAction`               |`<A, AF>`
+|===
+
+12 beans from one constructor call. To add project-specific actions, override `initDefinitions()`, call `super.initDefinitions()`, then add your own `definition(...)` entries using the same helper.
+
+The seven `getXxxTemplatePath()` hooks (`getListTemplatePath`, `getEditTemplatePath`, `getCreateTemplatePath`, `getCopyTemplatePath`, `getAddAdditiveTemplatePath`, `getAdditivesTabTemplatePath`, `getEditAdditiveTemplatePath`, plus `getDetailsTemplatePath`) map one-to-one to Thymeleaf files under `/product/...`. Override them to relocate templates without subclassing each action.
+
+=== Entity package — `product.entity`
+
+==== `CreditProduct` — single-table inheritance + L2 cache
+
+[source,java]
+----
+@Entity
+@Table(name = "credit_product")
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE, includeLazy = false)
+public abstract class CreditProduct extends AbstractAuditable implements NamedEntity { ... }
+----
+
+Load-bearing details:
+
+- `InheritanceType.SINGLE_TABLE` — your subclass columns all live in `credit_product`. No joins, no discriminator column override (class name is the default).
+- `@Cache(... includeLazy = false)` — L2 cache does not include lazy-loaded collections; `additives` is loaded fresh per session.
+- `@SQLRestriction("active = true")` on the `additives` collection is applied by Hibernate at SQL level, **not** by the JPA provider. If you write HQL joining additives, the restriction still applies. Native SQL bypasses it.
+- `creditType` uses `@Type(CustomEnumType.class)` — values are persisted as VARCHAR and looked up from the `CustomEnum` registry. Do not try to use `@Enumerated(EnumType.STRING)` here; `CreditType` is not a Java enum.
+- `offerEngineTypes` uses `@Type(NamedParameterType.class)` stored in `credit_product_offer_engine_type` — an element-collection, one row per supported engine type.
+
+==== `CreditProductAdditive` — soft-delete via `UndeletableEntity`
+
+[source,java]
+----
+@Entity
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+public abstract class CreditProductAdditive extends UndeletableEntity<Long> implements NamedEntity {
+
+    @ManyToOne(fetch = FetchType.EAGER, optional = false)
+    @JoinColumn(name = "product_id", updatable = false)
+    @Fetch(FetchMode.SELECT)
+    private CreditProduct product;
+
+    @ElementCollection(fetch = FetchType.LAZY)
+    @CollectionTable(name = "credit_product_additive_offer_engine_map", ...)
+    @MapKeyType(NamedParameterType.class)
+    private Map<ExecutionResultType, UUID> offerEngines;
+
+    public abstract ProductOffer createOffer();
+}
+----
+
+Inheriting `UndeletableEntity<Long>` gives you the `active` column and `setActive(boolean)` — the actions toggle this flag instead of running `DELETE`. The base exposes `setActive` as `protected`; `CreditProductAdditive` re-declares it `public` so activate/deactivate actions can call it without reflection.
+
+The `product` association is `EAGER + FetchMode.SELECT` — this avoids N+1 at the cost of an extra query per additive load. For bulk additive processing (e.g., scheduled jobs), fetch with an explicit `JOIN FETCH`.
+
+`createOffer()` is the **only** abstract method and the single extension point for offer generation. The offer engine layer calls `additive.createOffer()` to get a pre-wired `ProductOffer` subclass — your implementation must set back-references (`offer.setAdditive(this)`, currency, etc.). See <<offer-engine>> for how the returned offer flows through engine execution.
+
+==== Repositories
+
+Both repositories are minimalist. `CreditProductRepository` extends `JpaRepository<CreditProduct, UUID>` with one added finder:
+
+[source,java]
+----
+Stream<CreditProduct> findByState(CreditProductState state);
+----
+
+`CreditProductAdditiveRepository` extends both `JpaRepository` and `SynchronousAccessRepository` (the latter gives pessimistic-lock helpers used by servicing). It also adds a native update to soft-delete additives without loading them:
+
+[source,java]
+----
+@Modifying
+@Query(nativeQuery = true, value = "UPDATE credit_product_additive SET active = false WHERE product_id = :productId and id = :additiveId")
+void removeAdditive(UUID productId, Long additiveId);
+----
+
+The `productId` parameter in the WHERE clause is a guard — callers must know the parent product, which prevents cross-product deactivation bugs.
+
+==== `CreditType` vs. `CreditProductType`
+
+Two types that look similar but serve different roles:
+
+[cols="1,2,3", options="header"]
+|===
+|Type |Nature |Purpose
+
+|`CreditType`        |`CustomEnum<CreditType>`     |Extensible business taxonomy (PERSONAL, MORTGAGE, ...). Persist as VARCHAR via `CustomEnumType`. Registered at runtime by static initializers.
+|`CreditProductType` |Plain Java `enum`            |`PRODUCT` or `TEMPLATE`. Not currently persisted on `CreditProduct`; used by consumers that need to flag a template-style product for cloning workflows.
+|===
+
+`CreditTypeDeserializer` handles JSON payloads — when an offer-engine script or REST endpoint posts `{"creditType": "PERSONAL"}`, Jackson calls `CreditType.valueOf(CreditType.class, "PERSONAL")` which consults the static registry populated by `@Configuration` classes.
+
+=== Form package — `product.form`
+
+==== `BaseCreditProductForm`
+
+[source,java]
+----
+public class BaseCreditProductForm {
+    @NotBlank private String title;
+    @NotBlank private String code;
+    @JsonIgnore @NotNull private String engineName;
+    @JsonIgnore @NotEmpty private Set<@NotNull ExecutionResultType> offerEngineTypes;
+    @JsonIgnore @NotNull private UUID uuidContractTemplate;
+    private CreditType creditType;
+
+    public void setHasMerchantFee(boolean hasMerchantFee) { /* no-op hook */ }
+}
+----
+
+Three fields are `@JsonIgnore` — they are populated from Thymeleaf form submission (Spring MVC field binding), not from JSON API payloads. This keeps the form reusable for both API-driven and form-driven creation without exposing internal wiring to external callers.
+
+The empty `setHasMerchantFee` stub exists so subclasses that actually have a merchant-fee toggle can override it without the base form having to know about merchant fees. MapStruct's `@MappingTarget` will quietly no-op the setter if you don't override it — this lets one mapper signature fit both feeless and fee-bearing products.
+
+==== `CreditProductAdditiveFormService`
+
+[source,java]
+----
+public abstract class CreditProductAdditiveFormService<A extends CreditProductAdditive, F>
+    extends EntityFormService<A, F, Long> {
+
+    public void assembleProductData(Model model, CreditProduct product) { }
+    public abstract Collection<?> findAdditiveModelsByProduct(CreditProduct product);
+}
+----
+
+Two hooks on top of the generic `EntityFormService`:
+
+- `assembleProductData(model, product)` — default no-op. Called by `AddCreditProductAdditiveAction.getActionTemplate()` and `EditAdditiveAction.editModel()`. Override to push product context (offer-engine types, procuring-type options, currency) into the model so the additive modal can render dropdowns filtered by the parent product.
+- `findAdditiveModelsByProduct(product)` — abstract. `CreditProductAdditivesTab` calls this inside a `Lazy.of(...)` so the list is only materialized if the tab template actually iterates over it. Return a view-friendly DTO collection, not the entity list — the tab template should not call entity getters that would trigger more lazy loads.
+
+=== Filter package — `product.filter`
+
+`BaseCreditProductFilter` is a one-field abstract ancestor. It uses the `@Field(restriction = Restriction.IN, value = "state")` annotation on a `CreditProductState[]` array — the framework expands this into a JPA `IN` clause when the filter is applied. The filter is abstract because `ListFilter` requires concrete classes for Spring's controller binding.
+
+The SDK intentionally stops at `state`. All other filterable fields (title LIKE, credit type EQ, amount ranges) are project-specific and belong in your subclass.
+
+=== Rate package — `product.rate`
+
+==== `LoanRateService` — how SpEL and reference rates interact
+
+The service pre-processes the raw expression (e.g., `"SOFR + 0.025"`) before handing it to SpEL:
+
+. Fetch all `ReferenceRate` rows valid on `date` via `ReferenceRateService.getOnDate(date)`.
+. For each reference rate, compute a synthetic key: `"rate" + (abbreviation.hashCode() & 0xFFFFFFFFL)`.
+. Replace every occurrence of the abbreviation in the raw text with that key (e.g., `"SOFR + 0.025"` becomes `"rate123456 + 0.025"`).
+. Store `{key -> BigDecimal}` in a `LinkedHashMap` and wrap it in a `StandardEvaluationContext` with a `MapAccessor`.
+. Cache the parsed `Expression` under the transformed text in a `ConcurrentHashMap<String, Expression>`.
+. Evaluate; the result must be `BigDecimal` or a `Number` coercible via `new BigDecimal(result.toString())`.
+
+WARNING: Because the key depends on `hashCode()`, two reference rates whose abbreviations collide (astronomically unlikely but possible) would bind to the same variable. If you see `RateEvaluationException("Rate 'X' is not defined")` intermittently, check for abbreviation collisions or stale cached expressions after renaming a rate.
+
+==== Range evaluation picks only change points
+
+`getLoanRateValueByRange(expression, from, to)` calls `referenceRateService.getOnRangeChanges(from, to)` — a sparse map keyed by the date of every rate change. The service re-evaluates the expression on each change date, compares the new result to the previous value, and only records the entry when the result actually changes. This keeps the returned `NavigableMap` minimal — it contains change points, not every day in the range.
+
+This is what the servicing layer uses to drive variable-rate interest accrual. See <<credit-servicing>> and <<servicing-engines>> for how the returned map feeds `ScheduledEngine.rebuildScheduleFromDate(...)`.
+
+==== `RateEvaluationException` — user-visible vs. internal message
+
+The exception carries **two** messages: `message` (logs/stack traces) and `visibleMessage` (UI). When `printLoanRateValue(expressionTxt)` catches the exception, it returns `e.getMessage()` — which should not be rendered raw to end users. The Thymeleaf layer should call `getVisibleMessage()` when surfacing rate-test failures in the product edit form.
+
+=== Controller package — `product.controller`
+
+`CreditProductController` extends `ViewableFilterController<UUID, E, FR>` and carries the `@MenuItem(order = 900_110, name = "product", group = "setting")` annotation. That annotation is what surfaces the "Products" entry in the Settings menu — override the controller **without** the annotation if you want to suppress the menu item (e.g., when embedding products inside a different navigation).
+
+Because the controller is registered programmatically by `ProductWebConfigurationSupport` (not via `@ComponentScan`), Spring still picks up the `@MenuItem` annotation — bean post-processors read annotations regardless of how the bean was registered.
+
+=== Action package — `product.action` and `product.action.additive`
+
+Every action class declares an `@Order(...)` value that controls button placement on the entity detail page. The SDK values are:
+
+[cols="2,1,3", options="header"]
+|===
+|Action |`@Order` |Guard
+
+|`EnableCreditProductAction`            |16700  |`state == DRAFT && !additives.isEmpty()`
+|`DeactivateCreditProductAction`        |19000  |`state == ACTIVE`
+|`EditProductAction`                    |20000  |`state == DRAFT`
+|`CopyProductAction`                    |25000  |always (`p -> true`)
+|`AddCreditProductAdditiveAction`       |10000  |`state == DRAFT`
+|`ActivateAdditiveAction` (additive)    |10000  |`!active && product.state == DRAFT`
+|`DeactivateAdditiveAction` (additive)  |10000  |`active && product.state == DRAFT`
+|`EditAdditiveAction` (additive)        |20000  |`product.state == DRAFT`
+|===
+
+To insert a custom action between Enable and Deactivate, pick an order in `(16700, 19000)`.
+
+==== `CopyProductAction` — two-stage copy
+
+Copy is the only way to create a new product revision after activation. The action:
+
+. Uses `formService.getMapper().toForm(entity)` to snapshot the current product into a form DTO.
+. Overwrites only `code` and `title` from the `CopyProductForm` submitted by the user.
+. Saves the new product (state defaults to DRAFT).
+. Iterates active additives, converts each to an additive form via `additiveFormService.getMapper().toForm((A) additive)`, then saves with `(f, a) -> a.setProduct(product)` so the back-reference points at the new parent.
+
+Inactive additives are intentionally skipped. If you want to propagate them, override `copyEntity(...)`.
+
+NOTE: `CopyProductAction` does **not** currently set `copiedFrom` on the new product. If you need audit lineage, override `copyEntity` and set `entityForm.setCopiedFrom(entity.getId())` before saving.
+
+==== `AddCreditProductAdditiveAction` — bypasses auto-reload
+
+The action body is:
+
+[source,java]
+----
+formService.save(null, f, (f1, a) -> a.setProduct(p));
+reloadPageHelper.reload(p); // no auto reload because of direct DB change
+----
+
+The inline comment matters — the standard entity-action flow reloads the page automatically when the edited entity mutates. Here the mutation is on a **child** (the new additive), so the framework has no signal that the parent view needs to refresh. `ReloadPageHelper.reload(...)` manually triggers it.
+
+If you write your own parent-child actions and notice a stale page after save, this is the hook you're missing.
+
+==== Additive `ActivateAdditiveAction` has no confirmation dialog
+
+Compare `DeactivateCreditProductAction` (renders `/common/action/yes-no` with a confirmation prompt) with `ActivateAdditiveAction` (no `getActionTemplate` override — one-click activation). Low-risk state flips skip the dialog; risky ones (disable product, hard-delete, etc.) require it. Follow this convention in custom actions.
+
+=== Tab package — `product.tab`
+
+Both tabs extend `EntityTabController<UUID, E>` and register with `@Order` — 1000 for details, 2000 for additives, so Details renders first. Both default `isVisible(entity)` to `true` — override to hide tabs for certain product subtypes (e.g., show "Additives" only when `creditType != TEMPLATE`).
+
+`CreditProductAdditivesTab` wraps the additive collection in `Lazy.of(...)` so the database round-trip is deferred until the template actually iterates. This matters when the tab is one of several on a busy product detail page — switching tabs should not preload all tab contents.
+
+=== timvero-example wiring
+
+The example project provides canonical extensions:
+
+[cols="2,3", options="header"]
+|===
+|Class |Role
+
+|`ExampleCreditProduct`                       |Concrete product with amount/term ranges, currency, day-count method
+|`ExampleCreditProductAdditive`               |Concrete additive with fixed/variable rates, overrides `createOffer()`
+|`ExampleCreditProductFilter`                 |Extends `BaseCreditProductFilter` with title LIKE and credit-type EQ
+|`CreditProductForm`                          |Extends `BaseCreditProductForm` with example business fields
+|`ExampleCreditProductFormService`            |Assembles engines, types, templates, day-count methods
+|`ExampleCreditProductAdditiveForm`           |Additive form with rate-expression field
+|`ExampleCreditProductAdditiveFormServiceImpl`|Implements `findAdditiveModelsByProduct` / `assembleProductData`
+|`ExampleCreditProductFormMapper`             |MapStruct product mapper
+|`ExampleCreditProductAdditiveFormMapper`     |MapStruct additive mapper
+|`AdditiveFormValidator`                      |Enforces additive bounds against parent product
+|`ProductWebConfiguration`                    |One-line subclass of `ProductWebConfigurationSupport`
+|`SimpleScheduledEngine`                      |Example payment-schedule engine referenced by product's `engineName`
+|`CreditProductStateLabel`                    |Renders the state badge in list/detail views
+|`ExampleCreditProductRepository`             |Project-specific repository (search finders, etc.)
+|`ExampleCreditProductAdditiveRepository`     |Project-specific additive repository
+|===
+
+`ProductWebConfiguration` is 20 lines:
+
+[source,java]
+----
+include::{sourcedir}/product/ProductWebConfiguration.java[lines=12..20]
+----
+
+Passing the five class literals (product, product-form, filter, additive, additive-form) is all the SDK needs to register 12 web beans.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Define CreditType constants in a `@Configuration` class** — ensures registration at startup
+* {ok} **Keep additive ranges within product ranges** — use `AdditiveFormValidator` pattern for enforcement
+* {ok} **Use `@SQLRestriction` for soft-delete filtering** — the SDK already does this for additives; follow the same pattern for custom soft-delete entities
+* {ok} **Mark currency as `updatable = false`** — changing currency after product creation would corrupt existing offers
+* {ok} **Use `CopyProductAction` for product revisions** — copy to DRAFT, modify, activate the new version
+* {ok} **Populate form model data in `assembleEditModel()`** — keeps controller logic clean and reusable
+* {ok} **Register all components via `ProductWebConfigurationSupport`** — one configuration class replaces 12+ manual bean definitions
+* {ok} **Prefer `EntityManager.getReference()` for state flips** — `CreditProductService` avoids loading the full product and its `additives` collection just to change one column
+* {ok} **Override `getXxxTemplatePath()` instead of subclassing actions** — changing a template location is a one-line override, not a new `@Controller`
+* {ok} **Use `@Order` values between SDK landmarks (16700, 19000, 20000, 25000)** — inserts custom actions predictably into the detail-page button row
+* {ok} **Wrap tab collections in `Lazy.of(...)`** — follows `CreditProductAdditivesTab`'s pattern; defers DB work until the template iterates
+* {ok} **Surface `RateEvaluationException.getVisibleMessage()` in the UI** — never render `getMessage()` (contains expression text and internal state)
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Editing ACTIVE product fields directly via SQL** — bypasses state protection, corrupts offers and credits referencing the product
+* {bad} **Forgetting `@Configuration` on CreditType definitions** — types won't register, `CreditType.values()` returns empty
+* {bad} **Storing calculated rates in the product entity** — rates change over time; store the expression and evaluate at runtime via `LoanRateService`
+* {bad} **Creating additives without offer engine mappings** — offer generation will silently skip the additive, producing no offers
+* {bad} **Using `EAGER` fetch on the `additives` collection** — the SDK uses `LAZY` with `@SQLRestriction` intentionally; eager fetch loads all additives (including inactive) without the filter
+* {bad} **Validating additive bounds only in the frontend** — always enforce server-side via `Validator` implementation; the frontend can be bypassed
+* {bad} **Hardcoding day count method strings** — use the injected `Map<String, DayCountMethod>` bean to discover available methods dynamically
+* {bad} **Calling `setState()` on a loaded `CreditProduct` inside a long-running transaction** — prefer `CreditProductService`'s `getReference()` approach; otherwise you pay the cost of loading `additives` even when they aren't needed
+* {bad} **Overriding `ProductWebConfigurationSupport.initDefinitions()` without calling `super.initDefinitions()`** — silently drops the 12 SDK beans; controllers and actions vanish with no error at startup
+* {bad} **Returning entity instances from `findAdditiveModelsByProduct(...)`** — templates will trigger lazy loads per row; always return pre-materialized DTOs
+* {bad} **Rendering `RateEvaluationException.getMessage()` in the UI** — leaks expression text and internal keys (`rate123456`); surface `getVisibleMessage()` instead
+* {bad} **Using native SQL to read additives without re-applying `active = true`** — the `@SQLRestriction` is a Hibernate-layer filter; native queries see soft-deleted rows
+* {bad} **Calling `additiveRepository.removeAdditive(productId, additiveId)` without verifying parent state is DRAFT** — the native update has no guard; enforce state in the caller or in an action `when(...)` predicate
+* {bad} **Skipping `reloadPageHelper.reload(...)` in parent-child actions** — page stays stale after child mutation; `AddCreditProductAdditiveAction` is the canonical example of why you need it
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Product entity extends `CreditProduct` with business-specific fields
+* {todo} Additive entity extends `CreditProductAdditive` and implements `createOffer()`
+* {todo} `CreditType` constants defined in `@Configuration` class
+* {todo} `ProductWebConfigurationSupport` subclass registers all web components
+* {todo} `EntityFormService` populates engines, types, templates, and day count methods
+* {todo} `AdditiveFormValidator` enforces additive bounds against product bounds
+* {todo} `CreditProductAdditiveFormService` implements `findAdditiveModelsByProduct()` and `assembleProductData()`
+* {todo} MapStruct mappers created for both product and additive forms
+* {todo} Thymeleaf templates created: list, edit, copy, details tab, additives tab, add-additive modal
+* {todo} Database migration adds custom columns to `credit_product` and `credit_product_additive` tables
+* {todo} i18n messages defined for product fields, states, additive fields, and validation errors
+* {todo} At least one `ScheduledEngine` implementation registered with matching bean name
+* {todo} State label component created for product state display in list views
+* {todo} L2 cache enabled for product entities (default in SDK, verify in your config)
+* {todo} Rate expressions tested with `LoanRateService.printLoanRateValue()` before activation
+* {todo} `ProductWebConfiguration` passes all five class literals to `ProductWebConfigurationSupport` constructor
+* {todo} Any `initDefinitions()` override calls `super.initDefinitions()` first
+* {todo} Project-specific actions use `@Order` values that do not collide with SDK landmarks (16700 / 19000 / 20000 / 25000)
+* {todo} Custom additive form service's `findAdditiveModelsByProduct(...)` returns DTOs, not entities
+* {todo} Reference-rate abbreviations used in rate expressions exist in `ReferenceRateService` (see <<reference-data>>)
+* {todo} UI layer renders `RateEvaluationException.getVisibleMessage()` (never `getMessage()`)
+* {todo} Parent-child actions call `reloadPageHelper.reload(parent)` when mutating children
+* {todo} `CopyProductAction` override (if any) copies inactive additives intentionally or explicitly skips them
+* {todo} Offer engine mappings (`additive.offerEngines`) populated for each `ExecutionResultType` in `product.offerEngineTypes`
+* {todo} `ScheduledEngine` referenced by `product.engineName` exists as a Spring bean and integrates with <<credit-servicing>>
+
+---
+
+**Related:** <<product-web-components-configuration>>, <<offer-engine>>, <<offer-engine-credit-products>>, <<credit-management>>, <<credit-management-system>>, <<credit-servicing>>, <<servicing-engines>>, <<reference-data>>
+
+**Next:** <<offer-engine-credit-products>>, <<entity-actions>>

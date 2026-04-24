@@ -1,0 +1,997 @@
+[[storage]]
+[[document-storage]]
+= Document Storage — backends, encryption, integrity
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The storage module (`com.timvero.ground.service.storage`) is the SDK layer that writes and reads every file the application handles — uploaded documents, generated PDFs, email attachments, exported reports. It decouples the business code from the underlying storage medium, provides transparent encryption-at-rest, and tracks integrity via MD5. Most application code doesn't call it directly — higher-level services (`EntityDocumentService`, `SignableDocumentService`, `ExcelExportProcessor`) delegate here.
+
+== What You Need to Know
+
+The module has **four layers** — each cleanly separated:
+
+[cols="1,3,2", options="header"]
+|===
+|Layer |Role |Key types
+
+|**Orchestrator**
+|Single `@Service` application code interacts with — resolves the right backend, wires encryption, persists metadata
+|`DocumentStorage`
+
+|**Backend SPI**
+|Interface every concrete storage implements — type name, create/load/remove operations
+|`Storage`, `AbstractFileStorage`
+
+|**Value object**
+|Carries file content + metadata between layers — two flavors (eager byte array or lazy input stream)
+|`DocumentResource`
+
+|**Encryption**
+|Optional transparent cipher applied to every stored file
+|`InputStreamCipher`, `SimpleInputStreamCipher`
+|===
+
+Key characteristics:
+
+- **Pluggable backends** — `FileStorage` (local filesystem) ships with the SDK; register a `@Service` implementing `Storage` with a unique `type()` to add S3/GCS/Azure/any other medium
+- **Multi-backend in one application** — the `storage.document.main` property picks the default; individual `Document` rows remember which backend stored them, so migrations can mix old and new
+- **Integrity via MD5** — computed on write, stored on the `Document` entity, verifiable on read
+- **Filename sanitization** — `escapePath` strips illegal chars, collapses directory traversal (`..`), appends a UUID to prevent collisions
+- **Transparent AES/GCM encryption** — enable via `storage.document.encrypt.key`; the cipher sits between application and backend, invisible to both
+- **`Document` is `@Immutable`** — once persisted, never updated; re-uploads create new rows
+- **Separate transaction for writes** — `storeDocument` uses `REQUIRES_NEW`; a failed upload doesn't roll back the caller's business transaction
+
+== Architecture Overview
+
+[source]
+----
+                Application code
+                       │
+                       │  uploadFile(entity, file)
+                       ▼
+         ┌──────────────────────────────┐
+         │  EntityDocumentService       │    (higher-level service)
+         │  SignableDocumentService     │
+         │  NotificationGateway         │
+         │  ExcelExportProcessor        │
+         └──────────────┬───────────────┘
+                        │
+                        │  storeDocument(folder, DocumentResource)
+                        ▼
+         ┌──────────────────────────────┐
+         │  DocumentStorage @Service    │
+         └──────────────┬───────────────┘
+                        │
+                ┌───────┴────────┐
+                │                │
+        (optional) cipher        │
+                │                │
+                ▼                │
+    ┌───────────────────┐        │
+    │ InputStreamCipher │        │
+    │ (AES/GCM wrap)    │        │
+    └──────────┬────────┘        │
+               │                 │
+               └────────┬────────┘
+                        │
+                        │  getMainStorage() → Storage
+                        ▼
+         ┌──────────────────────────────┐
+         │  Storage backend impl        │
+         │   type() == "file" → FileStorage
+         │   type() == "s3"   → MyS3Storage
+         │   type() == ...              │
+         └──────────────┬───────────────┘
+                        │
+                        │  create(folder, resource) → Document
+                        │   (MD5 computed during write)
+                        ▼
+                    ┌─────────┐
+                    │ Document│   persisted row with
+                    │  entity │   content_type, filename, path,
+                    │         │   hash (MD5), storage (backend type),
+                    │         │   meta (cipher IV if encrypted)
+                    └─────────┘
+----
+
+== DocumentStorage — The Orchestrator
+
+The sole `@Service` application code interacts with directly:
+
+[cols="2,3", options="header"]
+|===
+|Method |Behavior
+
+|`storeDocument(String folder, DocumentResource resource)` → `Document`
+|Write content to the main backend. Runs in `@Transactional(propagation = REQUIRES_NEW)` — a write failure doesn't roll back the caller's transaction. Returns the persisted `Document` row.
+
+|`getDocumentResource(Document document)` → `DocumentResource`
+|Read content from the backend that wrote it (honors `document.storage`). Auto-decrypts if the document was stored encrypted.
+
+|`getDocumentById(UUID documentId)` → `Document`
+|Load the `Document` entity by id + initialize it via `Hibernate.initialize` (handles lazy proxies).
+
+|`deleteFile(Document document)`
+|Remove both the physical file (from its backend) and the `Document` row.
+|===
+
+Typical usage from a service:
+
+[source,java]
+----
+@Autowired private DocumentStorage documentStorage;
+
+public EntityDocument saveUpload(HasDocuments owner, DocumentResource resource) {
+    Document document = documentStorage.storeDocument(
+        folder(owner), resource);             // <1>
+    EntityDocument entityDoc = new EntityDocument(owner.getId(), document, type);
+    entityManager.persist(entityDoc);
+    return entityDoc;
+}
+
+private String folder(HasDocuments owner) {
+    return Hibernate.getClass(owner).getSimpleName() + "/" + owner.getId() + "/uploaded";
+}
+----
+<1> Folder is a logical path within the backend — for `FileStorage`, a subdirectory under `storage.file.location`; for S3, an object-key prefix. Convention `<EntityClass>/<id>/<kind>` is widely used in the SDK.
+
+=== Multi-Backend Selection
+
+`DocumentStorage` holds a `List<Storage>` and picks the right one per operation:
+
+[source]
+----
+storeDocument(folder, resource) {
+    storage = getMainStorage();   // by storage.document.main property → type() match
+    ...
+}
+
+getDocumentResource(document) {
+    storage = getStorage(document);   // by document.getStorage() → type() match
+    ...
+}
+----
+
+This lets you migrate backends incrementally: set `storage.document.main=s3` for new uploads, but existing `Document` rows with `storage="file"` still read from `FileStorage`. The two backends coexist until the migration completes.
+
+=== Configuration
+
+[source,properties]
+----
+# Which backend to use for new uploads (default: "file")
+storage.document.main=file
+
+# Local filesystem backend — root directory for files
+storage.file.location=/var/lib/app/storage
+
+# (Optional) enable encryption — see Encryption section
+storage.document.encrypt.key=<64-char-hex>
+
+# (Optional) override encryption algorithm — default AES/GCM/NoPadding
+storage.document.algorithm.key=AES/GCM/NoPadding
+----
+
+The `storage.file.location` property activates `FileStorage` via `@ConditionalOnProperty`. Without it, no `"file"` backend is registered — `storeDocument` throws `"Storage not found: file"` on first call.
+
+== Storage SPI — Adding a Backend
+
+The `Storage` interface is all you need to implement:
+
+[source,java]
+----
+public interface Storage {
+
+    default String escapePath(String filename) { /* ... */ }      // <1>
+
+    String type();                                                 // <2>
+
+    Document create(String folder, DocumentResource resource)
+        throws IOException;                                        // <3>
+
+    DocumentResource load(Document document) throws IOException;   // <4>
+
+    void remove(Document document) throws IOException;             // <5>
+}
+----
+<1> Filename sanitization — strips `\/:*?"<>|+`, collapses `..` sequences, appends a random UUID suffix before the extension. Most backends use the default; override only for backend-specific character restrictions.
+<2> Unique identifier like `"file"`, `"s3"`, `"azure"`. Must match exactly the value in `storage.document.main` to be picked as the main backend and must be stored on each `Document.storage` so reads route correctly.
+<3> Write content. Must compute MD5 hash during the write (streaming — don't buffer the whole file). Return a new `Document` with all fields populated.
+<4> Read content back. Return a `DocumentResource` with a lazy `InputStreamSource` — don't buffer into memory.
+<5> Delete the physical file. Don't delete the `Document` row — `DocumentStorage.deleteFile` does that separately.
+
+=== AbstractFileStorage — Template for File-Like Backends
+
+For any backend where you can treat content as a stream (local FS, S3, GCS, Azure Blob), `AbstractFileStorage` handles the boilerplate:
+
+[source,java]
+----
+public abstract class AbstractFileStorage implements Storage {
+
+    @Override
+    public Document create(String folder, DocumentResource resource) throws IOException {
+        String docPath = folder + "/" + escapePath(resource.getFilename());
+        byte[] md5 = resource.read(is -> {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            try (InputStream stream = new DigestInputStream(is, md)) {
+                write(docPath, stream);                              // <1>
+            }
+            return md.digest();
+        });
+        return new Document(resource.getContentType(), resource.getContentEncoding(),
+            resource.getFilename(), docPath, md5, type());
+    }
+
+    @Override
+    public DocumentResource load(Document document) throws IOException {
+        return new DocumentResource(document.getFilename(),
+            document.getContentType(), document.getContentEncoding(),
+            () -> read(document.getPath()));                         // <2>
+    }
+
+    @Override
+    public void remove(Document document) throws IOException {
+        delete(document.getPath());                                  // <3>
+    }
+
+    protected abstract void write(String docPath, InputStream stream) throws IOException;
+    protected abstract InputStream read(String docPath) throws IOException;
+    protected abstract void delete(String docPath) throws IOException;
+}
+----
+<1> The template wraps the incoming stream in `DigestInputStream` so MD5 is computed as the content flows through to `write()`. Subclasses only need to move bytes; hashing is automatic.
+<2> `load` returns a `DocumentResource` with a lazy `InputStreamSource` — the backend's `read()` isn't called until the consumer actually reads the stream. This avoids downloading the whole file just to check metadata.
+<3> `remove` deletes from the storage; `DocumentStorage` then deletes the JPA row.
+
+Implement a new backend in ~40 lines:
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.s3.bucket")
+public class S3Storage extends AbstractFileStorage {
+
+    @Value("${storage.s3.bucket}") private String bucket;
+    @Autowired private S3Client s3;
+
+    @Override public String type() { return "s3"; }
+
+    @Override
+    protected void write(String docPath, InputStream stream) throws IOException {
+        s3.putObject(PutObjectRequest.builder().bucket(bucket).key(docPath).build(),
+            RequestBody.fromInputStream(stream, -1 /* unknown length */));
+    }
+
+    @Override
+    protected InputStream read(String docPath) throws IOException {
+        return s3.getObject(GetObjectRequest.builder().bucket(bucket).key(docPath).build());
+    }
+
+    @Override
+    protected void delete(String docPath) throws IOException {
+        s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(docPath).build());
+    }
+}
+----
+
+Switch to this backend with:
+
+[source,properties]
+----
+storage.document.main=s3
+storage.s3.bucket=my-bucket
+----
+
+Existing `Document` rows with `storage="file"` keep reading from `FileStorage` — use a background job to migrate them if needed.
+
+=== FileStorage — The Default
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.file.location")
+public class FileStorage extends AbstractFileStorage {
+
+    @Value("${storage.file.location}") private String documentFolder;
+
+    @Override public String type() { return "file"; }
+
+    @Override
+    protected void write(String docPath, InputStream stream) throws IOException {
+        Path path = Paths.get(documentFolder, docPath);
+        Files.createDirectories(path.getParent());
+        Files.copy(stream, path);
+    }
+
+    @Override
+    protected InputStream read(String docPath) throws IOException {
+        return Files.newInputStream(Paths.get(documentFolder, docPath));
+    }
+
+    @Override
+    protected void delete(String docPath) throws IOException {
+        Files.delete(Paths.get(documentFolder, docPath));
+    }
+}
+----
+
+Simple, concrete, testable. For single-node deployments or local development, this is all you need. For production, mount `documentFolder` on shared storage (NFS, EBS with snapshots, or the OS's equivalent).
+
+== Built-in Backends
+
+Beyond `FileStorage`, the SDK ships five cloud/remote backends under `com.timvero.service.impl.storage`. Each is a `@Service` gated by `@ConditionalOnProperty` — the bean only registers when its activation property is set, so you can leave every backend on the classpath and pick one (or several) per environment. Switch the active backend by matching `storage.document.main` to the backend's `type()` value.
+
+[cols="1,2,1,3", options="header"]
+|===
+|Backend |Activation property |`type()` |Use case
+
+|`AmazonS3Storage`
+|`storage.amazon.bucket`
+|`s3`
+|AWS S3 or any S3-compatible service reachable by a static endpoint
+
+|`GoogleCloudStorage`
+|`storage.gcs.bucket`
+|`gcs`
+|Google Cloud Storage — uses Application Default Credentials by default
+
+|`MinioStorage`
+|`storage.minio.bucket`
+|`minio`
+|Self-hosted S3-compatible object storage (on-prem, air-gapped)
+
+|`AlibabaCloudStorage`
+|`storage.alibaba.endpoint`
+|`oss`
+|Alibaba Cloud OSS — China-region deployments
+
+|`SmbStorage`
+|`storage.smb.url`
+|`smb`
+|Windows SMB / CIFS shares, legacy NAS, Active Directory-integrated file servers
+|===
+
+All five implement `Storage` directly except `SmbStorage`, which extends `AbstractFileStorage` and gets MD5 hashing for free. The four cloud backends hash manually — either because the SDK response already contains an MD5/ETag (`s3`, `gcs`) or because they wrap their own `DigestInputStream` (`minio`). `AlibabaCloudStorage` stores the raw ETag bytes as the hash — see the caveat below.
+
+=== AmazonS3Storage
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.amazon.bucket")
+public class AmazonS3Storage implements Storage {
+    @Value("${storage.amazon.accessKey:}")  private String accessKey;
+    @Value("${storage.amazon.secretKey:}")  private String secretKey;
+    @Value("${storage.amazon.region}")      private String region;
+    @Value("${storage.amazon.endpoint:}")   private String endpoint;
+    @Value("${storage.amazon.bucket}")      private String bucket;
+    @Value("${storage.amazon.folder:}")     private String rootFolder;
+}
+----
+
+- {ok} **Credentials are optional** — if `storage.amazon.accessKey` is blank, the AWS SDK falls back to the default provider chain (IAM role on EC2/ECS/EKS, env vars, `~/.aws/credentials`). Prefer IAM roles in AWS; avoid static keys on disk.
+- {ok} **Custom endpoint supported** — set `storage.amazon.endpoint` to point at S3-compatible services (Wasabi, DigitalOcean Spaces, LocalStack for tests). Path-style access is enabled automatically when an endpoint is set.
+- {ok} **MD5 from the response** — `putObject` returns a base64 content MD5; decoded via `BinaryUtils.fromBase64`. No local digest pass needed.
+- {ok} **Optional prefix** — `storage.amazon.folder` prepends to every key; useful when one bucket hosts multiple environments or tenants.
+- {bad} **Uses the v1 SDK** (`com.amazonaws.*`) — AWS has deprecated this in favour of v2. The class includes a reflection hack to reroute Apache HttpClient logs to `aws.*` categories so wire-level chatter doesn't pollute your application logs.
+
+=== GoogleCloudStorage
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.gcs.bucket")
+public class GoogleCloudStorage implements Storage {
+    @Value("${storage.gcs.bucket}")       private String bucketName;
+    @Value("${storage.gcs.credentials:}") private Resource credentialsResource;
+}
+----
+
+- {ok} **Two credential modes** — `storage.gcs.credentials` accepts any Spring `Resource` (classpath, file, URL) pointing at a service-account JSON key. When unset, `StorageOptions.getDefaultInstance()` uses Application Default Credentials (GKE workload identity, `GOOGLE_APPLICATION_CREDENTIALS` env var, gcloud login).
+- {ok} **MD5 from the response** — `Blob.getMd5ToHexString()` decoded via Spring's `Hex.decode(...)`; hashing matches what's stored server-side.
+- {ok} **Streaming upload** — `storage.createFrom(blobInfo, inputStream)` chunks automatically; no whole-file buffering.
+- {bad} **No key prefix / folder option** — unlike S3, GCS writes directly under `folder + "/" + filename`. Use bucket naming for multi-tenant separation.
+
+=== MinioStorage
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.minio.bucket")
+public class MinioStorage implements Storage {
+    @Value("${storage.minio.accessKey}") private String accessKey;
+    @Value("${storage.minio.secretKey}") private String secretKey;
+    @Value("${storage.minio.endpoint}")  private String endpoint;
+    @Value("${storage.minio.bucket}")    private String bucket;
+}
+----
+
+- {ok} **Static credentials required** — MinIO doesn't participate in cloud IAM; `accessKey`/`secretKey` are mandatory. Rotate via MinIO admin and redeploy.
+- {ok} **Manual MD5** — wraps the upload stream in `DigestInputStream` (same pattern `AbstractFileStorage` uses). MinIO's server ETag is ignored because multipart uploads change its semantics.
+- {ok} **Endpoint is the full URL** (`http://minio.local:9000`) — MinIO is typically behind your own ingress; plain HTTP is fine on a trusted network.
+- {bad} **Part size hardcoded to 10 MiB** — `PutObjectArgs.stream(stream, -1, 10485760)`; files larger than ~80 GiB will overflow MinIO's 10 000-part limit. Fork the class if you need tuning.
+
+=== AlibabaCloudStorage
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.alibaba.endpoint")
+public class AlibabaCloudStorage implements Storage {
+    @Value("${storage.alibaba.endpoint}")   private String endpoint;
+    @Value("${storage.alibaba.accessKey}")  private String accessKey;
+    @Value("${storage.alibaba.secretKey}")  private String secretKey;
+    @Value("${storage.alibaba.bucket}")     private String bucket;
+    @Value("${storage.alibaba.identifier}") private String identifier;
+}
+----
+
+- {ok} **Static credentials only** — `DefaultCredentialProvider(accessKey, secretKey)`; no STS / RAM-role integration in this class. Use Alibaba RAM users with narrow bucket permissions.
+- {ok} **Identifier prefix is mandatory** — keys look like `<identifier>/<folder>/<filename>`. Set it to your tenant / deployment code; cannot be blank.
+- {bad} **Hash is the ETag string bytes, not a real MD5** — `result.getETag().getBytes()` (the source even has a `// TODO: ???` comment). The `Document.hash` column will be populated but won't match a re-computed MD5 of the content. Don't rely on `hash` for integrity checks when using this backend; see <<md5-integrity-verification>>.
+- {bad} **Activation key is `endpoint`, not `bucket`** — inconsistent with the other cloud backends. Setting `storage.alibaba.bucket` alone doesn't activate the bean.
+
+=== SmbStorage
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("storage.smb.url")
+public class SmbStorage extends AbstractFileStorage {
+    @Value("${storage.smb.domain}")                 private String domain;
+    @Value("${storage.smb.username}")               private String username;
+    @Value("${storage.smb.password}")               private String password;
+    @Value("${storage.smb.url}")                    private String serviceUrl;
+    @Value("${storage.smb.responseTimeout:3000}")   private int responseTimeout;
+}
+----
+
+- {ok} **Extends `AbstractFileStorage`** — the only built-in cloud/remote backend that does; MD5 is computed by the template via `DigestInputStream` wrapping, identical to `FileStorage`.
+- {ok} **NTLM auth** via `NtlmPasswordAuthenticator`; `domain` is optional (pass blank for workgroup-style shares).
+- {ok} **Parent directories auto-created** — `write()` calls `folder.mkdirs()` before opening the output stream.
+- {bad} **Single persistent `SmbFile` handle** held across the bean's lifetime — on long network interruptions the JCIFS client may need a restart. Wrap in a supervisor or rely on Kubernetes liveness probes if the share is flaky.
+- {bad} **Plaintext SMB password in properties** — always inject via a secrets manager, never commit to `application.properties`.
+
+=== Filename Sanitization
+
+`Storage.escapePath()` performs three transformations:
+
+[source]
+----
+"../../etc/passwd.txt"
+    │
+    │  1. replace illegal chars [\\/:*?"<>|+] with '_'
+    ▼
+"___etc_passwd.txt"
+    │
+    │  2. collapse consecutive dots to a single dot
+    ▼
+"___etc_passwd.txt"
+    │
+    │  3. append UUID suffix before extension
+    ▼
+"___etc_passwd_e1a3b9f4d67742b8a1c5d2e6f7a8b9c0.txt"
+----
+
+Protects against:
+
+- **Directory traversal** — the `..` collapse prevents escaping the storage root
+- **Filesystem characters** — Windows/Unix reserved characters are neutralized (cross-platform safety)
+- **Filename collisions** — the UUID guarantees uniqueness even if two uploads have identical names
+
+The UUID suffix means identical uploads produce different stored paths — dedup is not handled here; it's the caller's responsibility if needed.
+
+== DocumentResource — Two Flavors
+
+`DocumentResource` carries file content + metadata between layers. It has two backing modes:
+
+[cols="2,3,3", options="header"]
+|===
+|Mode |When it's used |Trade-off
+
+|**Eager** (`byte[] data`)
+|Small files, API uploads (already buffered by Spring MVC), generated content (Excel exports)
+|Simple — `getData()` returns immediately; but the whole file is in heap memory
+
+|**Lazy** (`InputStreamSource streamSource`)
+|Reads from storage backends, large files, streaming downloads
+|`getData()` reads the stream on demand; streams can only be consumed once
+|===
+
+The constructor picks the mode:
+
+[source,java]
+----
+// Eager — for generated content you already have in memory
+new DocumentResource("report.xlsx", "application/octet-stream", null, excelBytes);
+
+// Lazy — for content behind an InputStream
+new DocumentResource("scan.pdf", "application/pdf", null,
+    () -> Files.newInputStream(path));
+----
+
+=== API
+
+[cols="2,3", options="header"]
+|===
+|Method |Behavior
+
+|`getData()`
+|Returns the content as `byte[]`. For eager resources, returns the existing array. For lazy, reads the stream fully into memory and caches — subsequent calls return the cached array.
+
+|`read(InputStreamFunction<R>)`
+|Process the content via a lambda. Opens the stream, applies the function, closes the stream. Preferred for lazy resources when you want to avoid buffering.
+
+|`process(InputStreamConsumer)`
+|Same as `read` but for consumers (no return value).
+
+|`getText(Charset)`
+|Read as `String` via `getData()` + charset decoding. Buffers the whole content.
+
+|`getInputStreamSource()`
+|Raw access to the stream supplier — used by SDK internals, rarely by app code.
+|===
+
+TIP: Use `read(is -> ...)` or `process(is -> ...)` for large files — these handle stream lifecycle correctly (auto-close via try-with-resources). Reaching for `getData()` on a 500MB PDF OOMs the JVM.
+
+=== Gzip Helpers
+
+[source,java]
+----
+// Compress a resource
+DocumentResource compressed = DocumentResource.gzip(original);
+// -> contentEncoding = "gzip", content is gzipped bytes
+
+// Decompress a resource
+DocumentResource decompressed = DocumentResource.ungzip(compressedFromStorage);
+// -> contentEncoding = null, content is the original bytes
+// -> filename gets .xml or .json extension based on contentType
+----
+
+`gzip()` refuses to compress if `contentEncoding` is already set (avoids double-compression). `ungzip()` is a pass-through for non-gzip resources — safe to call unconditionally.
+
+Use cases:
+
+- **API responses** — serve gzip-encoded stored content directly when the client accepts it
+- **Storage savings** — gzip-compress before `storeDocument` for large text/XML/JSON
+- **Network transfer** — send compressed between services
+
+== The `Document` Entity
+
+Every file written through `DocumentStorage` produces a `Document` row:
+
+[source,java]
+----
+@Entity @Table(name = "document")
+@Immutable                                          // <1>
+@NotTrackable                                       // <2>
+public class Document extends UUIDPersistable {
+
+    @CreatedDate    private Instant createdAt;
+    @CreatedBy      private Auditor createdBy;
+
+    private String contentType;                     // "application/pdf"
+    private String contentEncoding = "identity";    // "identity" | "gzip"
+    private String filename;                        // original user filename
+    private String path;                            // sanitized path within backend
+    private byte[] hash;                            // MD5 — 16 bytes
+    private String storage;                         // backend "type()" — "file" / "s3" / ...
+    private String meta;                            // encryption IV, backend-specific metadata
+}
+----
+<1> `@Immutable` — Hibernate won't generate UPDATE queries. Once written, the row is read-only. Re-uploading a file creates a new row; use soft-delete semantics on owner entities (e.g., `EntityDocument.active`) rather than mutating `Document`.
+<2> `@NotTrackable` — excluded from the reload subsystem (see <<reload-infrastructure-live-ui-updates-on-entity-changes>>) so file churn doesn't flood UI reload events.
+
+The `storage` field is how `DocumentStorage.getStorage(document)` routes reads to the right backend. The `meta` field is backend-specific — for encrypted content, it holds the AES GCM IV (hex-encoded). Note that `meta`'s getter/setter are **package-private** — application code reads and writes it through <<documenthelper-controlled-access-to-the-meta-field,`DocumentHelper`>>, never directly.
+
+=== DocumentHelper — Controlled Access to the `meta` Field
+
+The `Document` class keeps `meta`'s accessors package-private on purpose — no public setter, no public getter:
+
+[source,java]
+----
+@Entity @Immutable
+public class Document extends UUIDPersistable {
+
+    @Column(name = "meta", length = 4000, updatable = false)
+    private String meta;
+
+    // ...
+
+    String getMeta() { return meta; }     // <1>
+    void setMeta(String meta) { this.meta = meta; }
+}
+----
+<1> Package-private — only types in `com.timvero.structure.storage.entity` can call these directly.
+
+`DocumentHelper` is the **public bridge** — a final utility class in the same package that exposes two static methods:
+
+[source,java]
+----
+public final class DocumentHelper {
+
+    private DocumentHelper() {}
+
+    public static void setDocumentMeta(Document document, String meta) {
+        document.setMeta(meta);
+    }
+
+    public static String getDocumentMeta(Document document) {
+        return document.getMeta();
+    }
+}
+----
+
+Why this indirection rather than a plain public getter/setter on `Document` itself?
+
+- {ok} **`meta` is SDK-internal** — it carries cipher IVs, backend-specific metadata, anything the storage layer needs to round-trip. Exposing it as a first-class field invites application code to stuff unrelated data in there
+- {ok} **The field is `updatable = false`** — Hibernate won't emit UPDATE for `meta` after insert. A public setter would suggest mutation is allowed; the package-private accessor makes it clear only the initial write (during `storeDocument`) counts
+- {ok} **`Document` is `@Immutable`** — adding public setters would contradict the contract. Routing writes through an explicit helper preserves the "read-only after insert" story while leaving a narrow hatch for the SDK's own encoding logic
+- {bad} **Application code reaching for `DocumentHelper.setDocumentMeta(...)` is a smell** — the only legitimate caller is `DocumentStorage` during the encode step; if you need to attach custom metadata to a document, model it on the referencing entity (e.g., `EntityDocument`) instead
+
+Typical SDK-internal usage (inside `DocumentStorage.storeDocument`):
+
+[source,java]
+----
+if (cipher != null) {
+    EncodedResource encoded = cipher.encode(resource.getInputStreamSource().getInputStream());
+    Document document = storage.create(folder, wrap(resource, encoded.stream()));
+    DocumentHelper.setDocumentMeta(document, encoded.metaSupplier().get());   // <1>
+    return document;
+}
+----
+<1> The cipher's IV (or whatever `metaSupplier` produces) is written to the fresh `Document` before its transaction commits. On read, `DocumentHelper.getDocumentMeta(document)` feeds the IV back into `cipher.decode(...)`.
+
+Think of `DocumentHelper` as a capability grant — it exists precisely so the SDK's encryption and backend layers can read/write `meta` without the entity itself leaking the field to every consumer on the classpath.
+
+=== `DocumentRepository`
+
+The Spring Data repository for `Document` is deliberately minimal:
+
+[source,java]
+----
+public interface DocumentRepository extends JpaRepository<Document, UUID> {
+}
+----
+
+That's the full contract — no custom finders, no query methods, no projections. Everything you need comes from `JpaRepository`:
+
+- `findById(UUID)`, `findAllById(Iterable<UUID>)` — lookup by primary key
+- `save(Document)` — insert on creation (no updates reach the row; `@Immutable` blocks them)
+- `delete(Document)`, `deleteById(UUID)` — used by `DocumentStorage.deleteFile` after the physical file is removed from its backend
+- `existsById(UUID)`, `count()` — housekeeping
+
+The repository is injected into `DocumentStorage` and is **not** intended for direct use by application code:
+
+- {bad} **Calling `documentRepository.save(...)` from a service** — bypasses backend write, MD5 hashing, encryption, and metadata wiring; leaves a `Document` row pointing at a file that doesn't exist
+- {bad} **Calling `documentRepository.delete(...)` directly** — removes the DB row but leaves the file on disk (or in S3), accumulating orphan bytes
+- {ok} **Read-only lookups in reporting / admin tools** — `findById` is fine for inspection; prefer `DocumentStorage.getDocumentById(...)` which also runs `Hibernate.initialize` for safe lazy traversal
+
+If you need to enumerate documents for a reconciliation job (see <<transaction-semantics-why-requires_new,Transaction Semantics>>), compose queries on the **referencing business entity** (e.g., `EntityDocumentRepository.findByDocumentIdNotIn(...)`) rather than adding finders here — `DocumentRepository` stays generic so the SDK can evolve the entity without breaking downstream query method names.
+
+== Encryption-at-Rest
+
+The storage layer supports transparent encryption through the `InputStreamCipher` SPI:
+
+[source,java]
+----
+public interface InputStreamCipher {
+
+    record EncodedResource(InputStream stream, Supplier<String> metaSupplier) {}
+
+    EncodedResource encode(InputStream stream);                     // <1>
+    InputStream decode(InputStream stream, String meta);            // <2>
+}
+----
+<1> Returns the encrypted stream plus a supplier for metadata (typically the IV) that needs to be stored on the `Document` row for later decryption.
+<2> Reverses the operation — gets the metadata back from `Document.meta` and produces a decrypted stream.
+
+=== SimpleInputStreamCipher — AES/GCM Default
+
+Activates when `storage.document.encrypt.key` is set:
+
+[source,java]
+----
+@Component
+@ConditionalOnProperty("storage.document.encrypt.key")
+public class SimpleInputStreamCipher implements InputStreamCipher {
+
+    @Value("${storage.document.algorithm.key:AES/GCM/NoPadding}")
+    private String algorithm;
+
+    @Value("${storage.document.encrypt.key}")
+    private String hexKey;                                          // <1>
+
+    @Override
+    public EncodedResource encode(InputStream stream) {
+        byte[] iv = new byte[12];
+        new SecureRandom().nextBytes(iv);                           // <2>
+        Cipher cipher = /* create with ENCRYPT_MODE, IV, key */;
+        return new EncodedResource(
+            new CipherInputStream(stream, cipher),
+            () -> new String(Hex.encode(iv))                        // <3>
+        );
+    }
+
+    @Override
+    public InputStream decode(InputStream stream, String meta) {
+        byte[] iv = Hex.decode(meta);                               // <4>
+        Cipher cipher = /* create with DECRYPT_MODE, IV, key */;
+        return new CipherInputStream(stream, cipher);
+    }
+}
+----
+<1> Hex-encoded AES key from `storage.document.encrypt.key` property (256-bit → 64 hex chars). Decoded once at startup into a `SecretKey`.
+<2> **Fresh IV per encryption** — 96 bits (12 bytes), cryptographically random. GCM requires unique IV per (key, plaintext) pair; reuse catastrophically leaks the key.
+<3> The IV is returned as hex-encoded metadata and stored on `Document.meta`.
+<4> On decrypt, the IV comes back from `Document.meta` and is used to reverse the cipher.
+
+=== Flow With Encryption
+
+[source]
+----
+storeDocument(folder, resource) {
+    if (cipher != null) {
+        encoded = cipher.encode(resource.inputStream);
+        // encoded.stream is encrypted
+        document = storage.create(folder, wrap(resource, encoded.stream));
+        DocumentHelper.setDocumentMeta(document,
+            encoded.metaSupplier.get());               // store IV (package-private bridge)
+    } else {
+        storage.create(folder, resource);
+    }
+}
+
+getDocumentResource(document) {
+    resource = storage.load(document);                  // still encrypted
+    String meta = DocumentHelper.getDocumentMeta(document);
+    if (cipher != null && meta != null) {
+        return cipher.decode(resource.inputStream, meta);
+    }
+    return resource;
+}
+----
+
+Enabling encryption mid-flight is safe — existing `Document` rows have `meta = null`, so they skip the decryption step even when the cipher bean is present. New uploads are encrypted; old ones read as plaintext.
+
+=== Key Management
+
+The default `SimpleInputStreamCipher` reads the key from a single property. For production, this should come from:
+
+- **Kubernetes Secrets / HashiCorp Vault / AWS KMS** — resolved at startup into the property value
+- **Environment variables** — `STORAGE_DOCUMENT_ENCRYPT_KEY` mapped to the property
+- **Never in source control** — obvious, but worth restating
+
+For key rotation or HSM-based encryption, implement a custom `InputStreamCipher` that delegates to your key management system. The `meta` field on `Document` can hold arbitrary JSON — carry the key version, HSM identifier, or any other metadata needed for decryption.
+
+== Advanced Patterns
+
+=== Downloading Directly From an Endpoint
+
+[source,java]
+----
+@GetMapping("/document/{id}/download")
+public ResponseEntity<InputStreamResource> download(@PathVariable UUID id) throws IOException {
+    Document document = documentStorage.getDocumentById(id);
+    DocumentResource resource = documentStorage.getDocumentResource(document);
+
+    return ResponseEntity.ok()
+        .contentType(MediaType.parseMediaType(resource.getContentType()))
+        .header(HttpHeaders.CONTENT_DISPOSITION,
+                "attachment; filename=\"" + resource.getFilename() + "\"")
+        .body(new InputStreamResource(resource.getInputStreamSource().getInputStream()));
+}
+----
+
+Spring streams the response — the content never buffers into memory. Works identically with or without encryption.
+
+=== HttpUtils — Download & Inline-View Helpers
+
+The SDK's `com.timvero.ground.tools.HttpUtils` wraps the boilerplate above with safer defaults — URL-encoded filenames, security headers, and separate "download" vs "view inline" actions:
+
+[source,java]
+----
+public class HttpUtils {
+
+    public static ResponseEntity<InputStreamResource> fileDownload(DocumentResource resource)
+        throws IOException;                                          // <1>
+
+    public static ResponseEntity<InputStreamResource> fileView(DocumentResource resource)
+        throws IOException;                                          // <2>
+
+    public static HttpHeaders headers(String fileName, String contentType,
+                                       String contentEncoding, String actionType);
+
+    public static String contentDisposition(String fileName, String actionType);
+}
+----
+<1> `Content-Disposition: attachment` — browser shows Save-As dialog. Use for PDFs, XLS, ZIPs, anything users should download rather than preview.
+<2> `Content-Disposition: inline` — browser renders in-place if it can (PDFs, images, text). Use for in-app document previews.
+
+Replace the manual endpoint with two lines:
+
+[source,java]
+----
+@GetMapping("/document/{id}/download")
+public ResponseEntity<InputStreamResource> download(@PathVariable UUID id) throws IOException {
+    Document document = documentStorage.getDocumentById(id);
+    DocumentResource resource = documentStorage.getDocumentResource(document);
+    return HttpUtils.fileDownload(resource);
+}
+
+@GetMapping("/document/{id}/preview")
+public ResponseEntity<InputStreamResource> preview(@PathVariable UUID id) throws IOException {
+    Document document = documentStorage.getDocumentById(id);
+    DocumentResource resource = documentStorage.getDocumentResource(document);
+    return HttpUtils.fileView(resource);
+}
+----
+
+Headers set automatically by `HttpUtils.headers`:
+
+[cols="2,3", options="header"]
+|===
+|Header |Value
+
+|`Content-Type`
+|From `DocumentResource.contentType` (if set)
+
+|`Content-Encoding`
+|From `DocumentResource.contentEncoding` (if set — e.g., `gzip`)
+
+|`Content-Security-Policy`
+|`frame-ancestors 'self'` — prevents embedding in third-party iframes
+
+|`X-Frame-Options`
+|`sameorigin` — same goal, older browsers
+
+|`Content-Disposition`
+|`attachment;filename="<URL-encoded-name>"` or `inline;filename="..."`
+|===
+
+The URL-encoding via `UriUtils.encodePath` handles Unicode filenames safely — a `"контракт.pdf"` becomes `"%D0%BA%D0%BE..."` rather than mangled ASCII. Use `HttpUtils` unless you need a non-default header configuration — the security defaults matter for production.
+
+[[md5-integrity-verification]]
+=== MD5 Integrity Verification
+
+`Document.hash` always holds the MD5 of the plaintext content at write time. Verify on critical reads:
+
+[source,java]
+----
+DocumentResource resource = documentStorage.getDocumentResource(document);
+byte[] expectedMd5 = document.getHash();
+
+byte[] actualMd5 = resource.read(is -> {
+    MessageDigest md = MessageDigest.getInstance("MD5");
+    try (InputStream digestStream = new DigestInputStream(is, md)) {
+        digestStream.transferTo(OutputStream.nullOutputStream());
+    }
+    return md.digest();
+});
+
+if (!Arrays.equals(expectedMd5, actualMd5)) {
+    throw new IntegrityViolationException(document.getId());
+}
+----
+
+Useful when:
+
+- A backend migration may have corrupted files
+- Storage media was restored from an uncertain backup
+- Regulatory requirements mandate periodic verification
+
+MD5 is not cryptographically strong against adversarial tampering — for that, use HMAC or a signed-hash at the application layer.
+
+=== Gzipped API Uploads
+
+Clients can upload `Content-Encoding: gzip` bodies; decompress before storing:
+
+[source,java]
+----
+@PostMapping("/upload")
+public void upload(@RequestHeader("Content-Type") String contentType,
+                    @RequestHeader(value = "Content-Encoding", required = false) String encoding,
+                    HttpServletRequest request) throws IOException {
+    InputStream body = request.getInputStream();
+    if ("gzip".equals(encoding)) {
+        body = new GZIPInputStream(body);
+    }
+    DocumentResource resource = new DocumentResource(
+        "upload.dat", contentType, null,
+        (InputStreamSource) () -> body);
+    documentStorage.storeDocument("uploads", resource);
+}
+----
+
+Or store as-is to save space:
+
+[source,java]
+----
+DocumentResource resource = new DocumentResource(
+    "upload.dat", contentType, "gzip",
+    (InputStreamSource) request::getInputStream);
+// contentEncoding = "gzip" — stored compressed; decompress on retrieval
+documentStorage.storeDocument("uploads", resource);
+----
+
+=== Transaction Semantics — Why REQUIRES_NEW
+
+`DocumentStorage.storeDocument` runs in its own transaction (`REQUIRES_NEW`). Practical consequence:
+
+[source,java]
+----
+@Transactional
+public EntityDocument uploadForm(HasDocuments owner, DocumentResource resource) {
+    Document document = documentStorage.storeDocument(folder(owner), resource);  // <1>
+    EntityDocument entityDoc = new EntityDocument(owner.getId(), document, type);
+    entityManager.persist(entityDoc);                                              // <2>
+
+    if (someCondition()) throw new ValidationException(...);                       // <3>
+
+    return entityDoc;
+}
+----
+<1> File written to backend, `Document` row committed in inner transaction — **the write is durable regardless of what happens next**
+<2> `EntityDocument` persisted in the outer transaction (not committed yet)
+<3> Validation failure rolls back the outer transaction — **but the file on disk and the `Document` row remain**
+
+In this scenario, a dangling `Document` row with no referencing `EntityDocument` pops into existence. The file stays on disk forever unless a cleanup job reconciles orphans.
+
+**Pattern to avoid orphans:** do validation BEFORE calling `storeDocument`, not after.
+
+**Pattern to clean up orphans:** nightly job that finds `Document` rows not referenced by any business entity and calls `documentStorage.deleteFile(...)`.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Always use `DocumentStorage`, not `Storage` directly** — the orchestrator handles backend selection, encryption, and metadata
+* {ok} **Use the `read(is -> ...)` pattern for large files** — keeps memory bounded; `getData()` reads everything into heap
+* {ok} **Set `storage.file.location` outside the application directory** — `/var/lib/app/storage` or similar; not next to the WAR
+* {ok} **Enable encryption for PII / financial documents** — `storage.document.encrypt.key`; implement key rotation via custom `InputStreamCipher`
+* {ok} **Implement the `Storage` interface via `AbstractFileStorage`** for any stream-based backend — MD5 hashing is automatic
+* {ok} **Use `@ConditionalOnProperty` on custom backends** — consistent with `FileStorage` pattern, keeps beans out of the context when the backend isn't configured
+* {ok} **Validate business constraints BEFORE calling `storeDocument`** — avoids orphan files from rolled-back transactions
+* {ok} **Capture the full `HexKey`** for AES-256 in the encryption property (64 hex chars); shorter keys get silently truncated
+* {ok} **Reconcile orphans on a schedule** — cross-check `Document.id` against every business table that references it
+* {ok} **Trust `Document.hash` for MD5 integrity checks** — it's computed during write, not retrofitted
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Calling `Storage` implementations directly** — bypasses encryption, multi-backend dispatch, and `Document` persistence; leaves inconsistent state
+* {bad} **Using `getData()` on large files** — reads the whole stream into memory; OOMs on hundreds of MBs
+* {bad} **Mutating `Document` fields after save** — the entity is `@Immutable`; attempts throw at commit time
+* {bad} **Reusing IVs** by hardcoding them in a custom cipher — GCM IV reuse is a catastrophic security break; always generate fresh random IVs
+* {bad} **Committing encryption keys to source control** — inevitable breach; use a secrets manager
+* {bad} **Storing `Document` references in long-lived caches** — the row is `@NotTrackable`, but cache eviction on deletion still matters for correctness
+* {bad} **Writing files to the storage root** (`folder=""`) — mixes files from different owners; impossible to clean up selectively
+* {bad} **Relying on `escapePath` for security** — it prevents accidental misuse, not determined attackers. Apply upload-source sanity checks at the controller
+* {bad} **Skipping the `@ConditionalOnProperty` on a custom backend** — the bean registers even when the backend is unconfigured; `type()` collision at startup
+* {bad} **Catching and swallowing `IOException` from `storeDocument`** — the transaction is already rolling back; the exception must propagate so the caller knows the upload failed
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `storage.document.main` set to the intended production backend
+* {todo} Chosen backend has its activation property set (`storage.file.location`, `storage.amazon.bucket`, `storage.gcs.bucket`, `storage.minio.bucket`, `storage.alibaba.endpoint`, `storage.smb.url`)
+* {todo} Exactly one built-in backend activates per environment (or each active backend has a unique `type()`) — avoids `Storage` bean collisions at startup
+* {todo} Cloud backends prefer IAM / workload-identity over static keys (`AmazonS3Storage` default provider chain, `GoogleCloudStorage` ADC); static keys stored in a secrets manager and rotated on a schedule
+* {todo} `AlibabaCloudStorage` users have a compensating integrity check — `Document.hash` stores the ETag, not a real MD5
+* {todo} Storage folder mounted on durable, shared, and backed-up media (local FS → NFS / EBS / snapshots; cloud → versioned bucket)
+* {todo} Encryption enabled (`storage.document.encrypt.key`) for deployments handling PII or regulated data
+* {todo} Encryption key stored in secrets manager, injected via env var, rotated per policy
+* {todo} Custom `Storage` backends have `@ConditionalOnProperty` + unique `type()` value
+* {todo} Custom `Storage` backends compute MD5 during write (via `AbstractFileStorage` or own `DigestInputStream` wiring)
+* {todo} Custom `InputStreamCipher` implementations generate cryptographically fresh IVs per encryption
+* {todo} Upload endpoints validate size/content-type before calling `storeDocument` (prevents orphan rows from rollbacks)
+* {todo} Orphan reconciliation job exists and runs on a schedule
+* {todo} Download endpoints stream via `InputStreamResource` / `StreamingResponseBody` — no `getData()` on the hot path
+* {todo} Monitoring: alert on `storeDocument` errors (disk full, S3 throttling, cipher failure)
+* {todo} Monitoring: alert on `MessageDigest.getInstance("MD5")` algorithm failures — indicates JVM misconfiguration
+* {todo} Backup strategy covers BOTH the `document` JPA table AND the actual file bytes (losing either makes the other useless)
+* {todo} Restore tested — a file-only restore with no DB restore surfaces every row as "not found"; document this for operations
+
+---
+
+**Related:** <<documents>>, <<notifications>>, <<entity-module-sdk-reference-hierarchy>>, <<audit-module-sdk-reference-internals>>
+
+**Next:** <<documents>>, <<document-templates>>

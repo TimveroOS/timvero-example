@@ -1346,3 +1346,664 @@ Final checklist before launching the Covenant Monitoring System in production.
 * {todo} Calculate Covenant action available
 * {todo} Update ANCHORED metric action available
 * {todo} Resolve action works for VIOLATION states
+* {todo} `HasMetricAnchoredMetricTab<E>` subclass registered for every subject type
+* {todo} `HasCovenantAnchoredMetricTab<E>` subclass registered for every holder type
+* {todo} `AbstractUpdateAnchoredMetricAction<E>` subclass wired with proper `@RequestMapping`
+* {todo} `MetricMappingController` menu item visible only to authorized setting roles
+
+== Metric SDK Internals
+
+This section documents the Pumpkin SDK `com.timvero.loan.metric` package — the 9 classes that
+implement the metric evaluation layer sitting between `MetricMapping` (definition) and
+`CovenantResult` (outcome). Understanding these internals matters when you need to:
+
+* Debug why a metric returns `EXCEPTION` instead of a value
+* Understand what `MetricType.ANCHORED` versus `MetricType.REGULAR` actually stores
+* Extend the metric tabs/actions for a new holder or subject class
+* Reason about what happens inside `MetricService.getMetric()` during an expression evaluation
+
+NOTE: This is post-approval covenant monitoring infrastructure. For pre-approval decision data
+on the same subject, see <<feature-service>> — both layers share the `FeaturedSubject` base
+interface but serve different business purposes.
+
+=== Package Layout
+
+The metric module ships in three subpackages, each with a single responsibility:
+
+[cols="1,2,3",options="header"]
+|===
+|Subpackage |Files |Responsibility
+
+|`metric` (root)
+|`MetricService`, `AnchoredMetricService`
+|Services that compile expressions, evaluate metrics, persist results, and orchestrate
+ANCHORED recalculation driven by covenant specifications.
+
+|`metric.entity`
+|`Metric`, `HasMetric`, `MetricType`, `MetricRepository`
+|Persisted metric record + marker interface for subjects + repository queries that
+always return the latest record per `(owner, mapping lineage, metric type)`.
+
+|`metric.tab` / `metric.action`
+|`HasMetricAnchoredMetricTab`, `HasCovenantAnchoredMetricTab`, `AbstractUpdateAnchoredMetricAction`
+|Admin UI base classes for rendering anchored metric values on subject/holder detail pages
+and for manually patching an ANCHORED value.
+|===
+
+=== Metric Entity — Immutable Time-Series Record
+
+`Metric` is an append-only entity. Each call that writes a value inserts a new row rather than
+updating an existing one, which is why the repository queries are all "find latest by owner and
+mapping lineage" — history is preserved for audit.
+
+[source,java]
+----
+@Entity
+@Table(name = "metric")
+@Immutable
+public class Metric extends UUIDPersistable {
+    @Column(nullable = false) private UUID ownerId;
+    @Column(nullable = false) private Instant createdAt;
+    @Column(nullable = false) private String name;
+
+    @Column(name = "metric_type", nullable = false)
+    @Enumerated(EnumType.STRING)
+    private MetricType metricType;   // ANCHORED | REGULAR
+
+    @Column(nullable = false)
+    @Enumerated(EnumType.STRING)
+    private FeatureDataType dataType; // STRING | INTEGER | DECIMAL | BOOLEAN | EXCEPTION | ...
+
+    @Column(length = 4000) private String rawContent;
+
+    @ManyToOne
+    @JoinColumn(name = "mapping_id", nullable = false)
+    private MetricMapping mapping;
+}
+----
+
+Key observations:
+
+* `@Immutable` + no setters — never mutate an existing `Metric`, always create a new one
+* `rawContent` is serialized via `FeatureDataType.serialize(content)` and parsed back via
+  `getContent()` at read time — the same serialization layer used by `Feature`
+* `ownerId` is a raw `UUID` (not a `@ManyToOne`) so the metric table stays polymorphic across
+  every `HasMetric` subject class without a discriminator
+* `mapping` references a **specific version** of `MetricMapping`, but queries resolve through
+  `mapping.lineageId` — so changing the mapping's expression does not orphan historical metrics
+
+=== HasMetric Marker Interface
+
+`HasMetric extends FeaturedSubject`. Implementing it does four things:
+
+1. Registers the class in `MetricService.entityClasses` at startup (via JPA metamodel scan)
+2. Makes the class selectable as `MetricMappingEntityType` in the admin UI
+3. Makes the class a valid `subject` binding inside metric expressions
+4. Lets `HasMetricAnchoredMetricTab<E>` render an "Anchored metric" tab on the detail page
+
+[source,java]
+----
+public interface HasMetric extends FeaturedSubject {
+    default String details() {
+        return getPrimaryId();
+    }
+}
+----
+
+Override `details()` to return a human-readable description for admin UI rendering —
+defaulting to `getPrimaryId()` gives you a UUID, which is useless in the "Update anchored
+metric" dropdown. See `Participant`/other `HasMetric` entities in `timvero-example` for
+real examples.
+
+=== MetricService — Expression Evaluation Pipeline
+
+`MetricService` is the entry point for computing any metric. The critical method is
+`getMetric(subject, mappingName, metricType, persist)`, and the flow is:
+
+[source,java]
+----
+// 1. Look up the active MetricMapping by name
+MetricMapping mapping = mappingRepository.getMetricMapping(mappingName)
+    .orElseThrow(...);
+
+// 2. Validate that subject.getClass() matches mapping.metricMappingEntityType
+Class<? extends HasMetric> expectedClass =
+    entityClasses.get(mapping.getMetricMappingEntityType());
+if (!expectedClass.isAssignableFrom(subject.getClass())) {
+    throw new IllegalArgumentException("Mapping X does not support subject of class Y");
+}
+
+// 3. Evaluate the expression with bindings: { entity, features }
+Map<String, Object> bindings = Map.of(
+    "entity", subject,
+    "features", new FeatureContainer(subject, featureService, persist)
+);
+Object content = scriptManager.compile(mapping.getExpression()).eval(bindings);
+
+// 4. Wrap result as Metric with resolved FeatureDataType
+FeatureDataType dataType = FeatureDataType.resolveDataType(content);
+Metric metric = new Metric(subject.getId(), mapping.getName(),
+                            dataType, content, mapping, metricType);
+
+// 5. If persist=true, save ONLY if rawContent/dataType differs from the last row
+return persist ? save(metric) : metric;
+----
+
+Four behaviours worth memorising:
+
+* {ok} **Any exception during evaluation is caught and stored as `Metric` with
+  `FeatureDataType.EXCEPTION`.** The metric row always exists — covenants downstream see
+  "exception" rather than "missing". `createExceptionMetric()` handles this branch.
+* {ok} **Deduplication.** `save()` compares the new row against the latest row for
+  `(ownerId, mapping.lineageId, metricType)` and skips the insert if `rawContent` +
+  `dataType` are identical. This prevents the metric table from growing on every no-op recheck.
+* {ok} **Class registry is built once at startup.** `init(EntityManager)` walks the JPA
+  metamodel, finds every class whose interfaces include `HasMetric`, and maps
+  `MetricMappingEntityType(simpleName) → Class`. Add `HasMetric` to a new entity and it
+  appears in the admin UI after the next restart — no config entry required.
+* {bad} **`FeatureContainer.get()` throws `RuntimeException` if the referenced feature has
+  `FeatureDataType.EXCEPTION`.** That becomes the metric's EXCEPTION content — you cannot
+  recover a "partial" metric from a partially-failed feature datasource.
+
+=== AnchoredMetricService — Holder-Level Orchestration
+
+`AnchoredMetricService` sits one level above `MetricService` and knows about **covenant
+holders**. It iterates through every `CovenantSpecification` on a holder, resolves the subjects
+via `CovenantExecutionService`, and calls `MetricService.getMetric(..., ANCHORED, true)` for
+each pair.
+
+Three public methods with distinct semantics:
+
+[cols="1,3",options="header"]
+|===
+|Method |When to call
+
+|`calculateAnchored(holder)`
+|Unconditional — ALWAYS writes a new anchored metric (subject to dedup in `save()`).
+Called at loan origination / disbursement to capture the baseline.
+
+|`recalculateAnchored(holder)`
+|Conditional — only processes subjects where the **latest** ANCHORED metric is currently
+`EXCEPTION`. Safe to call on a schedule; will not overwrite a good baseline with a freshly
+computed one.
+
+|`recalculateAnchored(holder, subject)`
+|Same as above, narrowed to a specific subject — called after manual edits or after a
+subject's data becomes available.
+|===
+
+All three use `@Transactional(propagation = REQUIRES_NEW)` because anchored recalculation is
+a side-effect that should not roll back the surrounding business transaction.
+
+See the production `CreditChecker` (`timvero-example/src/main/java/.../credit/checker`) for
+the expected call site: `calculateAnchored(credit)` runs inside the disbursement checker.
+
+=== Tab Base Classes
+
+Two distinct tab base classes, used on different entity types:
+
+[source,java]
+----
+// On the subject detail page (Participant, Collateral, ...)
+@RequestMapping("/metrics")
+@Controller
+@Order(3500)
+public class ParticipantMetricTab extends HasMetricAnchoredMetricTab<Participant> { }
+----
+
+`HasMetricAnchoredMetricTab<E>` auto-hides the tab (`isVisible()` returns false) when no
+ANCHORED metric exists for the entity. Subclasses override nothing except type parameters.
+
+[source,java]
+----
+// On the holder detail page (ExampleCredit, ...)
+@RequestMapping("/anchored-metric")
+@Controller
+@Order(10000)
+public class CreditAnchoredMetricTab extends HasCovenantAnchoredMetricTab<ExampleCredit> {
+    @Override public boolean isVisible(ExampleCredit entity) { return true; }
+}
+----
+
+`HasCovenantAnchoredMetricTab<E>` iterates all subjects reachable from the holder via
+`AnchoredMetricService.getSubjects(entity)` and shows ANCHORED metrics from each of them on a
+single page. This is the variant `timvero-example` uses for `ExampleCredit`.
+
+Both tabs render the same view template `/metric/tab/metrics` and use the
+`MetricResultItem(HasMetric subject, Metric metric)` record — if you customise one, check the
+template works for the other.
+
+=== AbstractUpdateAnchoredMetricAction — Manual Baseline Patch
+
+Anchored values sometimes need human override — an appraisal is disputed, a document changes
+retroactively, compliance requires a specific baseline. This action provides a form that
+enumerates all covenant subjects on the holder and lets the operator pick a subject + mapping,
+enter a typed value, and persist it as a new ANCHORED `Metric`.
+
+[source,java]
+----
+@RequestMapping("/update-anchored-metric")
+@Controller
+@Order(10000)
+public class UpdateAnchoredMetricAction
+        extends AbstractUpdateAnchoredMetricAction<ExampleCredit> { }
+----
+
+Form model:
+
+* `subjectId` — which `HasMetric` subject the value applies to
+* `anchoredMetricId` — which `MetricMapping` (picked from the holder's covenant specs)
+* `contentType` — restricted by the base class to `STRING` or `INTEGER`
+* `content` — the new value; validated by round-tripping through
+  `FeatureDataType.parse(serialize(content))` and rejecting with `error.metric.typeValue.notMatch`
+  if serialisation fails
+
+The action deliberately does not trigger a recalculation — it just inserts a new ANCHORED row
+and reloads the page. The next covenant execution will read the fresh baseline through
+`MetricRepository.findLastByOwnerIdAndMappingIdAndMetricType(...)`.
+
+=== MetricRepository — Latest-Per-Lineage Queries
+
+Every repository query follows the same pattern: **filter by owner and metric type, then take
+the row with `MAX(createdAt)` grouped by `mapping.lineageId`**. This is what makes the
+append-only design usable — callers always see the current state per mapping lineage, while
+audit keeps every historical write.
+
+Four queries exist:
+
+[cols="1,3",options="header"]
+|===
+|Method |Used by
+
+|`findLastByOwnerIdAndMappingIdAndMetricType`
+|`MetricService.readMetric` / `save` — latest value for a single mapping
+(resolved via `lineageId`, not `id`).
+
+|`findLatestMetricsByOwnerId(owner, type)`
+|`HasMetricAnchoredMetricTab` / `HasCovenantAnchoredMetricTab` — list of latest values across
+all mappings for a subject.
+
+|`existsLatestMetricsByOwnerIdAndDataType(owner, type, dataType)`
+|`AnchoredMetricService.hasAnchoredException` — "does any latest ANCHORED metric have
+`EXCEPTION` datatype for this subject?"
+
+|`existsLatestMetricsByOwnerId(owner, type)`
+|`HasMetricAnchoredMetricTab.isVisible()` — hides the tab if nothing has been anchored yet.
+|===
+
+Custom reporting queries should follow the same lineage-aware pattern; a naive
+`ORDER BY createdAt DESC LIMIT 1` will pick a historical row if you upgrade a mapping and
+don't re-anchor.
+
+== MetricMapping SDK Internals
+
+The `com.timvero.loan.metric_mapping` package (16 classes in 7 subpackages) is the admin-facing
+counterpart of the metric runtime. Its job is to let operators **define**, **version**,
+**search**, **test**, **import/export**, and **activate/deactivate** the `MetricMapping`
+entities that `MetricService` consumes.
+
+=== Package Layout
+
+[cols="1,2,4",options="header"]
+|===
+|Subpackage |Files |Responsibility
+
+|`metric_mapping` (root)
+|`MetricMappingService`
+|Exposes the list of entity types that implement `HasMetric` (for admin dropdowns) and
+runs expression "test" evaluations against a chosen entity instance.
+
+|`entity`
+|`MetricMapping`, `MetricMappingEntityType`, `MetricMappingRepository`
+|Persisted definition extending `HistoryEntity` (versioned via `lineageId`); typed
+`NamedParameter` wrapper for entity-class discrimination; repository with
+`findLatestActiveByLineageId`.
+
+|`form`
+|`MetricMappingForm`, `MetricMappingFormMapper`, `MetricMappingFormService`
+|MapStruct form ↔ entity mapping; form service that adds version list to the edit model and
+rejects changing `metricMappingEntityType` on an existing mapping.
+
+|`controller`
+|`MetricMappingController`
+|List view + `/evaluate-expression` POST endpoint + `/entities` JSON endpoint for the expression
+tester dropdown; registers a `setting` menu item with order `900_620`.
+
+|`action`
+|`CreateMetricMappingAction`, `EditMetricMappingAction`
+|Thin Spring `@Controller` shells over `EntityCreateController` / `EditEntityActionController`.
+Both carry no business logic — the work is in `MetricMappingFormService`.
+
+|`filter`
+|`MetricMappingFilter`, `MetricMappingFilterService`
+|List filter; defaults `active = true` so the list page shows only active mappings by default.
+
+|`tab`
+|`MetricMappingDetailsTab`
+|Detail page with version history; feeds the Thymeleaf model with engine names, the current
+mapping, version list, and an `isNoneActiveVersionExist` flag used by the UI to enable
+"activate" buttons.
+
+|`export`
+|`MetricMappingExportData`, `MetricMappingExporter`, `MetricMappingToDtoMapper`
+|History-aware export/import. `MetricMappingExporter` extends `AbstractHistoryEntityExporter`
+with `@Order(7400)` — position matters for import ordering relative to other catalog entries.
+|===
+
+=== MetricMapping Entity
+
+[source,java]
+----
+@Entity
+@Table(name = "metric_mapping")
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+public class MetricMapping extends HistoryEntity implements NamedEntity {
+    @Column(nullable = false)
+    private String name;
+
+    @Embedded
+    private Expression expression;
+
+    @Column(name = "metric_entity_type", nullable = false)
+    @Type(value = NamedParameterType.class)
+    private MetricMappingEntityType metricMappingEntityType;
+}
+----
+
+Three things drive everything downstream:
+
+* **`extends HistoryEntity`** — each edit is a new row sharing a `lineageId` with the previous
+  version; only rows with `active = true` are considered by `MetricMappingRepository.getMetricMapping(name)`.
+  This is also why `MetricService.save()` dedupes by `mapping.lineageId` rather than `mapping.id`.
+* **`@Embedded Expression expression`** — the expression is stored with its engine name
+  (JavaScript by default), so the same mapping can reference a different engine across versions.
+* **`@Type(NamedParameterType.class) MetricMappingEntityType`** — column-mapped to a plain
+  string column (`metric_entity_type`) but type-safe at the Java level. The string is the
+  `simpleName` of the target `HasMetric` class, which is why renaming a `HasMetric` entity class
+  breaks every mapping pointing at it. Never refactor an entity class name without a data migration.
+
+The 2nd-level cache (`CacheConcurrencyStrategy.READ_WRITE`) matters: `MetricService.getMetric()`
+is called inside tight covenant loops; without the L2 cache each expression evaluation would
+hit the DB for the `MetricMapping` row.
+
+=== MetricMappingEntityType — Why Not Class?
+
+Admins pick a `MetricMappingEntityType` from a dropdown; the DB stores it as a string. The
+SDK chose `NamedParameter` over `Class<?>` for three reasons:
+
+* {ok} Mappings survive when you rename-then-map the class (via custom migration)
+* {ok} Mappings are portable across packages/modules — no FQN lock-in
+* {ok} The admin UI can show user-friendly names in the dropdown
+
+The bridge between string and class lives in `MetricService.entityClasses`, built at startup
+from the JPA metamodel. If a mapping references an entity type that no longer implements
+`HasMetric`, `MetricService.validateMapping()` throws `IllegalArgumentException` —
+stored as `FeatureDataType.EXCEPTION` content, visible in the admin tab.
+
+=== MetricMappingRepository Queries
+
+Three queries, all lineage-aware:
+
+[source,java]
+----
+// Active mapping resolved by name — used by MetricService.getMetric(subject, name, ...)
+Optional<MetricMapping> getMetricMapping(String name);
+
+// All active mappings for a given entity type — used by MetricService.getAllActive(ownerClass)
+Collection<MetricMapping> findAllByActiveTrueAndMetricMappingEntityType(
+    MetricMappingEntityType type);
+
+// Latest active version sharing a lineage — used by AbstractUpdateAnchoredMetricAction
+// to show the current version in the "Update anchored metric" dropdown, even if the
+// CovenantSpecification points at an older version.
+Optional<MetricMapping> findLatestActiveByLineageId(UUID lineageId);
+----
+
+The `findLatestActiveByLineageId` query is the reason admins can edit a mapping mid-cycle
+without breaking in-flight covenant executions: the spec keeps pointing at version N, new
+metrics write against version N+1, and the history tab shows both.
+
+=== Form Pipeline — MetricMappingFormService
+
+`MetricMappingFormService extends HistoryEntityFormService` inherits the "save = new version"
+behaviour. The service adds three responsibilities:
+
+[source,java]
+----
+@Override
+protected void assembleEditModel(MetricMapping mapping, MetricMappingForm form,
+                                  Map<String, Object> model) {
+    if (form.getExpression() == null) {
+        form.setExpression(new ExpressionForm());
+        form.getExpression().setEngineName(JSScriptEngine.NAME);   // 1. default engine
+    }
+    model.put("metricMappingEntityTypes", mappingService.getResultTypes());
+    model.put("engineNames", scriptManager.getEngineNames());
+    model.put("entityTypes", metricService.getEntityClasses()...); // 2. populate dropdowns
+}
+
+@Override
+public UUID save(UUID id, MetricMappingForm form) throws ValidationException {
+    if (id != null) {
+        MetricMapping existing = repository.getReferenceById(id);
+        if (!existing.getMetricMappingEntityType().equals(form.getMetricMappingEntityType())) {
+            ValidationException.binding()
+                .rejectValue("metricMappingEntityType", "metric-mapping.unmodifiableField")
+                .throwIfNotEmpty();                                 // 3. freeze entity type
+        }
+    }
+    return super.save(id, form);
+}
+----
+
+Locking `metricMappingEntityType` after creation is intentional — letting an admin change the
+target entity type mid-lifecycle would orphan every historical `Metric` whose `ownerId` points
+at the old class.
+
+The `MetricMappingFormMapper` is a standard MapStruct interface; the only interesting mapping
+is `@Mapping(target = "lineageId", ignore = true)` — the `lineageId` is managed by
+`HistoryEntity`, not the form.
+
+=== Controller — List + Expression Tester
+
+`MetricMappingController` registers itself as a setting menu item:
+
+[source,java]
+----
+@MenuItem(order = 900_620, name = "metricMapping", group = "setting")
+@RequestMapping(MetricMappingController.PATH)  // "/metric-mapping"
+----
+
+Two JSON endpoints back the expression tester UI:
+
+* `POST /metric-mapping/evaluate-expression` — runs
+  `MetricMappingService.testMetric(expression, type, entityId)` which builds an in-memory
+  `MetricMapping("", expression, type)` and calls `metricService.getMetric(subject, mapping)`
+  with `persist = false`. The expression is never saved — `name = ""` — and dedup logic does not
+  apply because the service does not hit `save()`.
+* `GET /metric-mapping/entities?search=...&metricMappingEntityType=...` —
+  `ValidationEntitySearchService.search()` against the picked `HasMetric` class, returning a
+  `Map<id, label>` that the UI renders as a searchable dropdown.
+
+`@ExceptionHandler(ScriptException.class)` returns 412 Precondition Failed with the localised
+message so the tester UI can render a clean error. If you extend the controller with more
+endpoints, follow the same pattern rather than letting `ScriptException` bubble up as 500.
+
+=== Actions — Create / Edit
+
+`CreateMetricMappingAction` and `EditMetricMappingAction` are deliberately empty:
+
+[source,java]
+----
+@Controller
+public class CreateMetricMappingAction
+        extends EntityCreateController<UUID, MetricMapping, MetricMappingForm> {
+    @Override protected boolean isOwnPage() { return true; }
+}
+
+@Controller
+public class EditMetricMappingAction
+        extends EditEntityActionController<UUID, MetricMapping, MetricMappingForm> {
+    @Override public String getHighlighted() { return BTN_SUCCESS; }
+}
+----
+
+The real logic is in `MetricMappingFormService.assembleEditModel` / `save`. These shells only
+opt in to "own page" rendering (full-page form rather than a modal) and switch the save button
+to the success style. Leave them alone unless you need to add a route guard.
+
+=== Filter — Hide Inactive by Default
+
+`MetricMappingFilter extends ListFilter` with a single `@Field(restriction = EQ) boolean active = true`.
+The list page shows only active mappings by default; ticking the checkbox reveals archived ones.
+`MetricMappingFilterService` is empty — it's just a typed instantiation of
+`FilterListService<MetricMapping, MetricMappingFilter>`.
+
+=== Tab — Version History
+
+`MetricMappingDetailsTab` is the default detail tab with `@Order(1000)`. It always renders
+(`isVisible() == true`), and exposes four model attributes to the Thymeleaf template:
+
+* `engineNames` — from `ScriptManager.getEngineNames()`, so the engine dropdown is always fresh
+* `metric` — the current mapping version
+* `history` — all versions sharing the lineage, sorted by `createdAt DESC`
+  (via `MetricMappingFormService.getMetricVersions(mapping)`)
+* `isNoneActiveVersionExist` — true if every version has `active = false`; the template uses
+  this to prompt the operator to activate a version
+
+=== Export / Import Round-Trip
+
+Three classes form a round-trippable catalog export:
+
+* `MetricMappingExportData` — DTO with `name`, `ExpressionForm expression`, and
+  `metricMappingEntityType` as a plain `String` (no `@Type` on a DTO). Implements `equals`/`hashCode`
+  so the diff tool can detect identical mappings across environments.
+* `MetricMappingToDtoMapper` — MapStruct mapper with `@Mapper(uses = NamedParameterMapper.class)`,
+  which handles the `NamedParameter` ↔ `String` conversion automatically.
+  `lineageId` is ignored on import — new environments get new lineages.
+* `MetricMappingExporter extends AbstractHistoryEntityExporter` with `@Order(7400)` and
+  `getVersion() = "1"`. The order must place this after any entity class containing `HasMetric`
+  is imported, otherwise the string `metric_entity_type` will not resolve at runtime.
+
+When bumping the version, also version the downstream covenant specs — a mapping rename that
+leaves `CovenantSpecification.metricMapping` referencing a stale lineage is silent until the
+next execution.
+
+=== How Metrics Flow From Credit to Covenant Check
+
+Tying the two packages together, the end-to-end happy path for an ANCHORED-backed covenant is:
+
+[source]
+----
+CreditChecker (origination)
+    │
+    ▼
+AnchoredMetricService.calculateAnchored(credit)
+    │
+    ├─ CovenantExecutionService.getSpecifications(credit)       — specs on holder
+    │
+    ├─ for each spec with anchoredMetricMapping != null:
+    │     │
+    │     ├─ CovenantExecutionService.getSubjects(credit, spec) — via CovenantHolderResolver
+    │     │
+    │     └─ for each subject:
+    │           │
+    │           └─ MetricService.getMetric(subject,
+    │                    spec.getAnchoredMetricMapping().getName(),
+    │                    MetricType.ANCHORED, persist=true)
+    │                 │
+    │                 ├─ MetricMappingRepository.getMetricMapping(name)
+    │                 ├─ validateMapping(subject, mapping)
+    │                 ├─ evaluateMetricExpression(subject, mapping, persist=true)
+    │                 │      │
+    │                 │      └─ ScriptManager.compile(expression)
+    │                 │          .eval({ entity, features(FeatureContainer) })
+    │                 │
+    │                 └─ save(metric) — dedup by (ownerId, lineageId, metricType)
+    ▼
+Scheduled consumer (see Lifecycle & Scheduling)
+    │
+    └─ For each CovenantSpecification on each active holder:
+         │
+         ├─ Compute REGULAR metric via MetricService.getMetric(..., REGULAR, true)
+         ├─ Read ANCHORED metric via MetricRepository.findLastByOwnerIdAndMappingIdAndMetricType
+         └─ Evaluate covenant expression with { metric, anchored } bindings
+               → CovenantResult.state ∈ { CLEAN | VIOLATION | RESOLVED | EXCEPTION }
+----
+
+The same `MetricService.getMetric(...)` signature is used for both ANCHORED (at origination)
+and REGULAR (at every scheduled check) evaluations — the only difference is the
+`MetricType` argument. This is why the dedup logic in `save()` is keyed on
+`(ownerId, mapping.lineageId, metricType)` — a REGULAR metric never overwrites an ANCHORED one.
+
+=== Additional Anti-Patterns — Metric Internals
+
+==== Mutating Metric Fields
+
+**Problem:** Calling a "setter" on an existing `Metric` to change its value.
+
+[.unstyled]
+* {bad} `Metric` is `@Immutable` — there are no setters
+* {bad} Even if you bypass Hibernate, you destroy the audit trail
+* {bad} Covenant executions may already reference this row
+
+**Fix:** Always create a new `Metric(...)` and persist it through `MetricService.saveMetric()`.
+
+==== Renaming a HasMetric Entity Class
+
+**Problem:** `@Entity` class renamed from `Participant` to `LoanParticipant` without a migration.
+
+[.unstyled]
+* {bad} Every `MetricMapping` stores the old `simpleName` in `metric_entity_type`
+* {bad} `MetricService.validateMapping()` throws on the next execution
+* {bad} Metrics stored as `FeatureDataType.EXCEPTION` for all affected subjects
+
+**Fix:** Either keep the class name or write a Flyway migration that rewrites
+`metric_mapping.metric_entity_type` in-place.
+
+==== Skipping the `details()` Override
+
+**Problem:** A `HasMetric` entity uses the default `details()` which returns `getPrimaryId()`.
+
+[.unstyled]
+* {bad} "Update anchored metric" dropdown shows UUIDs instead of names
+* {bad} Audit logs are hard to correlate with business entities
+* {bad} `HasCovenantAnchoredMetricTab` rows are unreadable
+
+**Fix:** Override `details()` to return a business-meaningful label
+(e.g. `name + " (" + id + ")"` for `Participant`).
+
+==== Using `evaluate-expression` as a Computation Cache
+
+**Problem:** Client code calls `POST /metric-mapping/evaluate-expression` to get "live" metric
+values instead of writing an ANCHORED mapping and calling `MetricService.getMetric(...)`.
+
+[.unstyled]
+* {bad} The tester endpoint runs with `persist = false` — no Metric row is written
+* {bad} Results are not audited, not cached, not visible in tabs
+* {bad} Every call recompiles the expression — wasteful under load
+
+**Fix:** Use the tester endpoint strictly for interactive validation. For recurring
+computation, define a real `MetricMapping` and call `MetricService` from application code.
+
+=== Additional Production Checklist — Metric Internals
+
+[.unstyled]
+* {todo} Every `HasMetric` entity overrides `details()` with a business-readable label
+* {todo} Entity class renames have an accompanying `metric_entity_type` migration
+* {todo} `AnchoredMetricService.calculateAnchored(holder)` is invoked inside the disbursement
+  checker (or equivalent origination hook) — not on a schedule
+* {todo} `MetricMappingExporter` order (`7400`) is higher than any custom exporter that
+  depends on mapping lookup
+* {todo} Custom reporting queries against `metric` table filter by
+  `mapping.lineageId` (not `mapping.id`) when "latest value" semantics are required
+* {todo} L2 cache is enabled in Hibernate config — `MetricMapping` uses
+  `CacheConcurrencyStrategy.READ_WRITE` and covenant loops depend on it
+
+NOTE: These internals tie directly into the surrounding documentation:
+<<feature-service>> covers the pre-approval counterpart of metrics;
+<<credit-servicing>> drives the scheduled covenant executions that consume these metrics;
+<<flowable-internals>> shows how metric values can be fed into decision facts;
+<<entity-module-sdk-reference-hierarchy>> explains the `HistoryEntity` / `UUIDPersistable`
+bases used by `MetricMapping` and `Metric`; and <<notifications>> is the outbound channel
+for covenant breaches detected through this pipeline.

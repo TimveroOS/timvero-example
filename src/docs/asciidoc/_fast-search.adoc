@@ -1,10 +1,39 @@
 = Fast Search System
 
-Add search functionality to your entities with minimal configuration.
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+Fast Search (`com.timvero.ground.service.fastsearch`) wraps Hibernate Search to give your application a cross-entity, full-text search endpoint with minimal configuration. Entities opt in via `@Indexed`; each indexed type gets a `SearchEntity` bean describing how results render; the SDK assembles everything into the built-in `/search` UI.
 
 == What You Need to Know
 
-Fast Search lets users search across all your application entities. It's already enabled and integrated into the UI - you just need to configure which entities are searchable.
+The module has three cooperating pieces:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |Role |Key types
+
+|**Entity annotations** (from Hibernate Search)
+|Mark entities and fields as indexed — the SDK defers to Hibernate Search for the actual indexing
+|`@Indexed`, `@FullTextField`, `@KeywordField`, `@IndexedEmbedded`
+
+|**Search configuration** (per entity)
+|Tell the SDK how to render this entity in result lists — name provider, template, navigation URL
+|`SearchEntity<T>` (current), `FastSearchEntity<T>` (deprecated)
+
+|**Runtime**
+|Auto-registered Spring beans that execute searches, manage the index, and expose operator controls
+|`FastSearchService`, `FastSearchIndexManager`, `UpdateIndexesControlButton`, `MultipleEnvironmentIndexLayoutStrategy`
+|===
+
+Key characteristics:
+
+- **Pluggable backend** — Lucene (on-disk) by default; Elasticsearch activated via properties
+- **Auto-recovery from schema drift** — a scheduled job validates the index schema and drops+recreates+reindexes on mismatch
+- **Cross-environment index separation** — `MultipleEnvironmentIndexLayoutStrategy` lets one ES cluster host dev/staging/prod indexes without collision
+- **Cross-type and type-specific search** — `search(input)` searches all configured entities; `searchEntity(Class, input)` targets one
+- **Simple query syntax** — `simpleQueryString` supports AND/OR, wildcards, field-specific queries, phrase matching
+
+WARNING: **`FastSearchEntity` is `@Deprecated(forRemoval = true)`.** The guide below uses `SearchEntity.builder(...)` from `com.timvero.web.common.search`. Legacy code may still use `new FastSearchEntity<>(...)`; the two are interchangeable at runtime (the builder produces a `SearchEntity extends FastSearchEntity`). Migrate new beans to the builder and convert legacy ones opportunistically.
 
 == Configuration
 
@@ -14,50 +43,88 @@ Configure Fast Search in `application.properties`:
 
 [source,properties]
 ----
-## Quick Search (uses Lucene backend by default)
+## Enable Fast Search (required)
 hibernate.search.enabled=true
+
+## Thread pool size for mass reindexing (required — no default)
+hibernate.search.index.threads=4
+
+## Default: Lucene (on-disk) backend
 hibernate.search.backend.directory.root=/index
 ----
 
-=== Using Elasticsearch
+`hibernate.search.index.threads` is required — `FastSearchIndexManager` fails to start without it (no `@Value` default).
 
-To use Elasticsearch instead of the default Lucene backend:
+=== Using Elasticsearch
 
 [source,properties]
 ----
-## Quick Search with Elasticsearch
 hibernate.search.enabled=true
+hibernate.search.index.threads=4
 hibernate.search.backend.type=elasticsearch
 hibernate.search.backend.hosts=localhost:9200
 hibernate.search.backend.protocol=http
 ----
 
+Elasticsearch gives you network-shared indexes, horizontal scaling, and operational tooling. Lucene is simpler for single-node deployments and gives comparable latency for small-to-medium data volumes.
+
+=== Multi-Environment Index Strategy
+
+When dev, staging, and production share one Elasticsearch cluster, they must use separate indexes. The SDK provides `MultipleEnvironmentIndexLayoutStrategy` — activated when the `hibernate.search.backend.layout.environment` property is set:
+
+[source,properties]
+----
+hibernate.search.backend.type=elasticsearch
+hibernate.search.backend.hosts=shared-es.company.internal:9200
+hibernate.search.backend.layout.strategy=multi-environment-strategy
+hibernate.search.backend.layout.environment=prod
+----
+
+The strategy appends `-{environment}` to every index name:
+
+[cols="2,3", options="header"]
+|===
+|Hibernate Search index name |Actual Elasticsearch index
+
+|`client`
+|`client-prod`
+
+|`application`
+|`application-staging` (with `environment=staging`)
+|===
+
+Plus write/read aliases: `client-prod-write` and `client-prod-read`. All environments coexist safely on the same cluster; accidentally pointing staging at the prod cluster still writes to `client-staging`, not `client-prod`.
+
+Without the property, the strategy bean is inactive (`@ConditionalOnProperty`) — Hibernate Search uses its default naming.
+
 == Quick Setup
 
 === 1. Make Entity Searchable
 
-Add `@Indexed` to your entity and mark searchable fields:
+Add `@Indexed` to your entity and annotate searchable fields:
 
 [source,java]
 ----
 @Entity
 @Indexed
-public class Client extends AbstractAuditable<UUID> {
-    
-    @FullTextField  // Natural language search
+public class Client extends AbstractAuditable implements HasDocuments {    // <1>
+
+    @FullTextField                                                          // <2>
     private String fullName;
-    
-    @KeywordField   // Exact matches only
+
+    @KeywordField                                                           // <3>
     private String nationalId;
-    
-    @IndexedEmbedded  // Include nested fields
+
+    @IndexedEmbedded                                                        // <4>
     private ContactInfo contactInfo;
 }
 ----
+<1> `AbstractAuditable` has no generic parameter — don't write `AbstractAuditable<UUID>` (see <<entity-module-sdk-reference-hierarchy>>)
+<2> Natural-language text — analyzed, case-folded, tokenized. Use for names, descriptions, narrative.
+<3> Exact matches — not analyzed. Use for IDs, codes, statuses, SKUs.
+<4> Include fields from an embedded object. The nested class must also be `@Indexed` or `@IndexedEmbedded`-compatible.
 
-=== 2. Configure Search Entity
-
-Create a configuration class:
+=== 2. Register a SearchEntity Bean
 
 [source,java]
 ----
@@ -66,74 +133,111 @@ Create a configuration class:
 public class ClientSearchConfig {
 
     @Bean
-    FastSearchEntity<Client> clientSearchEntity() {
-        return new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+    SearchEntity<Client> clientSearchEntity() {
+        return SearchEntity.builder(Client.class, Client::getDisplayedName)    // <1>
+            .build();
     }
 }
 ----
+<1> For entities implementing `NamedEntity`, the one-arg overload `SearchEntity.builder(Client.class)` picks up `getDisplayedName()` automatically
 
-That's it! Search is now available in the application UI at `/search`.
+That's it — the entity now appears in the global `/search` endpoint.
 
 == Field Types
 
-**`@FullTextField`** - For names, descriptions, natural language text  
-**`@KeywordField`** - For IDs, codes, statuses, exact matches  
-**`@IndexedEmbedded`** - Include fields from nested objects
+[cols="2,3,3", options="header"]
+|===
+|Annotation |Purpose |Example
 
-== FastSearchEntity Configuration
+|`@FullTextField`
+|Natural-language text — tokenized, case-folded, optionally stemmed
+|Names, descriptions, notes, free text
 
-The `FastSearchEntity` bean controls how your entity appears in search results.
+|`@KeywordField`
+|Exact match — stored verbatim; lower-case matching if configured
+|IDs, SKUs, enum codes, statuses
 
-=== Basic Configuration
+|`@IndexedEmbedded`
+|Include fields from a nested / associated object
+|`@Embedded` fields, `@ManyToOne` associations, `@Embeddable` classes
+
+|`@GenericField`
+|Numbers, dates, booleans (not searched by default — use only when you need range filtering)
+|Amounts, timestamps
+|===
+
+Only fields annotated with a search annotation are indexed. No reflection-based magic.
+
+== SearchEntity — Builder API
+
+`SearchEntity` configures how search results for the entity render in the UI.
+
+=== Factory Methods
 
 [source,java]
 ----
-@Bean
-FastSearchEntity<Client> clientSearchEntity() {
-    return new FastSearchEntity<>(Client.class, Client::getDisplayedName);
-}
+// Explicit name provider
+SearchEntity.builder(Client.class, Client::getDisplayedName)
+    .build();
+
+// For NamedEntity subclasses — uses getDisplayedName() by default
+SearchEntity.builder(Client.class)
+    .build();
 ----
 
-**Parameters:**
+=== Builder Methods
 
-- `Client.class` - The entity class to make searchable
-- `Client::getDisplayedName` - Function that returns the display name for search results
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`.entityType(String)`
+|Override the default type identifier (derived from `EnumUtils.getDefaultGroup(clazz)`). Used for i18n labels (`entity.{type}`) and navigation routing.
+
+|`.layoutTemplateName(String)`
+|Thymeleaf fragment reference for rendering this entity in result lists. Default: `/form/search :: default`.
+
+|`.pathProvider(Function<T, String>)`
+|Function producing a URL path per entity. Default: no link (results aren't clickable). Typical: `c -> "/client/" + c.getId()`.
+
+|`.build()`
+|Returns the configured `SearchEntity<T>`.
+|===
 
 === Custom Display Names
 
-Control how search results are displayed:
+Full composition rather than just the `NamedEntity` contract:
 
 [source,java]
 ----
 @Bean
-FastSearchEntity<Client> clientSearchEntity() {
-    return new FastSearchEntity<>(Client.class, client -> {
+SearchEntity<Client> clientSearchEntity() {
+    return SearchEntity.builder(Client.class, client -> {
         String name = client.getIndividualInfo().getFullName();
         String id = client.getIndividualInfo().getNationalId();
         return name + " (" + id + ")";
-    });
+    }).build();
 }
 ----
 
 === Layout Templates
 
-Specify custom result templates:
-
 [source,java]
 ----
 @Bean
-FastSearchEntity<Client> clientSearchEntity() {
-    FastSearchEntity<Client> entity = new FastSearchEntity<>(Client.class, Client::getDisplayedName);
-    entity.setLayoutTemplateName("/client/search :: client-result");
-    return entity;
+SearchEntity<Client> clientSearchEntity() {
+    return SearchEntity.builder(Client.class, Client::getDisplayedName)
+        .layoutTemplateName("/client/search :: client-result")
+        .pathProvider(c -> "/client/" + c.getId())
+        .build();
 }
 ----
 
-This uses `/client/search +++::+++ client-result` template for displaying this entity in search results. Default template is `/form/search +++::+++ default`.
+The template fragment receives the entity as `entity`.
 
 === Multiple Entities
 
-Configure multiple entities in one config class:
+Register each entity as its own bean. The `FastSearchService` auto-discovers all `SearchEntity` / `FastSearchEntity` beans in the context:
 
 [source,java]
 ----
@@ -142,21 +246,241 @@ Configure multiple entities in one config class:
 public class SearchConfig {
 
     @Bean
-    FastSearchEntity<Client> clientSearchEntity() {
-        return new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+    SearchEntity<Client> clientSearchEntity() {
+        return SearchEntity.builder(Client.class)
+            .pathProvider(c -> "/client/" + c.getId())
+            .build();
     }
-    
+
     @Bean
-    FastSearchEntity<Application> applicationSearchEntity() {
-        return new FastSearchEntity<>(Application.class, app -> 
-            "Application #" + app.getId());
+    SearchEntity<Application> applicationSearchEntity() {
+        return SearchEntity.builder(Application.class, app -> "Application #" + app.getId())
+            .pathProvider(a -> "/application/" + a.getId())
+            .build();
+    }
+
+    @Bean
+    SearchEntity<Participant> participantSearchEntity() {
+        return SearchEntity.builder(Participant.class)
+            .pathProvider(p -> "/participant/" + p.getId())
+            .build();
     }
 }
 ----
 
+=== Legacy API — FastSearchEntity (Deprecated)
+
+`FastSearchEntity` is kept for backward compatibility. Existing code like:
+
+[source,java]
+----
+FastSearchEntity<Client> entity = new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+entity.setLayoutTemplateName("/client/search :: client-result");
+----
+
+still works, but **every getter and setter is `@Deprecated`**. Migrate at your own pace:
+
+[source,java]
+----
+// Legacy:
+FastSearchEntity<Client> entity = new FastSearchEntity<>(Client.class, Client::getDisplayedName);
+entity.setLayoutTemplateName("/client/search :: client-result");
+entity.setEntityType("customer");
+entity.setPathProvider(c -> "/client/" + c.getId());
+
+// Equivalent with the builder:
+SearchEntity.builder(Client.class, Client::getDisplayedName)
+    .layoutTemplateName("/client/search :: client-result")
+    .entityType("customer")
+    .pathProvider(c -> "/client/" + c.getId())
+    .build();
+----
+
+`SearchEntity extends FastSearchEntity` internally, so `List<FastSearchEntity<?>>` injection in the SDK picks up both styles.
+
+== Programmatic Search — FastSearchService
+
+Most applications just use the `/search` endpoint. For custom search flows (typeahead, embedded search widgets, API endpoints), inject `FastSearchService`:
+
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`search(String input)`
+|Cross-type search across ALL registered entity classes. Returns `ResultData` (items + total count). Cap at 40 hits.
+
+|`searchEntity(Class<T>, String input)`
+|Type-specific search — returns `List<T>`. Same 40-hit cap.
+
+|`searchEntity(Class<T>, String input, int limit)`
+|Type-specific with custom limit. For typeahead-style pickers that only need 5-10 hits.
+
+|`supports(Class<?>)`
+|Check whether the entity class has a registered `SearchEntity` (useful in generic code that adapts to available search configs).
+
+|`nameProvider(Class<T>)`
+|Retrieve the name-provider function for an entity class — reuse for display logic outside search contexts.
+|===
+
+=== ResultData + SearchResult
+
+Cross-type search returns `ResultData` wrapping `List<SearchResult>` plus total hit count:
+
+[source,java]
+----
+public static class SearchResult {
+    private final Object entity;              // the hit
+    private final Object entityId;            // primary key
+    private final String entityType;          // from SearchEntity.entityType
+    private final String entityName;          // from SearchEntity.nameProvider.apply(entity)
+    private final String layoutTemplateName;  // from SearchEntity.layoutTemplateName
+    private String entityPath;                // from SearchEntity.pathProvider.apply(entity)
+}
+----
+
+Typed search (`searchEntity(Class, ...)`) returns the entities directly — you handle rendering on your own.
+
+=== Example: Custom Typeahead Endpoint
+
+[source,java]
+----
+@RestController
+@RequestMapping("/api/typeahead")
+public class ClientTypeaheadController {
+
+    @Autowired private FastSearchService fastSearchService;
+
+    @GetMapping("/clients")
+    public List<ClientSummaryDto> clients(@RequestParam String q) {
+        return fastSearchService.searchEntity(Client.class, q, 10).stream()
+            .map(c -> new ClientSummaryDto(c.getId(), c.getDisplayedName()))
+            .toList();
+    }
+}
+----
+
+All `FastSearchService` methods are `@Transactional(readOnly = true)` internally — safe to call from any controller.
+
+=== SearchController — The Default `/search` Endpoint
+
+The SDK ships with a ready-made controller that wires `FastSearchService` to the admin UI's search page:
+
+[source,java]
+----
+@Controller
+@RequestMapping(SearchController.PATH)                               // <1>
+@ConditionalOnProperty("hibernate.search.enabled")                   // <2>
+public class SearchController {
+
+    public static final String PATH = "/search";
+
+    @Autowired(required = false)
+    private FastSearchService searchService;
+
+    @Autowired
+    private EntityControllerMapping entityControllerMapping;          // <3>
+
+    @GetMapping
+    public String search(@RequestParam(required = false) String query, Model model) {
+        model.addAttribute("query", query);
+        if (searchService != null) {
+            ResultData result = searchService.search(query);
+            result.getItems().forEach(i -> {
+                if (i.getEntityPath() == null) {
+                    entityControllerMapping.getLink(i.getEntity().getClass(), i.getEntityId())
+                        .ifPresent(i::setEntityPath);                 // <4>
+                }
+            });
+            model.addAttribute("result", result);
+        }
+        return "/search/list";
+    }
+}
+----
+<1> Fixed path `/search` — not customizable; use `SearchController.PATH` constant to link from the UI
+<2> Only active when search is enabled — same activation property as the whole search subsystem
+<3> `EntityControllerMapping` is the SDK's registry of entity URL routes (part of `<<entity-actions>>`). It maps `(entityClass, entityId)` → navigation URL.
+<4> **Fallback path resolution** — if a `SearchEntity` bean didn't set a `pathProvider` explicitly, the controller asks `EntityControllerMapping` for the entity's default detail URL. This means you can skip `pathProvider` in most `SearchEntity.builder(...)` calls and still get clickable results — as long as the entity has a registered detail controller.
+
+The `/search/list` Thymeleaf template receives:
+
+- `query` — the user's search string
+- `result` — `ResultData` with items (populated `entityPath` on each) + total hit count
+
+You customize rendering by overriding `/search/list.html` in your project's template classpath. The per-entity-type rendering is driven by `SearchEntity.layoutTemplateName()` — see the Thymeleaf fragment reference earlier in this doc.
+
+TIP: If you need a JSON variant (autocomplete, embedded search widget in non-admin UI), write a separate `@RestController` using `FastSearchService` directly — `SearchController` is HTML-only. The custom typeahead example above (`ClientTypeaheadController`) is the template.
+
+== Index Management — FastSearchIndexManager
+
+The SDK's index lifecycle is handled by `FastSearchIndexManager`:
+
+[source,java]
+----
+public class FastSearchIndexManager {
+
+    @Scheduled(initialDelay = 30_000, fixedDelay = 1_000_000_000)    // <1>
+    public void validateIndex() {
+        SearchSchemaManager searchSchemaManager = Search.session(entityManager).schemaManager();
+        try {
+            searchSchemaManager.validate();                           // <2>
+        } catch (SearchException e) {
+            if (e.getMessage().startsWith("HSEARCH000520")) {          // <3>
+                searchSchemaManager.dropAndCreate();
+                log.info("Index schema was dropped and created");
+                updateIndexes();                                      // <4>
+            } else {
+                throw e;
+            }
+        }
+    }
+
+    public void updateIndexes() {                                     // <5>
+        Search.session(entityManager).massIndexer()
+            .threadsToLoadObjects(indexThreads).start();
+    }
+}
+----
+<1> Runs 30s after startup, then every ~11.5 days. First run catches most schema drift from deployed entity changes.
+<2> Validates the existing index schema against the current entity mappings.
+<3> `HSEARCH000520` is Hibernate Search's "schema validation failed" error code. Common causes: added `@IndexedEmbedded`, changed field type, added a new `@FullTextField`.
+<4> Mass reindex after drop+create — walks all rows and re-indexes them.
+<5> Public method — called by `UpdateIndexesControlButton` and externally available for scheduled reindexing scripts.
+
+=== Auto-Recovery vs Explicit Management
+
+**Auto-recovery** (`validateIndex` schedule): safe for development and small-data production. Drops+recreates+reindexes on schema mismatch automatically. Downside: the mass reindex runs the instant a deployed change breaks the schema — potentially during business hours.
+
+**Manual management** (disable the schedule, trigger via `UpdateIndexesControlButton`): recommended for large-data production. Deploy the schema change, then run the indexer from the admin panel during a maintenance window.
+
+To disable auto-recovery but keep manual trigger: override `FastSearchIndexManager.validateIndex` in a subclass or register a competing `@Scheduled` bean. The SDK doesn't currently offer a property flag.
+
+=== UpdateIndexesControlButton — Operator Trigger
+
+[source,java]
+----
+@Component
+@ConditionalOnBean(FastSearchIndexManager.class)
+@Order(1000)
+public class UpdateIndexesControlButton implements ControlButton {
+    @Override public String code() { return "update-indexes"; }
+    @Override public String caption() { return "Update Indexes"; }
+    @Override public String permission() { return SYSTEM_CONTROL; }
+
+    @Override
+    public void execute() { indexManager.updateIndexes(); }
+}
+----
+
+Appears in the admin System Control panel. Use when:
+
+- Adding a new `@Indexed` entity in production (no schema mismatch yet, but old data isn't indexed)
+- Recovering after an Elasticsearch cluster rebuild
+- Testing search config changes — reindex without restart
+
 == Entity Labels
 
-Add entity type labels to `messages.properties` for proper display:
+Add entity-type labels to `messages.properties` for proper display:
 
 [source,properties]
 ----
@@ -165,46 +489,137 @@ entity.application=Application
 entity.participant=Participant
 ----
 
-== Index Management
+The key format is `entity.{entityType}` where `{entityType}` is either the `SearchEntity.entityType()` value or — if not overridden — `EnumUtils.getDefaultGroup(clazz)` (entity class simple name in kebab-case).
 
-Search indexes are created automatically when the application starts.
+== Search Query Syntax
 
-=== Manual Index Refresh
-
-Use the **Update Indexes** button on the `/control` page to manually refresh search indexes.
-
-=== Index Recreation
-
-If indexes are dropped or corrupted, they will be automatically recreated when the application starts.
-
-== Search Examples
-
-Users can search with:
+The `/search` endpoint accepts Hibernate Search's `simpleQueryString` syntax:
 
 [source]
 ----
-john smith             # Find both terms
-"john smith"           # Exact phrase
-fullName:john          # Search specific field
-john*                  # Wildcard search
-john AND smith         # Boolean operators
+john smith             # both terms (AND implicit)
+"john smith"           # exact phrase
+fullName:john          # search specific field
+john*                  # wildcard suffix
+john AND smith         # explicit boolean
+john OR alex           # either match
+-smith                 # exclude term
+(john OR alex) smith   # grouped boolean
 ----
 
-== Common Issues
+Invalid syntax silently falls back to partial matches — no error to the user. Consider logging failed queries if typo analysis matters for your UX.
 
-**No search results?**
+== Advanced Patterns
 
-1. Check `@Indexed` annotation exists
-2. Verify `FastSearchEntity` bean is configured  
-3. Ensure searchable fields have `@FullTextField` or `@KeywordField`
+=== Dynamic Search Bean Registration
 
-**Slow search?**
+Register `SearchEntity` beans conditionally based on feature flags:
 
-1. Use `@KeywordField` for exact matches
-2. Only index fields users actually search
+[source,java]
+----
+@Bean
+@ConditionalOnProperty("features.application-search.enabled")
+SearchEntity<Application> applicationSearchEntity() {
+    return SearchEntity.builder(Application.class).build();
+}
+----
+
+Disabled features don't contribute to search — no result clutter when a feature isn't in use.
+
+=== Search-Only View DTOs
+
+For search result projections that don't match the entity shape, return custom DTOs from your controller:
+
+[source,java]
+----
+@GetMapping("/api/search-json")
+public List<SearchRowDto> searchJson(@RequestParam String q) {
+    return fastSearchService.search(q).getItems().stream()
+        .map(r -> new SearchRowDto(r.getEntityId(), r.getEntityType(), r.getEntityName(), r.getEntityPath()))
+        .toList();
+}
+----
+
+Avoids serializing raw entities (lazy proxies, circular refs) in API responses.
+
+=== Reindex After Bulk SQL Import
+
+`FastSearchIndexManager.updateIndexes()` runs a full mass reindex. For incremental updates (say, after importing 100 new rows via Hibernate), Hibernate Search's default behavior already covers you — entity listeners fire on commit. Full mass reindex is only needed after:
+
+- Native SQL bulk inserts that bypass Hibernate
+- Schema changes to `@Indexed` / `@FullTextField` annotations
+- Recovery from an index outage
+
+[source,java]
+----
+@Transactional
+public void importBulk(Path csvFile) {
+    jdbcTemplate.batchUpdate("INSERT INTO client ...", rows);
+    // Hibernate listeners DIDN'T fire — reindex explicitly
+    indexManager.updateIndexes();
+}
+----
+
+=== Migrating Off Deprecated FastSearchEntity
+
+Automated migration is safe because `SearchEntity extends FastSearchEntity`:
+
+1. Replace the constructor call: `new FastSearchEntity<>(...)` → `SearchEntity.builder(...)`
+2. Replace setters with builder methods
+3. Close the chain with `.build()`
+
+Runtime behavior is unchanged. The old `FastSearchEntity` bean injection points keep working.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `SearchEntity.builder(...)`** for new beans — the deprecation is explicit
+* {ok} **Use `@FullTextField` for natural language** (names, notes) and `@KeywordField` for exact codes (IDs, SKUs) — mixing them up causes silent search misses
+* {ok} **Annotate nested `@Embeddable` with `@IndexedEmbedded`** — otherwise nested field changes don't trigger reindex
+* {ok} **Set `pathProvider`** — clickable results are what users expect; the default doesn't link anywhere
+* {ok} **Gate search config with `@ConditionalOnProperty("hibernate.search.enabled")`** — avoids pointless beans when search is off
+* {ok} **Set `hibernate.search.index.threads`** to match your disk / ES ingest capacity — too high causes I/O contention
+* {ok} **Configure `layout.environment` when sharing an ES cluster** across dev/staging/prod — prevents cross-environment index collisions
+* {ok} **Use `searchEntity(Class, input, limit)` for typeahead** — not `search(input)` which returns the 40-hit default
+* {ok} **Populate `entity.{type}` i18n keys** for every registered `SearchEntity` — otherwise the UI shows raw entity type strings
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Writing new code with `new FastSearchEntity<>(...)`** — it's marked `forRemoval`; IDE warnings nag and future SDK versions will delete it
+* {bad} **Writing `extends AbstractAuditable<UUID>`** — the class has no type parameter; `<UUID>` compiles but is a lie
+* {bad} **Indexing every field** — bloats the index, slows reindex, dilutes relevance scoring. Only index fields users actually search
+* {bad} **Using `@KeywordField` for free text** — exact match on `"John Smith"` misses `"john smith"`; use `@FullTextField`
+* {bad} **Relying on `validateIndex` auto-recovery in production** with large tables — reindex may lock up your ES cluster during peak hours
+* {bad} **Running `updateIndexes()` inside a request thread** — mass reindex takes minutes to hours on real data; run from a scheduled job or the admin button
+* {bad} **Ignoring `HSEARCH000520` in logs** — means your index schema drifted and auto-recovery kicked in; investigate what deploy caused it
+* {bad} **Sharing indexes across environments without `MultipleEnvironmentIndexLayoutStrategy`** — staging overwrites prod data; happens silently until someone searches
+* {bad} **Exposing raw `SearchResult` through JSON APIs** — leaks internal field names + triggers lazy loads. Map to a DTO
+* {bad} **Forgetting `@ConditionalOnProperty`** on your search config — beans register even when search is off; harmless but pollutes startup logs
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `hibernate.search.enabled=true` set
+* {todo} `hibernate.search.index.threads` set (no default — bean fails to start)
+* {todo} For production: Elasticsearch backend (not Lucene) — enables multi-node deployments
+* {todo} For shared ES cluster: `hibernate.search.backend.layout.strategy=multi-environment-strategy` + `layout.environment=<env>` configured
+* {todo} Every `@Indexed` entity has a registered `SearchEntity` (or deprecated `FastSearchEntity`) bean
+* {todo} Every searchable field has `@FullTextField` / `@KeywordField` (or is reachable via `@IndexedEmbedded`)
+* {todo} `pathProvider` set on every `SearchEntity` — clickable results
+* {todo} `entity.{type}` i18n keys defined for every registered search entity
+* {todo} Auto-recovery (`FastSearchIndexManager.validateIndex`) behavior reviewed: acceptable in dev; consider disabling in prod with large indexes
+* {todo} `UpdateIndexesControlButton` visible in admin panel (`@Order` position acceptable)
+* {todo} New `@Indexed` entity deployments trigger manual reindex (or confirmed that auto-recovery handles it)
+* {todo} Bulk SQL insert paths explicitly call `FastSearchIndexManager.updateIndexes()` afterward
+* {todo} Monitoring: alert on repeated `HSEARCH000520` in logs (schema drift causing reindex loops)
+* {todo} Search-backed API endpoints map to DTOs — no raw entity serialization
+* {todo} Migration plan documented for deprecated `FastSearchEntity` usages (no hard deadline yet, but plan ahead of SDK upgrades)
 
 ---
 
-**Related:** <<getting-started>>, <<form-classes-setup-and-usage>>, <<html-template-integration>>
+**Related:** <<entity-module-sdk-reference-hierarchy>>, <<getting-started>>, <<form-classes-setup-and-usage>>, <<html-template-integration>>
 
-**Advanced:** https://hibernate.org/search/documentation/
+**Advanced:** https://hibernate.org/search/documentation/[Hibernate Search documentation]
+
+**Next:** <<documents>>, <<entity-history>>

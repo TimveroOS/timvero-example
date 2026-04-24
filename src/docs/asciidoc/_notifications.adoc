@@ -378,6 +378,440 @@ infobip:
 
 Supports delivery status tracking.
 
+[[gateway-implementations-sdk-reference]]
+== Gateway Implementations — SDK Reference
+
+The preceding subsections document _activation_ — which properties turn a gateway on and what YAML to paste. This chapter documents _internals_ — the HTTP client choice, the DTO shape, the provider-status-to-`NotificationStatus` mapping, and the hidden behaviors you need to know when debugging a stuck `SCHEDULED` row, writing a custom gateway that mirrors a built-in, or deciding whether a provider can meet a business requirement (attachments, bounce tracking, delivery confirmation).
+
+All four built-in gateways follow the same Spring activation shape but differ sharply in HTTP client and response surface:
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Gateway | Base class | Client library | Activation | `check()` source
+
+| `MailgunEmailGateway` | `AbstractEmailGateway` | `mailgun-java` (Feign) | `@ConditionalOnProperty("mailgun.apikey")` | Events API, filtered by `message-id`
+| `CustomerIoEmailGateway` | `AbstractEmailGateway` | Spring `RestTemplate` | `@ConditionalOnProperty("customerio.apikey")` | _none_ — status is synthetic `PERFORMED`
+| `TwilioSmsGateway` | `AbstractSmsGateway` | `twilio-java` SDK | `@ConditionalOnProperty("twilio.sid")` + `@ConditionalOnClass` | `Message.fetcher(sid)` per id
+| `InfobipSmsGateway` | `AbstractSmsGateway` | `infobip-api-java-client` | `@ConditionalOnProperty("infobip.api.key")` + `@ConditionalOnClass` | `getOutboundSmsMessageDeliveryReports()` per id
+|===
+
+Common pattern: each class is a `@Service` with a provider-specific bean name (`"MailgunEMAIL"`, `"TwilioSMS"`, `"InfobipSMS"`) — these names are what `NotificationTemplate.gatewayName` stores and what `NotificationExecutorRegister.supports()` matches against. The name is also visible in `/actuator/beans` for diagnosing "which gateway actually claimed my EMAIL template?".
+
+[[gateway-mailgun-internals]]
+=== MailgunEmailGateway — Feign-style REST client
+
+The class delegates to `MailgunMessagesApi` and `MailgunEventsApi` — two Feign proxies created by `MailgunClient.config(apiKey)` at `@PostConstruct`. The stub `MailgunApi` interface in the same package is dead code (all methods commented out) — the real contract lives in the `com.mailgun.api.v3` package of the `mailgun-java` library.
+
+[source,java]
+----
+@Service("MailgunEMAIL")                                <1>
+@ConditionalOnProperty("mailgun.apikey")
+public class MailgunEmailGateway extends AbstractEmailGateway {
+
+    @PostConstruct
+    protected void init() {
+        MailgunClientBuilder builder = MailgunClient.config(apiKey)
+            .logLevel(Logger.Level.NONE)
+            .retryer(new Retryer.Default())             <2>
+            .errorDecoder(new ErrorDecoder.Default())
+            .options(new Request.Options(
+                timeout.toSeconds(), TimeUnit.SECONDS,
+                timeout.toSeconds(), TimeUnit.SECONDS, true));
+        mailgunMessagesApi = builder.createApi(MailgunMessagesApi.class);
+        mailgunEventsApi   = builder.createApi(MailgunEventsApi.class);
+    }
+
+    @Override public int batchSize()     { return 20; }  <3>
+    @Override public Duration lifeTime() { return Duration.ofDays(1); }
+}
+----
+<1> Bean name `"MailgunEMAIL"` — the suffix matches `NotificationGatewayType.EMAIL.name()`, used by template→gateway routing.
+<2> `Retryer.Default` — 5 attempts, exponential backoff up to 1s. Applies to 429/5xx and IOExceptions. No way to disable per-call; a hanging Mailgun API costs you `timeout × 5 ≈ 150s` before a send fails over.
+<3> Batch size 20 is used by `checkScheduled()` — Mailgun's Events API accepts the `message-id` query as a space-separated `OR` list (see below), so 20 IDs round-trip as one HTTP call.
+
+**Send path (`sendEmail`):**
+
+[source,java]
+----
+if (attachments == null || attachments.isEmpty()) {
+    message = Message.builder()
+        .from(sender).to(email).subject(subject).html(body).build();   <1>
+} else {
+    message = Message.builder()
+        .from(sender).to(email).subject(subject).html(body)
+        .formData(attachments.stream()                                 <2>
+            .map(a -> new FormData(a.getContentType(), a.getFilename(), a.getData()))
+            .toList())
+        .build();
+}
+MessageResponse messageResponse = mailgunMessagesApi.sendMessage(domain, message);
+String id = messageResponse.getId();
+return id.substring(1, id.length() - 1);                               <3>
+----
+<1> No-attachment path is `application/x-www-form-urlencoded` under the hood (Feign's form encoder). Faster, no multipart boundary overhead.
+<2> Attachment path flips to `multipart/form-data`. `DocumentResource.getData()` is `byte[]` — loaded fully into memory. Large attachments block the single-threaded gateway executor (see <<gateway-implementations-sdk-reference>> intro and `NotificationExecutorRegister`).
+<3> Mailgun returns the Message-ID wrapped in angle brackets (`<xxx@domain>`). The substring strips them — matches the raw `message-id` header that the Events API returns, which is critical for `check()` correlation.
+
+**Status reconciliation (`check`):**
+
+The query window is `[now - lifeTime, now]` = 1 day. `messageId` is `String.join(" OR ", messageIds)` — Mailgun's query DSL — so a single batch of 20 IDs is one HTTP round-trip regardless of batch size.
+
+[source,java]
+----
+EventsQueryOptions opts = EventsQueryOptions.builder()
+    .messageId(String.join(" OR ", messageIds))
+    .begin(now.minusSeconds(lifeTime().toSeconds()).getEpochSecond())
+    .end(now.getEpochSecond())
+    .build();
+EventsResponse response = mailgunEventsApi.getEvents(domain, opts);
+for (EventItem item : response.getItems()) {
+    if      (EventType.ACCEPTED.getValue().equals(item.getEvent()))  // SCHEDULED
+    else if (EventType.REJECTED.getValue().equals(item.getEvent())
+          || EventType.FAILED.getValue().equals(item.getEvent()))    // DROPPED
+    else if (EventType.DELIVERED.getValue().equals(item.getEvent())) // PERFORMED
+    else                                                             // OPENED
+}
+----
+
+Event-to-`NotificationStatus` mapping:
+
+[cols="1,1,2", options="header"]
+|===
+| Mailgun event | `NotificationStatus` | Notes
+| `accepted` | `SCHEDULED` | Mailgun queued, not yet sent
+| `rejected`, `failed` | `DROPPED` | Hard bounce, blocked recipient, auth fail
+| `delivered` | `PERFORMED` | Recipient MX accepted
+| anything else (`opened`, `clicked`, `complained`, `unsubscribed`) | `OPENED` | Catch-all — note `complained` also maps here {bad}
+|===
+
+[WARNING]
+====
+`EXPIRED` is **not** mapped by Mailgun's `check()` — it is set by `NotificationProcessingService.checkScheduled()` when the row is still `SCHEDULED` past `gateway.lifeTime()` (1 day here). If you rely on `EXPIRED` to trigger fallback (e.g. send an SMS when email never delivered), remember the polling cadence is 5 min — you get `EXPIRED` 1 day + up-to-5-min after the send.
+====
+
+The paginated `EventsResponse` (mirrored by the local `EventsResponse` DTO — only used for decoding structure, not wire) is single-page in practice since the message-id filter narrows results hard. No pagination follow-up is done — if Mailgun spreads 20 events across pages, you lose status updates until the next poll window.
+
+`SendMessageResponse` is a local two-field DTO (`id`, `message`) that exists for parity with the internal Mailgun types; the gateway itself returns `MessageResponse` from the library.
+
+[[gateway-customerio-internals]]
+=== CustomerIoEmailGateway — Transactional Email API
+
+Unlike Mailgun, this gateway hand-rolls a `RestTemplate` (no Feign, no SDK). The `CustomerIoApi` `@Component` is a thin wrapper around `restTemplate.exchange()` — split out for testability, not for re-use.
+
+[source,java]
+----
+@Component
+@ConditionalOnProperty("customerio.apikey")
+public class CustomerIoApi {
+    @PostConstruct
+    public void init() {
+        restTemplate = new RestTemplateBuilder()
+            .interceptors(new LogBodyInterceptor())                      <1>
+            .defaultHeader(HttpHeaders.CONTENT_TYPE, APPLICATION_JSON_VALUE)
+            .defaultHeader(HttpHeaders.ACCEPT,       APPLICATION_JSON_VALUE)
+            .connectTimeout(timeout).readTimeout(timeout)                <2>
+            .build();
+    }
+    public CustomerIoSendResponse sendEmail(CustomerIoSendRequest request) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.add(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey);      <3>
+        HttpEntity<CustomerIoSendRequest> req = new HttpEntity<>(request, headers);
+        return restTemplate.exchange(baseUrl + "/v1/send/email",
+                POST, req, CustomerIoSendResponse.class).getBody();
+    }
+}
+----
+<1> `LogBodyInterceptor` (from `com.timvero.ground.rest`) logs the outbound JSON body at DEBUG. Safe for transactional emails but note it captures full body including any PII; gate on log level in prod.
+<2> Single `timeout` property applied to both connect and read phases. Default 30s — Customer.io's transactional endpoint usually responds in <1s but queues can stall.
+<3> Bearer auth, distinct from Mailgun's HTTP Basic.
+
+**Send path (`sendEmail`):**
+
+The DTO `CustomerIoSendRequest` is marshalled with `@JsonInclude(NON_NULL)` — `messageData` and `tracked` default to `true`, and the gateway always sets a synthetic `identifiers` map:
+
+[source,java]
+----
+Map<String, String> identifiers = new HashMap<>();
+identifiers.put("email", email);                                         <1>
+request.setIdentifiers(identifiers);
+
+if (attachments != null && !attachments.isEmpty()) {
+    log.warn("Customer.io transactional email API does not support "
+           + "attachments directly. {} attachments will be ignored.",    <2>
+           attachments.size());
+}
+CustomerIoSendResponse response = customerIoApi.sendEmail(request);
+if (response == null)
+    throw new CustomerIoApiException("Customer.io API returned null response");
+String deliveryId = response.getDeliveryId();
+if (deliveryId == null || deliveryId.isEmpty())
+    throw new CustomerIoApiException("Customer.io API returned empty delivery_id");
+return deliveryId;                                                       <3>
+----
+<1> Customer.io requires a "customer" identifier. The gateway uses the recipient email — fine for transactional, but means every distinct email address becomes a synthetic Customer.io person record.
+<2> {bad} Attachments are **silently dropped** with a log warning — no exception, no `GENERATION_FAILED`. Templates that legitimately need attachments will appear to send successfully. See Anti-Patterns.
+<3> `CustomerIoApiException` is the only checked exception thrown — `AbstractEmailGateway` catches it and flips the row to `ERROR`.
+
+**Status reconciliation (`check`):** {bad}
+
+[source,java]
+----
+public Map<String, NotificationStatus> check(Collection<String> messageIds) {
+    Map<String, NotificationStatus> result = new HashMap<>();
+    for (String messageId : messageIds) {
+        result.put(messageId, NotificationStatus.PERFORMED);             <1>
+    }
+    return result;
+}
+----
+<1> Customer.io's transactional API exposes no delivery-status endpoint. The gateway returns `PERFORMED` for every queued ID on the first `checkScheduled()` tick. This is a **lie** — the email may have bounced, failed auth, or never sent — but from the Pumpkin lifecycle's POV the row is closed. If you need true delivery tracking, configure Customer.io webhooks and write a `NotificationRepository`-updating handler separately.
+
+`CustomerIoApiException extends Exception` — checked. The propagation contract: `sendEmail` declares it, `AbstractEmailGateway` treats any `Exception` not of type `IncorrectDataException` as `ERROR`. The `CustomerIoApi` wrapper does **not** wrap `HttpClientErrorException` / `HttpServerErrorException` — those bubble as unchecked `RestClientException` and also land as `ERROR`.
+
+[[gateway-twilio-internals]]
+=== TwilioSmsGateway — Twilio SDK integration
+
+No Feign, no RestTemplate — Twilio ships its own `TwilioRestClient` that wraps OkHttp. The gateway is a thin adapter over it.
+
+[source,java]
+----
+@Service("TwilioSMS")
+@ConditionalOnProperty("twilio.sid")
+@ConditionalOnClass(name = "com.twilio.Twilio")                          <1>
+public class TwilioSmsGateway extends AbstractSmsGateway {
+
+    private final TwilioRestClient client;
+    private final String sender;
+
+    public TwilioSmsGateway(
+        @Value("${twilio.sid}") String sid,
+        @Value("${twilio.auth.token}") String authToken,
+        @Value("${twilio.sender}") String sender
+    ) {
+        this.client = new TwilioRestClient.Builder(sid, authToken).build();   <2>
+        this.sender = sender;
+    }
+}
+----
+<1> `@ConditionalOnClass` — if the Twilio SDK jar isn't on the classpath the bean is silently skipped, avoiding `ClassNotFoundException` at startup. Protects deployments that opt out of the SDK.
+<2> Constructor injection (no `@PostConstruct`) — fails fast at startup if SID/token are wrong. The global static `Twilio.init()` is deliberately **not** used — this gateway is instance-scoped so multiple Twilio accounts can co-exist (e.g. one per tenant in a multi-tenant deployment, if you subclass and wire different properties).
+
+**Send path (`sendSms`):**
+
+[source,java]
+----
+Message message = Message
+    .creator(new PhoneNumber(phone), new PhoneNumber(sender), text)
+    .create(client);                                                     <1>
+return message.getSid();                                                 <2>
+----
+<1> `Message.creator(...).create(client)` — fluent SDK call, POSTs to `/2010-04-01/Accounts/{sid}/Messages.json`. Returns the full `Message` with status `QUEUED` (or `SCHEDULED` if you set `sendAt` — this gateway does not).
+<2> The `sid` (prefixed `SM...`) is saved as `Notification.externalId` and later used for `check()`.
+
+Rate limiting is Twilio-side (default 1 msg/sec per sender number for long-codes, 100+/sec for short-codes). This gateway inherits the single-thread default `Executor` — so sends serialize across the JVM. For higher throughput register a `NotificationExecutorRegister` targeting `TwilioSmsGateway.class` (pattern shown in <<per-gateway-executors-notificationexecutorregister>>). No `batchSize()` / `lifeTime()` overrides — inherits the abstract defaults (batch 1, lifetime 2h).
+
+**Status reconciliation (`check`):**
+
+One HTTP call **per message id** — there is no batch delivery-status endpoint on Twilio. For a batch of 20 stuck messages the polling tick makes 20 sequential calls.
+
+[source,java]
+----
+for (String sid : messageIds) {
+    Message sms = Message.fetcher(sid).fetch(client);
+    NotificationStatus status = switch (sms.getStatus()) {
+        case SENT       -> NotificationStatus.PROCESSED_DELIVERY;         <1>
+        case DELIVERED  -> NotificationStatus.PERFORMED;
+        case FAILED     -> NotificationStatus.ERROR;
+        case UNDELIVERED, CANCELED -> NotificationStatus.DROPPED;         <2>
+        case ACCEPTED, SCHEDULED, QUEUED, SENDING
+                        -> NotificationStatus.SCHEDULED;
+        default         -> NotificationStatus.SCHEDULED;
+    };
+    result.put(sid, status);
+}
+----
+<1> `SENT` is the one carrier handed it off to the recipient carrier — Twilio does not yet know if delivered. Maps to the intermediate `PROCESSED_DELIVERY` so admin UIs can distinguish it from "still queued".
+<2> `UNDELIVERED` = carrier rejected (bad number, blocked); `CANCELED` = your code called cancel. Both are terminal and flip to `DROPPED` — `ERROR` is reserved for hard send failures.
+
+Missing from the switch: `READ` (WhatsApp/MMS only), `RECEIVED`/`RECEIVING` (inbound, not applicable), and `PARTIALLY_DELIVERED` (MMS) — they fall into `default` and are treated as still-in-flight.
+
+The public `setDocumentStorage(DocumentStorage)` method exists for test-harness wiring (the parent class uses `documentStorage` for letter-style gateways that persist blobs; SMS doesn't need it but the base class requires the field).
+
+[[gateway-infobip-internals]]
+=== InfobipSmsGateway — Infobip SDK integration
+
+Structurally closest to Twilio — official SDK (`infobip-api-java-client`), one-`SmsApi`-per-call, one HTTP round-trip per status check.
+
+[source,java]
+----
+@Service("InfobipSMS")
+@ConditionalOnProperty("infobip.api.key")
+@ConditionalOnClass(name = "com.infobip.ApiClient")
+public class InfobipSmsGateway extends AbstractSmsGateway {
+
+    @PostConstruct
+    protected void initTwilio() {                                        <1>
+        apiClient = ApiClient.forApiKey(ApiKey.from(apiKey))
+            .withBaseUrl(BaseUrl.from(baseUrl))                          <2>
+            .build();
+    }
+}
+----
+<1> Method name is a historical typo (`initTwilio` in an Infobip class) — harmless, `@PostConstruct` doesn't care about the name. Flagged here so you don't chase it.
+<2> Infobip is region-sharded — the `infobip.api.url` is tenant-specific (your account's base URL shown in the Infobip portal). Unlike Twilio there is no single global endpoint; wrong base URL fails at send-time with 404.
+
+**Send path (`sendSms`):**
+
+[source,java]
+----
+SmsApi smsApi = new SmsApi(apiClient);                                   <1>
+SmsTextualMessage smsMessage = new SmsTextualMessage()
+    .addDestinationsItem(new SmsDestination().to(phone))
+    .text(text);
+if (StringUtils.hasText(sender)) {
+    smsMessage.setFrom(sender);                                          <2>
+}
+SmsAdvancedTextualRequest req = new SmsAdvancedTextualRequest().messages(List.of(smsMessage));
+SmsResponse smsResponse = smsApi.sendSmsMessage(req).execute();
+return smsResponse.getMessages().get(0).getMessageId();                  <3>
+----
+<1> New `SmsApi` per call — cheap wrapper over the shared `apiClient`. The underlying OkHttp client & connection pool are reused.
+<2> `sender` is optional (`infobip.sender:` default empty). If blank, Infobip uses the default sender configured on the account — country-specific alphanumeric sender IDs may still apply.
+<3> The gateway picks `messages[0]` — this works because the request contains exactly one `SmsTextualMessage`. Batch-sending multiple destinations in one call would require reworking the return contract (base class expects one `externalId` per `sendSms` call).
+
+`ApiException` (Infobip SDK) is caught and rethrown unchanged — the `catch` block is a no-op placeholder (comment: "HANDLE THE EXCEPTION"). It propagates up and lands as `ERROR` via `AbstractSmsGateway`.
+
+**Status reconciliation (`check`):**
+
+Infobip groups statuses into numeric `groupId` bands — the switch maps those bands directly:
+
+[source,java]
+----
+SmsDeliveryResult r = smsApi.getOutboundSmsMessageDeliveryReports()
+    .messageId(sid).execute();
+SmsReport report = r.getResults().get(0);
+Assert.state(sid.equals(report.getMessageId()),                          <1>
+    () -> "Not expected sid : " + report.getMessageId() + ", expected " + sid);
+
+NotificationStatus status = switch (report.getStatus().getGroupId()) {
+    case 1 -> NotificationStatus.SCHEDULED;  // PENDING
+    case 2 -> NotificationStatus.DROPPED;    // UNDELIVERABLE
+    case 3 -> NotificationStatus.PERFORMED;  // DELIVERED
+    case 4 -> NotificationStatus.EXPIRED;    // EXPIRED — Infobip-native
+    case 5 -> NotificationStatus.ERROR;      // REJECTED
+    default -> throw new IllegalArgumentException(
+        "Unexpected Status Group Id: " + report.getStatus().getGroupId());  <2>
+};
+----
+<1> Defensive assertion — Infobip's API _should_ echo the queried `messageId` but the gateway guards against mis-routed responses. A violation throws `IllegalStateException`, the batch aborts, and the row stays `SCHEDULED` for the next tick.
+<2> The `default` branch **throws** rather than falling through to `SCHEDULED`. If Infobip adds a new group ID the whole batch for that gateway fails until the SDK is updated — fail-fast rather than silent drop. Compare with Mailgun's catch-all-to-`OPENED` — opposite philosophy.
+
+Of the four gateways, Infobip is the only one whose `check()` can produce a **native** `EXPIRED` (Infobip tells you the carrier gave up). Mailgun, Customer.io, and Twilio rely on the `NotificationProcessingService.checkScheduled()` lifetime check to synthesize `EXPIRED`.
+
+[[gateway-javamailsender-internals]]
+=== JavaMailSenderGateway — Spring Mail / SMTP
+
+The fifth built-in gateway (`com.timvero.service.impl.email.spring`) wraps any `JavaMailSender` bean — Spring Mail's SMTP abstraction. It's the zero-dependency option: no provider SDK, just configure an SMTP host and it works.
+
+[source,java]
+----
+@Configuration
+@Import(MailSenderAutoConfiguration.class)               // <1>
+public class JavaMailSenderConfiguration {
+
+    @Bean
+    @ConditionalOnBean(JavaMailSender.class)              // <2>
+    JavaMailSenderGateway javaMailSenderGateway(JavaMailSender sender) {
+        return new JavaMailSenderGateway(sender);
+    }
+}
+
+public class JavaMailSenderGateway extends AbstractEmailGateway {
+
+    @Value("${spring.mail.sender}")
+    private String sender;
+
+    @Override public int batchSize() { return 20; }         // <3>
+    @Override public Duration lifeTime() { return Duration.ofDays(1); }
+
+    @Override
+    public String sendEmail(String sender, String email, String subject,
+                            String body, List<DocumentResource> attachments) throws Exception {
+        MimeMessage message = emailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message, !attachments.isEmpty());    // <4>
+        helper.setFrom(sender);
+        helper.setTo(email);
+        helper.setSubject(subject);
+        helper.setText(body, true);                         // <5>
+        for (DocumentResource attachment : attachments) {
+            helper.addAttachment(attachment.getFilename(),
+                attachment.getInputStreamSource(), attachment.getContentType());
+        }
+        emailSender.send(message);
+        return message.getMessageID();                      // <6>
+    }
+
+    @Override
+    public Map<String, NotificationStatus> check(Collection<String> messageIds) {
+        return messageIds.stream()
+            .collect(Collectors.toMap(id -> id, id -> NotificationStatus.PERFORMED));  // <7>
+    }
+}
+----
+<1> Imports Spring Boot's `MailSenderAutoConfiguration` — gives you a `JavaMailSender` bean when `spring.mail.host` is set. No extra dependency beyond `spring-boot-starter-mail`.
+<2> `@ConditionalOnBean(JavaMailSender.class)` — activates **only** if a `JavaMailSender` exists. Differs from the other gateways (which use `@ConditionalOnProperty` directly) because the gateway isn't named like the others (`"MailgunEMAIL"`, etc.); it's just a bean.
+<3> Batch size 20 for `check()` calls, `lifeTime()` 1 day — same as Mailgun's defaults.
+<4> `MimeMessageHelper` with `multipart = true` only when attachments present — saves a MIME wrapper when there are none.
+<5> `helper.setText(body, true)` — second arg is "isHtml". Every email is HTML by default; plain-text-only is possible but you'd need a custom gateway.
+<6> Returns `Message.getMessageID()` — the `Message-ID` header, a unique string assigned by the SMTP transport after `send()` completes. Stored on `Notification.messageId` for correlation.
+<7> `check()` is a no-op stub — SMTP has no delivery-status-tracking protocol (bounces arrive asynchronously via ISP responses, not a polling API). Everything sent is optimistically marked `PERFORMED`. If delivery status matters, use Mailgun / Customer.io / a provider with a real events API.
+
+=== Activation
+
+The gateway is already imported via `@Import(MailSenderAutoConfiguration.class)` — you just need SMTP properties:
+
+[source,yaml]
+----
+spring:
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: your-username
+    password: your-app-password
+    sender: noreply@example.com           # used as default From
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+----
+
+Missing `spring.mail.host` → no `JavaMailSender` bean → `@ConditionalOnBean(JavaMailSender.class)` stops the gateway from registering — fully quiet failure mode. If you see no outbound email and no errors, grep `/actuator/beans` for `javaMailSenderGateway`; if absent, SMTP config is missing.
+
+=== When to Use
+
+[cols="1,3", options="header"]
+|===
+|Scenario |Gateway choice
+
+|On-prem / air-gapped deployment, no external API allowed
+|`JavaMailSenderGateway` with local MTA (Postfix, Exim)
+
+|Development / CI
+|`JavaMailSenderGateway` + MailHog / Mailpit (fake SMTP with a web UI)
+
+|Production + delivery-status tracking required
+|Mailgun / Customer.io — SMTP gives you no `ERROR` / `DROPPED` signal
+
+|Regulated industry + every send must be audited end-to-end
+|Mailgun + `EventsResponse` polling — SMTP's always-`PERFORMED` is a compliance gap
+
+|Multi-tenant app with per-tenant providers
+|Custom gateway extending `AbstractEmailGateway` — all four gateways activate individually, so tenants can share one JVM with different providers
+|===
+
+The JavaMailSender path is the simplest and the only one without a third-party runtime dependency — use it when "the message left the building" is good enough.
+
+**Cross-references:** `DocumentResource` attachments → <<storage>>; `Notification` status-change auditing → <<audit-module-sdk-reference-internals>>; per-gateway thread pools → <<per-gateway-executors-notificationexecutorregister>>; the `SCHEDULED`→`EXPIRED` synthesis → <<notificationprocessingservice-the-engine-room>>.
+
 === Custom Gateway Implementation
 
 To integrate with a provider not included in the SDK, extend the appropriate abstract class:
@@ -426,6 +860,7 @@ This registers `DevEmailGateway`, `DevSmsGateway`, and `DevVoiceGateway` via `De
 
 TIP: In production, dev gateways are replaced automatically — built-in gateways use `@ConditionalOnProperty` and activate only when their provider properties are configured.
 
+[[internationalization-i18n]]
 == Internationalization (i18n)
 
 The notification system integrates with Spring's message system for localized labels and descriptions.
@@ -540,8 +975,497 @@ public class WorkflowCompletionListener implements EntityEventListener<ProcessEx
 }
 ----
 
-=== Summary
+[[notification-lifecycle-sdk-internals]]
+[[the-notification-lifecycle-sdk-internals]]
+== The Notification Lifecycle — SDK Internals
 
-* **Automatic notifications** - Use EntityChecker for state-driven events
-* **Scheduled reminders** - Use EventParameters for admin-configurable timing
-* **Workflow notifications** - Listen to process completion events
+Beyond the event DSL, the SDK persists every outbound notification as a `Notification` row and drives it through a status lifecycle managed by a scheduled service. Knowing this is essential when reconciling with external providers, building admin screens over the notification history, or diagnosing "why didn't my SMS go out?".
+
+=== The `Notification` Entity
+
+`Notification` extends `AbstractAuditable` and is the persisted record of one delivery attempt to one recipient contact. Its schema captures everything needed to resend, audit, or reconcile:
+
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Purpose
+
+| `template` | `NotificationTemplate` | Template used to render content (eager `ManyToOne`)
+| `eventType` | `NotificationEventType` | Denormalized from template — survives template deletion
+| `gatewayType` | `NotificationGatewayType` | `EMAIL`, `PHONE`, or `LETTER`
+| `gatewayName` | `String` | Bean name of the gateway used (e.g. `mailgunGateway`)
+| `status` | `NotificationStatus` | Current lifecycle state — see below
+| `notificationSource` | `UUID` | Entity that triggered the event (application / credit / etc.)
+| `notificationRecipient` | `UUID` | The `Notifiable.getId()` that received it
+| `subject` / `phone` / `email` / `address` | — | Rendered recipient contact + subject
+| `content` | `Document` | Rendered body stored via `DocumentStorage` (HTML or plain text)
+| `attachments` | `List<Document>` | Documents from `NotificationModel.getDocuments()`
+| `externalId` | `String` | Provider message ID returned by `gateway.send()`
+| `performedAt` | `Instant` | When the gateway accepted it (not when delivered)
+| `notificationGenerationException` | `ExceptionEntity` | Populated on `GENERATION_FAILED`
+|===
+
+NOTE: The entity is `@NotTrackable` (reload system ignores it) and carries `HistorySupplierEvent` — audit trails tie back to it via `AbstractAuditable`.
+
+=== NotificationStatus — the lifecycle state machine
+
+`NotificationStatus` has nine values, reached in the following transitions:
+
+[source]
+----
+                        ┌─ GENERATION_FAILED (terminal, template rendering threw)
+                        │
+      prepare() ────────┤
+                        │
+                        └─ CREATED ──→ SCHEDULED ──→ PERFORMED
+                                            │           │
+                                            ├─→ ERROR   └─→ OPENED (provider callback)
+                                            │
+                                            ├─→ EXPIRED (past gateway.lifeTime())
+                                            │
+                                            └─→ DROPPED (provider bounced)
+----
+
+* `GENERATION_FAILED` — `TemplateService.evaluate()` threw; the exception is saved as `ExceptionEntity` and linked on the row. No send is attempted.
+* `CREATED` — persisted, waiting for the send executor. Picked up by `checkCreated()` if the "send after-commit" hook misses it.
+* `SCHEDULED` — `gateway.send()` returned an external id; waiting for delivery confirmation.
+* `PROCESSED_DELIVERY` — intermediate status some providers report (Twilio "queued", etc.).
+* `PERFORMED` — provider confirmed delivery.
+* `OPENED` — provider confirmed recipient opened (email providers like Mailgun).
+* `ERROR` — `gateway.send()` returned `null` or threw a non-`IncorrectDataException`.
+* `EXPIRED` — status was still `SCHEDULED` past `gateway.lifeTime()` (default 2h) — no longer polled.
+* `DROPPED` — provider hard-bounced (invalid address, blocked recipient).
+
+TIP: `NotificationStatus` implements `InEnum`, so queries can use `status.in(ERROR, EXPIRED, DROPPED)` — this is exactly how the duplicate-prevention check in `prepare()` treats "recoverable" statuses.
+
+[[notificationprocessingservice-the-engine-room]]
+=== NotificationProcessingService — the engine room
+
+The `@Service` `NotificationProcessingService` (package-private) owns the entire send pipeline. `NotificationEvent.notify()` delegates to it after resolving recipients and templates.
+
+**Two scheduled methods drive retry & status reconciliation:**
+
+[source,java]
+----
+@Scheduled(initialDelay = 600_000, fixedDelay = 300_000)
+@SchedulerLock(name = "NotificationProcessingService_checkCreated", ...)
+protected void checkCreated() {
+    List<Notification> stuck = notificationRepository.findAllByStatus(CREATED);
+    performNotifications(stuck);  // re-queue onto the per-gateway Executor
+}
+
+@Scheduled(initialDelay = 600_000, fixedDelay = 300_000)
+@SchedulerLock(name = "NotificationProcessingService_checkScheduled", ...)
+protected void checkScheduled() {
+    for (NotificationGateway gateway : gateways.values()) {
+        Instant expiryThreshold = Instant.now().minus(gateway.lifeTime());
+        List<Notification> pending = notificationRepository
+            .findAllByStatusAndGatewayType(SCHEDULED, gateway.getType());
+        // batch by gateway.batchSize(), call gateway.check(), update statuses,
+        // flip to EXPIRED if past lifeTime
+    }
+}
+----
+
+Both methods use ShedLock (`@SchedulerLock`) — safe to run multi-instance. The 10-minute initial delay prevents boot storms on restart. The 5-minute fixed delay means delivery status can lag up to ~5 minutes behind provider reality.
+
+[[per-gateway-executors-notificationexecutorregister]]
+=== Per-gateway Executors & NotificationExecutorRegister
+
+Each gateway bean gets its own `Executor`. Default is `Executors.newSingleThreadExecutor()` — SMS providers with strict rate limits need exactly this. To customize, register a `NotificationExecutorRegister`:
+
+[source,java]
+----
+public interface NotificationExecutorRegister {
+    boolean supports(NotificationGateway gateway);
+    Executor createExecutor();
+}
+----
+
+[source,java]
+----
+@Component
+public class BulkEmailExecutorRegister implements NotificationExecutorRegister {
+    @Override
+    public boolean supports(NotificationGateway gateway) {
+        return gateway instanceof MailgunGateway;  // only for bulk-capable providers
+    }
+    @Override
+    public Executor createExecutor() {
+        return Executors.newFixedThreadPool(10);   // 10 parallel sends
+    }
+}
+----
+
+`NotificationProcessingService.init()` iterates all registered `NotificationExecutorRegister` beans for each gateway at startup and takes the first `supports()` match. If none match, the single-threaded default is used.
+
+=== Quiet-hours Enforcement
+
+Before dispatching, `isPerformNotificationAvailable()` checks `template.isLateAvailable()`. If `false`, the current hour (in the notification's `timeZone`, falling back to JVM default) must be between `notification.hour.from` and `notification.hour.to`:
+
+[source,properties]
+----
+notification.hour.from=8    # default — inclusive
+notification.hour.to=18     # default — exclusive
+----
+
+Notifications that fail the window stay at `CREATED` and are retried every 5 minutes by `checkCreated()` until the window opens.
+
+WARNING: The check uses the *recipient's* `TimeZone` if set on the `Notification` — make sure your `Notifiable` resolver populates this when borrowers cross timezones. Otherwise it falls back to `TimeZone.getDefault()` which is the server JVM timezone.
+
+[[template-matching-entitytemplatematcher]]
+== Template Matching — How Events Find Templates
+
+When `notify()` is called, `NotificationEvent` queries `notificationTemplateRepository.findByEventTypeAndActiveTrue(getType())` — returning every active template for that event type. Each template is then evaluated for a match.
+
+=== The Two-Phase Filter
+
+[source]
+----
+1. Repository load:      active=true AND eventType=<this event>
+2. entityMatchesTemplate: default true — override for per-template predicates
+3. EntityTemplateMatcher: optional bean for cross-cutting matching
+----
+
+**Phase 2** is the hook on `NotificationEvent`:
+
+[source,java]
+----
+protected boolean entityMatchesTemplate(E entity, M model, Map<String, Object> templateParams) {
+    return true;  // default: send to every active template
+}
+----
+
+`templateParams` is the resolved `Map<String, Object>` of this template's `EventParameter` values (already parsed). `PaymentReminderEvent` uses this to check `daysCount` against the credit's actual overdue state:
+
+[source,java]
+----
+include::{sourcedir}/notification/PaymentReminderEvent.java[lines=53..86]
+----
+
+The same event can spawn multiple templates (one per `daysCount` value) — each gets its own pass through `entityMatchesTemplate()`.
+
+=== EntityTemplateMatcher — cross-cutting matchers
+
+`EntityTemplateMatcher<E>` is a pluggable interface for matching logic that doesn't belong inside a specific event:
+
+[source,java]
+----
+public interface EntityTemplateMatcher<E extends Notifiable> {
+    boolean matches(E e, NotificationTemplate template);
+}
+----
+
+Use it when matching depends on a *cross-cutting* concern — client opt-out flags, regulatory do-not-contact lists, test-environment filters — that applies to many events uniformly. Implementing this as a bean means events don't repeat the check in every `entityMatchesTemplate()`.
+
+=== preventDuplicate — idempotency
+
+Templates with `preventDuplicate = true` skip recipients who already have a non-terminal `Notification` with the same (template, recipient, source) triple. The check uses `NotificationRepository.findAllByTemplateAndNotificationRecipientAndNotificationSource()` and excludes only `ERROR`, `EXPIRED`, `DROPPED` (the recoverable-failure states) — so `CREATED`, `SCHEDULED`, `PERFORMED`, `OPENED` all block a resend.
+
+TIP: Turn `preventDuplicate` on for lifecycle notifications (loan approval, account closure) where the same event could fire twice from retry logic. Leave it off for payment reminders that legitimately resend.
+
+[[recipient-resolution-notifiable-contacts-type]]
+== Recipient Resolution — Notifiable, NotificationContacts, RecipientType
+
+A template has a `recipientType`; the event resolves that type to actual `Notifiable` entities; the processing service pulls contact info from each.
+
+=== Notifiable — the contract
+
+Every entity that can *receive* a notification implements `Notifiable`:
+
+[source,java]
+----
+public interface Notifiable extends Persistable<UUID> {
+    String getMainNotificationPhone();
+    String getNotificationEmail();
+    Address getNotificationAddress();
+
+    default Collection<String> getAllNotificationPhones()  { /* returns main or empty */ }
+    default Collection<String> getAllNotificationEmails()  { /* returns main or empty */ }
+}
+----
+
+Override the `getAll*` defaults when a recipient has multiple contacts (e.g. work + mobile phone, personal + corporate email) and you want templates to fan out across all of them. Single-contact recipients leave them alone.
+
+=== NotificationRecipientType + RecipientResolver
+
+`NotificationRecipientType` is a `NamedParameter` (like `NotificationEventType`). Each type is paired with a `NotificationRecipientResolver` bean that knows how to turn the triggering entity into actual recipients:
+
+[source,java]
+----
+public interface NotificationRecipientResolver {
+    NotificationRecipientType getType();
+    boolean supports(Class<?> entityType, NotificationEventType eventType);
+    Iterable<? extends Notifiable> resolve(Object entity, NotificationTemplate template);
+}
+----
+
+Two resolvers ship in the SDK:
+
+[cols="1,3", options="header"]
+|===
+| Resolver | Resolution
+
+| `DefaultNotificationRecipientResolver` (`DEFAULT`, order 0) | Casts the entity to `Notifiable`. Used when the triggering entity *is* the recipient.
+| `AgentNotificationRecipientResolver` (`AGENT`, order 100) | Looks up `UserAccount`s subscribed to this template via `findByNotificationSubscription(template.getLineageId())`. Used for internal staff alerts.
+|===
+
+To add "co-borrower", "guarantor", or "broker" recipient types: implement `NotificationRecipientResolver`, return a new `NotificationRecipientType` from `getType()`, and make `supports()` return true for the entity/event combinations you handle. `NotificationRecipientResolverRegistry` auto-discovers all beans and filters by `supports()` per event.
+
+WARNING: The first template created for a new event type determines what `recipientType` values appear in the admin form — because `NotificationTemplateFormService.notificationRecipients` is built from `getRecipientTypes()` at `@PostConstruct`. Restart after adding a new resolver.
+
+=== NotificationContacts — per-call contact filter
+
+`NotificationContacts` is an optional parameter to `notify()` that *filters* which of the recipient's contacts are actually used:
+
+[source,java]
+----
+NotificationContacts contacts = new NotificationContacts();
+contacts.addEmail("legal-copy@borrower.com");   // only send to this address
+loanApprovedEvent.notify(applicationId, model, contacts);
+----
+
+If `contacts` is `null` (the usual case), the recipient's *main* contact is used. If non-null, only contacts that appear in *both* the recipient's `getAll*` collection and the `NotificationContacts` filter are used. Use cases:
+
+* Send to a specific email branch when a recipient has several
+* Suppress phone notifications when only email is desired for one invocation
+* Route regulatory copies to a designated address without adding it to the recipient entity
+
+[[event-parameters-and-references]]
+[[event-parameters-references]]
+== Event Parameters & References
+
+=== EventParameter + EventParameterType
+
+`EventParameter` is a typed, named, admin-configurable field attached to a `NotificationEvent`. `NotificationTemplate.eventParameterValues` stores the admin's value as a `Map<String, String>` (serialized via the parameter's `formatValue`/`parseValue`).
+
+`EventParameterType` has four values:
+
+[cols="1,2,2", options="header"]
+|===
+| Type | Factory | Serialized as
+
+| `STRING` | `EventParameter.stringField("category")` | raw string
+| `INTEGER` | `EventParameter.integerField("daysCount")` | `Integer.toString`
+| `DECIMAL` | `EventParameter.decimalField("amount")` | `BigDecimal.toPlainString`
+| `ENUM` | `EventParameter.enumField("reason", DeclineReason.values())` | `enum.name()`
+|===
+
+Parameters are declared in the event's constructor (`super(param1, param2, ...)`), rendered by `NotificationTemplateFormService.getEventParameters()` (which parses the stored string back to the typed object and resolves localized labels), and delivered to `entityMatchesTemplate()` pre-parsed.
+
+=== NotificationReferenceService — finding past notifications
+
+`NotificationReferenceService` is the lookup service for navigating from an entity to its notification history. Two methods:
+
+[source,java]
+----
+@Service
+public class NotificationReferenceService {
+    public List<Notification> getNotificationsByRecipient(Notifiable recipient);
+    public List<Notification> getNotificationsBySource(Persistable<UUID> source);
+}
+----
+
+Use `getNotificationsBySource(application)` on an admin application-detail screen to show every notification that the application triggered — across all recipient types, event types, and gateways. Use `getNotificationsByRecipient(client)` to build a communication-history tab on a client profile.
+
+TIP: Both methods return raw `Notification` lists — for paged/filtered views (admin lists, API endpoints) use `NotificationFilterService` with a `NotificationFilter` instead; it supports restrictions on status, event type, date range, template title, phone, and email.
+
+[[notification-repositories]]
+== Repositories
+
+=== NotificationRepository
+
+[source,java]
+----
+public interface NotificationRepository
+    extends JpaRepository<Notification, UUID>, JpaSpecificationExecutor<Notification> {
+
+    List<Notification> findAllByStatus(NotificationStatus status);
+
+    List<Notification> findAllByStatusAndGatewayType(
+        NotificationStatus status, NotificationGatewayType type);
+
+    List<Notification> findAllByTemplateAndNotificationRecipientAndNotificationSource(
+        NotificationTemplate template, UUID recipientReference, UUID sourceReference);
+
+    List<Notification> findAllByNotificationSource(UUID source);
+    List<Notification> findAllByNotificationRecipient(UUID recipient);
+}
+----
+
+`JpaSpecificationExecutor` is present — `NotificationFilterService` uses it to translate `NotificationFilter` into `Specification<Notification>` queries.
+
+Who calls what:
+
+* `findAllByStatus(CREATED)` — `checkCreated()` scheduled recovery loop
+* `findAllByStatusAndGatewayType(SCHEDULED, EMAIL)` — `checkScheduled()` per-gateway polling
+* `findAllByTemplateAndNotificationRecipientAndNotificationSource(...)` — `preventDuplicate` check in `prepare()`
+* `findAllByNotificationSource` / `findAllByNotificationRecipient` — `NotificationReferenceService` lookups
+
+=== NotificationTemplateRepository
+
+[source,java]
+----
+public interface NotificationTemplateRepository
+    extends JpaRepository<NotificationTemplate, UUID>, JpaSpecificationExecutor<NotificationTemplate> {
+
+    List<NotificationTemplate> findByRecipientTypeAndActiveTrue(NotificationRecipientType type);
+
+    Stream<NotificationTemplate> findByEventTypeAndActiveTrue(NotificationEventType type);
+    Stream<NotificationTemplate> findByEventType(NotificationEventType type);
+}
+----
+
+`findByEventTypeAndActiveTrue` is the hot-path query on every `notify()` call — it returns a `Stream` so the event can filter templates lazily via `entityMatchesTemplate()`. `NotificationTemplate` is `@Cache(usage = READ_WRITE)` plus `eventParameterValues` is cached — so this query hits the 2nd-level cache in a warm system.
+
+NOTE: `NotificationTemplate` extends `HistoryEntity`. Edits create new versions with the same `lineageId`; `active=true` filters to the current version. That is why `preventDuplicate` is keyed on `template` (a specific version) rather than `lineageId` — correcting a template does not block a resend to recipients who got an older version.
+
+[[notifications-admin-web-controllers]]
+== Admin Web Controllers
+
+Three controllers expose the notification subsystem to admin users: the template editor (`/notification-template`), the notification log (`/notification`), and the "Activate" entity action. All live in `com.timvero.web.entity` and plug into the shared admin controller infrastructure (see <<web-infrastructure-entity-view-controllers>>).
+
+=== NotificationTemplateController
+
+The template editor at `/notification-template` is a `ViewableFilterController` with five custom endpoints for the live-preview panel (mirrors `DocumentTemplateController` — same ergonomics, different event type):
+
+[source,java]
+----
+@Controller
+@RequestMapping("/notification-template")
+@MenuItem(order = 100_100, name = "notificationTemplate", group = "tools")
+public class NotificationTemplateController
+        extends ViewableFilterController<UUID, NotificationTemplate, NotificationTemplateFilter> {
+
+    @Override protected String getViewPage() { return "/notification-template/view"; }
+
+    @Override
+    protected void assembleViewModel(NotificationTemplate template, Model model) {
+        model.addAllAttributes(formService.assembleViewModel(template));
+    }
+
+    @GetMapping("/variables_details") @PreAuthorize("hasRole(this.viewRole)")
+    public String getVariablesDetails(@RequestParam NotificationEventType docType, Model model) { /* Thymeleaf fragment */ }
+
+    @GetMapping("/variables")         @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public Map<String, Collection<BeanPropertyModel>> getVariables(@RequestParam NotificationEventType docType) { /* autocomplete JSON */ }
+
+    @GetMapping("/entities")          @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public Map<?, String> getEntities(@RequestParam NotificationEventType docType,
+                                      @RequestParam(required = false) String search) { /* test-entity search */ }
+
+    @PostMapping(value = "/test", produces = "text/html;charset=UTF-8")
+    @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public String testTemplate(@Valid @ModelAttribute NotificationTemplateForm form,
+                               BindingResult errors,
+                               @RequestParam(required = false) String localeName)
+            throws BindException, TemplateEvaluatonException { /* renders preview as HTML string */ }
+
+    @GetMapping("/parameters")        @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public Map<String, Map<String, Object>> getParameters(@RequestParam(required = false) UUID id,
+                                                          @RequestParam NotificationEventType eventType,
+                                                          Locale locale) { /* parameter catalog for editor */ }
+}
+----
+
+Key points:
+
+* **`@MenuItem(group = "tools", order = 100_100)`** — the editor lives in the **Tools** menu, *first* in its group (before the notification log at `100_200`). Admins typically author a template, then check the log to confirm it fired.
+* **`/test` returns HTML as a `String`** (not a streamed `InputStreamResource` like the document template). Notifications are text/HTML bodies rendered inline in the preview panel — there is no PDF conversion step.
+* **`/test` accepts a `locale` request parameter** — previews the *same* template rendered in any supported language, so the admin can sanity-check i18n before activating (see <<internationalization-i18n>>).
+* **`/parameters`** is unique to this controller (not present on `DocumentTemplateController`) — notification templates carry `EventParameter` overrides per template (SLA thresholds, reminder-before offsets, etc.); this endpoint returns the full catalog with current values so the editor's parameter panel can render. See <<event-parameters-references>>.
+* **The `@ExceptionHandler`** returns `{message, line?}` JSON for template-evaluation errors — same contract as `DocumentTemplateController`, lets the editor highlight the failing line inline.
+
+=== NotificationController
+
+Read-only notification log at `/notification` — a minimal `ViewableFilterController`:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/notification")
+@MenuItem(order = 100_200, name = "notification", group = "tools")
+public class NotificationController
+        extends ViewableFilterController<UUID, Notification, NotificationFilter> {
+}
+----
+
+The controller body is empty — the base class provides list, filter, detail view, and Excel export. The list is backed by `NotificationFilter` (date range, status, type, recipient, event type); see <<list-filters-annotation-driven-jpa-query-dsl>>. The detail page renders the rendered body, attachments, address (for letters), and lifecycle history — all from `Notification` entity fields. The derived role `NOTIFICATION_VIEW` shows the page; there is no `*_EDIT` role because notifications are immutable from the UI side (status transitions happen via `NotificationProcessingService`, see <<the-notification-lifecycle-sdk-internals>>).
+
+[[activation-notification-template-action]]
+=== ActivationNotificationTemplateAction — Entity Action for Activation
+
+Not a Thymeleaf page — a `SimpleActionController` that appears as an **"Activate"** button on an inactive template's detail page:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/activation")
+@Order(16700)
+public class ActivationNotificationTemplateAction
+        extends SimpleActionController<UUID, NotificationTemplate> {
+
+    @Autowired private NotificationTemplateFormService formService;
+
+    @Override
+    protected EntityAction<? super NotificationTemplate, Object> action() {
+        return when(template -> !template.isActive())                        // <1>
+            .then((entity, form, user) -> {
+                formService.activate(entity.getId());
+                setRedirectToEntity(entity.getId());                         // <2>
+            });
+    }
+
+    @Override public String getHighlighted() { return BTN_SUCCESS; }          // <3>
+}
+----
+<1> `when(...)` makes the button conditional — it only renders for templates where `isActive() == false`. Already-active templates never see the button.
+<2> After activation, the admin is redirected back to the same template's detail page — the UI now shows the freshly-activated state.
+<3> `BTN_SUCCESS` (green) — the button's CSS class. Contrast with `BTN_DANGER` for destructive actions.
+
+Key points:
+
+* **`@Order(16700)`** controls the button's position in the entity's action bar — lower numbers render leftmost. The SDK reserves ranges per action category; see <<entity-actions>>.
+* **The `/activation` path is shared across entity types** — `SimpleActionController<ID, Entity>` controllers route by the entity class derived from the generic parameter. `ActivationNotificationTemplateAction` only fires for `NotificationTemplate` entities; other entities with their own `/activation` action get their own controller.
+* **The activation call goes through `NotificationTemplateFormService.activate(id)`** which creates a new version with `active=true` and deactivates all others in the `lineageId` — the template history (via `HistoryEntity`) keeps the full version trail.
+
+Because this controller is an *action* rather than a page, it has no `@MenuItem` and does not appear in the top-level navigation — it surfaces as a button on the template detail view driven by the action registry. See <<entity-actions>> for the full mechanics.
+
+=== Address entity
+
+`Address` is an abstract `@Entity` with `SINGLE_TABLE` inheritance and `@Immutable` — implemented by domain modules (e.g. `ClientAddress`). Stored on `Notification.address` for letter-type notifications, resolved via `Notifiable.getNotificationAddress()`. The `@Immutable` annotation means the address snapshot on the notification is never mutated after creation — you get the address as it was when the letter was prepared.
+
+[[notifications-anti-patterns]]
+== Anti-Patterns
+
+* {bad} **Reading `Notification` entity state synchronously after `notify()`** — `notify()` returns `boolean` (whether any template matched) and queues delivery onto an `Executor`. The actual status transition to `PERFORMED` happens async, minutes later. Poll `NotificationRepository.findAllByNotificationSource()` for status or listen for audit events.
+* {bad} **Calling `NotificationEvent.notify()` inside a loop without batching at the event level** — each call opens a `REQUIRES_NEW` transaction (see `transactionTemplateBuilder.requiresNew()`). For 10,000 credits you open 10,000 transactions. Either batch at the gateway level (fixed thread pool via `NotificationExecutorRegister`) or rearchitect using an `EntityChecker` that fires per-entity change.
+* {bad} **Triggering notifications from inside a long-running transaction** — `notify()` nests a `REQUIRES_NEW`. If the outer transaction rolls back after `notify()`, the notification is already committed and will send. Always call from the *end* of the business operation, or use `TransactionUtils.afterTransaction`.
+* {bad} **Mutating `Notification` fields by hand** — `@NotTrackable` opts the entity out of the reload system; changes in DB won't propagate to UI live views. Always go through the processing service for status changes.
+* {bad} **Setting `preventDuplicate = true` on reminder templates** — reminders need to re-fire every cycle; `preventDuplicate` blocks on any `CREATED`/`SCHEDULED`/`PERFORMED` row with the same `(template, recipient, source)`. Reminders with the same `(template, recipient, credit)` would stop after the first successful send forever.
+* {bad} **Implementing `NotificationRecipientResolver.supports()` returning `true` for every entity/event combination** — the resolver is invoked at `NotificationEvent`'s `@Autowired` init and caches its decision; a resolver that indiscriminately claims every event ends up in every event's recipient type dropdown in the admin UI, confusing template authors.
+* {bad} **Storing raw `MonetaryAmount` or `LocalDate` objects in an `EventParameter` value** — `EventParameterType` has four supported types; `formatValue()` will throw `IllegalArgumentException` for anything else. Use the parameter for simple admin-configurable thresholds only; put complex values in the model.
+* {bad} **Reading `notification.content` / `notification.attachments` from within the gateway's `check()` method** — `check()` is invoked from the 5-minute scheduler, long after the send transaction. The entity is detached; use the `externalId` to query the provider, then save status back via the repository.
+* {bad} **Using `CustomerIoEmailGateway` for templates that require attachments** — `sendEmail()` logs a warning and drops the attachments silently; the row closes as `PERFORMED` on first `checkScheduled()` tick (Customer.io exposes no delivery API). Recipients never see the file and your admin UI reports success. Use Mailgun or SMTP when attachments are load-bearing (see <<gateway-customerio-internals>>).
+* {bad} **Relying on Mailgun's `check()` to surface `EXPIRED`** — `MailgunEmailGateway.check()` maps only `accepted`/`delivered`/`rejected`/`failed` to status; anything else (including timeouts and silent drops) stays `SCHEDULED` until `NotificationProcessingService` synthesizes `EXPIRED` after `lifeTime()` = 1 day. Fallback flows (send SMS when email expires) see the transition up to 1 day + 5 min late — budget accordingly.
+* {bad} **Assuming `PERFORMED` means "delivered" across all gateways** — Customer.io flips to `PERFORMED` on queue-accept, not delivery; Twilio distinguishes queue-accept (`PROCESSED_DELIVERY`) from carrier-delivered (`PERFORMED`); Mailgun/Infobip use provider-reported delivery. If business logic branches on `PERFORMED`, qualify by gateway (see <<gateway-implementations-sdk-reference>>).
+
+[[notifications-production-checklist]]
+== Production Checklist
+
+* {todo} At least one email gateway bean is active (`mailgun.apiKey` / `customerio.apikey` / `spring.mail.host` set) — verify with `/actuator/beans | grep Gateway`
+* {todo} For SMS: `twilio.sid` or `infobip.api.key` set; Twilio/Infobip SDK on classpath
+* {todo} `notification.hour.from` / `notification.hour.to` match your customer timezone policy (defaults are 8–18 server-local)
+* {todo} Templates for *critical* lifecycle events (loan approved, loan declined) have `preventDuplicate = true`
+* {todo} Templates for recurring events (payment reminders, late-payment notices) have `preventDuplicate = false`
+* {todo} Every `NotificationEvent.getType()` value has a `messages.properties` entry at `notification.event.type.<NAME>`
+* {todo} Every `EventParameter` has a `messages.properties` entry at `notification.event.<EVENT_TYPE>.<PARAM_NAME>`
+* {todo} `application.properties` does *not* have `spring.profiles.active=development` — dev gateways log instead of sending
+* {todo} ShedLock table is configured (the two `@Scheduled` methods require it for multi-instance safety)
+* {todo} Provider webhooks (if used) tolerate unknown `externalId` values — the `check()` loop expires after `gateway.lifeTime()` (default 2h) and providers may still POST status updates afterward
+* {todo} Admin UI surfaces `Notification.notificationGenerationException` rows — these are template-rendering failures that would otherwise be invisible
+* {todo} `NotificationRecipientResolver` beans are registered *before* `NotificationTemplateFormService` inits — Spring handles this, but custom `@PostConstruct` ordering can break it
+* {todo} `Notifiable.getNotificationAddress()` returns an `Address` snapshot that won't mutate (use `@Immutable` or copy on read) — letters reference the row forever
+
+**Related:** <<storage>> (notification bodies stored as `Document`), <<document-templates>> (Pebble templating shared between docs and notifications), <<audit-module-sdk-reference-internals>> (`Notification` extends `AbstractAuditable` — every status change is audited), <<user-management>> (`AGENT` recipient resolution via `UserAccount.notificationSubscription`).
+
+**Next:** <<reload-infrastructure-live-ui-updates-on-entity-changes>> — how the admin notification list stays in sync with status changes pushed by `checkScheduled()`, <<entity-module-sdk-reference-hierarchy>> — `Notification` inherits the audit/tracking base classes described there.

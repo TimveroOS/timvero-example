@@ -1,3 +1,4 @@
+[[credit-accruals-tab]]
 = Credit Accruals Tab Integration
 
 :sourcedir: ../../main/java/com/timvero/example/admin

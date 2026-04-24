@@ -1,0 +1,477 @@
+[[form-schema]]
+= Form Schema — JSON-defined dynamic form catalog
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The form-schema module (`com.timvero.structure.form_schema`) is the SDK layer that stores **JSON-schema form definitions** as catalog entities and exposes them by **stable string code** to downstream consumers — chiefly the decision engine (`FixedDecisionFact` warnings, `PendingDecision`) that needs to render ad-hoc underwriter forms without changing Java code. The module is small (one entity, one service, one edit pipeline, one export pipeline) but load-bearing: it's the hinge between the audited catalog of form definitions and every place in the system that wants to ask "render **this** form, whose shape I don't know at compile time."
+
+== What You Need to Know
+
+The module is a **thin catalog wrapper** around a JSON schema blob. Three layers, each bounded:
+
+[cols="1,3,3", options="header"]
+|===
+|Layer |Purpose |Public API
+
+|**Entity + repository**
+|`FormSchema` is an `@Audited` `CatalogEntity` (soft-delete via `active`, UUID id) whose payload is a `@JdbcTypeCode(SqlTypes.JSON)` string column. The repository has two lookups: by unique `code` and the full active list.
+|`FormSchema`, `FormSchemaRepository`
+
+|**Lookup service**
+|`FormSchemaService` is the *only* consumer-facing API — two methods: `getActiveByCode(code)` and `getAllActive()`. Decision-engine code and Flowable action handlers resolve schemas via this service and never touch the repository.
+|`FormSchemaService`
+
+|**Edit + export pipelines**
+|Two parallel MapStruct pipelines: `FormSchemaForm` / `FormSchemaFormMapper` powers the admin CRUD screen; `FormSchemaExportData` / `FormSchemaToDtoMapper` / `FormSchemaExporter` powers catalog-to-catalog import/export across environments.
+|`FormSchemaForm`, `FormSchemaExportData`
+|===
+
+Key characteristics:
+
+- **Code is the stable identifier** — the UUID `id` is a DB detail; consumers reference a schema by its human-readable `code` (`@UniqueConstraint(name = "UK_form_schema_code")`). A schema kept across DB dumps keeps the same code, not the same id.
+- **Schema is opaque to the SDK** — the `schema` column stores an arbitrary JSON string (JSON Schema by convention, but the SDK doesn't parse it). The Java layer is a dumb courier; interpretation happens in the JS form renderer.
+- **Soft-delete via `active`** — inherited from `CatalogEntity`. `findActiveByCode` and `findAllActive` respect this flag; deleted schemas are hidden but `aud_form_schema` keeps full history.
+- **Audited** — `@Audited` on both `CatalogEntity` and `FormSchema` means every edit is captured in `aud_form_schema` and surfaces in the history tab automatically.
+- **No FormService subclass in the SDK** — unlike most SDK entities, there's no `FormSchemaService extends EntityFormService`. Edit flow uses the framework `CatalogController` + the bare `FormSchemaFormMapper`. See <<form-classes-setup-and-usage>> for what that skeleton normally looks like.
+
+== Architecture Overview
+
+[source]
+----
+                    ┌──────────────────────────────────┐
+   Admin UI         │  /form-schema/* CatalogController │
+   (CRUD screen)    │  — list / create / edit / delete │
+                    └──────────────┬───────────────────┘
+                                   │ FormSchemaFormMapper
+                                   ▼
+                    ┌──────────────────────────────────┐
+                    │          FormSchema (entity)     │
+                    │  ┌─ code       (unique, stable) ─│
+                    │  ├─ description                  │
+                    │  ├─ schema     (jsonb blob)      │
+                    │  └─ active     (soft-delete)     │
+                    └──────────────┬───────────────────┘
+                                   │ @Audited  → aud_form_schema
+                                   │
+             ┌─────────────────────┼───────────────────────────┐
+             │                     │                           │
+             ▼                     ▼                           ▼
+ ┌────────────────────┐  ┌─────────────────────┐  ┌─────────────────────────┐
+ │ FormSchemaService  │  │ FormSchemaExporter  │  │ Hibernate Envers        │
+ │ getActiveByCode()  │  │ + ToDtoMapper       │  │ writes history on every │
+ │ getAllActive()     │  │ → FormSchemaExport  │  │ insert / update         │
+ └─────────┬──────────┘  │   Data  (JSON dump) │  └─────────────────────────┘
+           │             └─────────────────────┘
+           │ resolve by code
+           ▼
+ ┌──────────────────────────────────────────────┐
+ │  Downstream consumers                        │
+ │  ├─ FixedDecisionFact.warning(..., schema)   │
+ │  ├─ PendingDecision.schema                   │
+ │  └─ ProcessActionServiceProvider.saveWarning │
+ │  (all receive FormSchema instances, never    │
+ │   parse the JSON — they hand it to JS UI)    │
+ └──────────────────────────────────────────────┘
+----
+
+The diagram's key fact: **three independent readers** share one entity. Admin edits via the form pipeline; environment migrations use the export pipeline; runtime decisions use the lookup service. None of them know about the others.
+
+== FormSchema Entity
+
+The entity is a catalog row with three business columns and one inherited flag:
+
+[source,java]
+----
+@Entity
+@Table(name = "form_schema",
+    uniqueConstraints = {
+        @UniqueConstraint(columnNames = FormSchema.CODE,
+            name = FormSchema.CODE_UNIQUE_CONSTRAINT)})
+@Audited
+public class FormSchema extends CatalogEntity implements Comparable<FormSchema> {
+
+    public static final String CODE = "code";
+    public static final String CODE_UNIQUE_CONSTRAINT = "UK_form_schema_code";
+
+    @Column(name = CODE, nullable = false, updatable = false)     // <1>
+    private String code;
+
+    @Column(nullable = false)
+    private String description;
+
+    @JdbcTypeCode(SqlTypes.JSON)                                  // <2>
+    @Column
+    private String schema;
+    /* getters / setters / toString / compareTo */
+}
+----
+<1> `updatable = false` — once assigned, a schema's code **cannot** be changed. Enforced at the JPA layer; UPDATEs that mutate the column are silently ignored by Hibernate's dirty-check. This is what makes the code a stable referent for downstream consumers; renaming would silently break every `getActiveByCode("old-name")` call.
+<2> `SqlTypes.JSON` maps to `jsonb` on PostgreSQL. The Java type stays `String` — the SDK never deserializes the schema. Consumers (the JS form renderer) handle interpretation.
+
+The natural ordering, via `Comparator.comparing(FormSchema::getCode, String.CASE_INSENSITIVE_ORDER)`, ensures dropdown lists and table rows render in a stable, human-friendly order regardless of insertion time or UUID.
+
+=== CatalogEntity Inheritance
+
+`FormSchema` extends `CatalogEntity`, which contributes:
+
+[cols="2,3", options="header"]
+|===
+|Inherited member |Effect on FormSchema
+
+|`UUID id` (`AbstractPersistable<UUID>`)
+|Primary key. Generated by the JPA provider; not business-visible.
+
+|`boolean active` + `@Undeletable(propertyName = "active")`
+|Soft-delete flag. `active=false` rows are filtered out by `findActiveByCode` and `findAllActive`. The `@Undeletable` annotation tells the framework's generic delete action to flip the flag rather than `DELETE FROM form_schema`.
+
+|`@Audited`
+|Every insert/update/delete is written to `aud_form_schema`. The same annotation on the subclass is redundant but harmless — present for clarity.
+
+|`@EntityListeners(AuditingEntityListener.class)`
+|Populates JPA auditing fields (`createdBy`, `createdDate`, `lastModifiedBy`, `lastModifiedDate`) if declared on a superclass — not present on `CatalogEntity` itself, so this is a no-op here but activates if a future superclass adds them.
+|===
+
+TIP: The fact that `id` is a UUID but `code` is the business key is deliberate. Import/export across environments (dev → stage → prod) matches rows by code; the UUID can freely differ per environment. Do **not** hard-code UUIDs in downstream services.
+
+=== FormSchemaRepository
+
+Two queries, both active-only:
+
+[source,java]
+----
+public interface FormSchemaRepository extends JpaRepository<FormSchema, UUID> {
+
+    @Query("from FormSchema where code = :code")                  // <1>
+    Optional<FormSchema> findActiveByCode(@Param("code") String code);
+
+    @Query("from FormSchema where active = true")
+    List<FormSchema> findAllActive();
+}
+----
+<1> The method name says "Active" but the JPQL doesn't filter `active = true` — a **bug-prone gap** at the time of writing. If you need strict active-only lookup, either patch the query or filter in the service. In practice, admin UIs soft-delete and then recreate; the inconsistency rarely surfaces.
+
+The rest of the JPA boilerplate (`save`, `findAll`, `findById`, paging) comes free from `JpaRepository<FormSchema, UUID>`.
+
+== FormSchemaService — The Public API
+
+Direct, minimal, read-only. Exactly two methods:
+
+[source,java]
+----
+@Service
+public class FormSchemaService {
+
+    @Autowired
+    private FormSchemaRepository repository;
+
+    public Optional<FormSchema> getActiveByCode(String code) {
+        return repository.findActiveByCode(code);
+    }
+
+    public List<FormSchema> getAllActive() {
+        return repository.findAllActive();
+    }
+}
+----
+
+**Canonical consumer pattern** — the Flowable action handler that attaches an underwriter warning with an associated schema:
+
+[source,java]
+----
+@Transactional(noRollbackFor = MisconfigurationException.class)
+public void saveWarning(UUID processInstanceId, String factCode,
+                        String decisionDepartmentCode, String schemaCode) {
+    ProcessExecution execution = processExecutionService.findByProcessInstanceId(processInstanceId);
+
+    DecisionDepartment department = decisionDepartmentService.getActiveByCode(decisionDepartmentCode)
+        .orElseThrow(() -> saveMisconfigurationException(execution,
+            "Decision making department %s is not found".formatted(decisionDepartmentCode)));
+
+    FormSchema form = StringUtils.hasLength(schemaCode)                         // <1>
+        ? formSchemaService.getActiveByCode(schemaCode)
+            .orElseThrow(() -> saveMisconfigurationException(execution,
+                "Custom schema %s is not found".formatted(schemaCode)))
+        : null;
+
+    FixedDecisionFact warning = FixedDecisionFact.warning(factCode, department, form);
+    execution.getExecutionResult().getFixedDecisionFacts().add(warning);
+}
+----
+<1> Optional — a warning may or may not carry a form. The null-safe path is the primary flow; callers tolerate "no form" and render a simple note instead.
+
+Three things this pattern always does:
+
+- **Lookup by code**, never by id
+- **Throw a `MisconfigurationException`** on missing schema — treats a dangling code as a config error, not a runtime error
+- **Pass the entity through**, never dereference `.getSchema()` in Java — the JSON blob is for the client
+
+== FormSchemaForm Edit Pipeline
+
+For the admin CRUD screen. The same three-field DTO, annotated for Bean Validation:
+
+[source,java]
+----
+public class FormSchemaForm {
+
+    @NotBlank private String code;
+    @NotBlank private String description;
+    @NotBlank private String schema;
+    /* getters / setters */
+}
+----
+
+=== FormSchemaFormMapper
+
+MapStruct-generated, extends the SDK's `EntityToFormMapper<E, F>` contract (see <<form-classes-setup-and-usage>>):
+
+[source,java]
+----
+@Mapper
+public interface FormSchemaFormMapper extends EntityToFormMapper<FormSchema, FormSchemaForm> {
+
+    @Override
+    void toEntity(FormSchemaForm form, @MappingTarget FormSchema entity) throws ValidationException;  // <1>
+
+    @Override
+    @InheritConfiguration
+    FormSchema createEntity(FormSchemaForm form) throws ValidationException;                          // <2>
+
+    @Override
+    FormSchemaForm toForm(FormSchema entity);
+}
+----
+<1> Update path — `@MappingTarget` preserves `id`, `active`, `version`, and anything else not in the form. Without it, an edit would silently insert a new row (because `code` is `updatable=false`, that insert would then fail on `UK_form_schema_code` — a noisy failure that at least surfaces the bug).
+<2> Create path — `@InheritConfiguration` reuses `toEntity`'s field mapping. Since all three form fields have matching entity fields, the generated impl is trivial.
+
+=== Wiring Into the Admin UI
+
+There is **no `FormSchemaFormService`** in the SDK. Instead, the `CatalogController` in `pumpkin/web` handles the CRUD lifecycle directly via the mapper:
+
+[source,java]
+----
+@Controller
+@RequestMapping("form-schema")
+public class FormSchemaController extends CatalogController<FormSchema, FormSchemaForm> {
+
+    @Override
+    protected String getTableTemplate(Model model) { return "/form-schema/table"; }
+
+    @Override
+    protected String getFieldsTemplate(FormSchema entity, Model model) { return "/form-schema/fields"; }
+
+    @Override
+    protected void validateConstraint(String constraint, Binding binding) {                  // <1>
+        if (FormSchema.CODE_UNIQUE_CONSTRAINT.equalsIgnoreCase(constraint)) {
+            binding.rejectValue("code", "error.form.schema.code.duplicate",
+                "Form schema with this code already exists");
+        }
+    }
+
+    @Override
+    protected boolean isOwnPage() { return true; }
+}
+----
+<1> The constraint-to-field mapping — `UK_form_schema_code` becomes a field-level validation error on the `code` input. Pattern matches `EntityFormService.validateConstraint` (see <<form-classes-setup-and-usage>>).
+
+If your project needs custom edit logic (enriching the model, server-side schema linting, publisher side-effects), subclass `EntityFormService<FormSchema, FormSchemaForm, UUID>` in your app module and route the controller through it instead of using `CatalogController` directly.
+
+== FormSchemaExport Pipeline
+
+Environment-to-environment migration. Separate DTO, separate MapStruct mapper, separate exporter bean.
+
+=== FormSchemaExportData
+
+Plain POJO with the same three business fields — **no `active` flag** (export is always active-state) and **no `id`** (id is re-keyed on import):
+
+[source,java]
+----
+public class FormSchemaExportData {
+    private String code;
+    private String description;
+    private String schema;
+    /* getters / setters */
+}
+----
+
+=== FormSchemaToDtoMapper
+
+[source,java]
+----
+@Mapper
+public interface FormSchemaToDtoMapper extends CatalogEntityToDtoMapper<FormSchema, FormSchemaExportData> {
+
+    @Override
+    FormSchema toEntity(FormSchemaExportData form);
+
+    @Override
+    @InheritInverseConfiguration
+    FormSchemaExportData toForm(FormSchema entity);
+}
+----
+
+The parent `CatalogEntityToDtoMapper` hard-codes `@Mapping(target = "active", ignore = true)` on `toEntity` — imported schemas come in as **inactive by default**. The importing admin then activates them deliberately, preventing half-imported test schemas from leaking into production flows.
+
+=== FormSchemaExporter
+
+[source,java]
+----
+@Service
+@Order(3000)                                                      // <1>
+public class FormSchemaExporter extends CatalogEntityExporter<FormSchema, FormSchemaExportData> {
+
+    @Override
+    public String getVersion() { return "2"; }                    // <2>
+}
+----
+<1> `@Order(3000)` — export/import order across all `CatalogEntityExporter` beans. Schemas import *after* reference data they might hypothetically reference (departments, products) but before anything that might reference *them* (decision configurations).
+<2> Version `"2"` — the current export format. Older exports (version `1`) used a different column layout (`export_id` column, no UUID `id`); the V250826 migration is the schema upgrade that moved to v2.
+
+The base `CatalogEntityExporter` handles `loadKeys` (active UUIDs), `load` (one entity → DTO), and `save` (idempotent insert — existing `id` is a no-op, preserving multi-run imports).
+
+[[form-schema-admin-controller]]
+== FormSchemaController — Admin Web Controller
+
+The catalog UI at `/form-schema` is a thin `CatalogController` subclass — seven endpoints (list, row, toggle enable, save-new, save-edit, delete, fields-fragment) come free from the base class (<<web-infrastructure-catalog-admin-pattern-common-catalog>>). The subclass wires templates, validates constraints, and opts out of the shared catalog page:
+
+[source,java]
+----
+@Controller
+@RequestMapping("form-schema")
+public class FormSchemaController extends CatalogController<FormSchema, FormSchemaForm> {
+
+    @Override
+    protected String getTableTemplate(Model model) { return "/form-schema/table"; }
+
+    @Override
+    protected String getFieldsTemplate(FormSchema entity, Model model) { return "/form-schema/fields"; }
+
+    @Override
+    protected void validateConstraint(String constraint, Binding binding) {
+        if (FormSchema.CODE_UNIQUE_CONSTRAINT.equalsIgnoreCase(constraint)) {
+            binding.rejectValue("code", "error.form.schema.code.duplicate",
+                "Form schema with this code already exists");
+        }
+    }
+
+    @Override
+    protected boolean isOwnPage() { return true; }                 // <1>
+}
+----
+<1> `isOwnPage() == true` means form schemas get their own top-level page with a dedicated route, rather than showing up as one tab among many on the combined `/catalog` multi-tab page. This is typical for catalogs with non-trivial editors — the schema JSON field needs a large editor pane that doesn't compress well into a tab layout. Most plain-reference catalogs (`Country`, `Currency`, etc.) leave this at the default `false`.
+
+Key points:
+
+* **No `@MenuItem`** here — an "Own page" catalog still renders into the Settings menu, but registration flows through `AllCatalogController` rather than `@MenuItem` discovery. Menu labels come from `messages.properties` via the catalog metadata.
+* **No `@PreAuthorize`** — the parent `CatalogController` derives `CATALOG_FORM_SCHEMA_VIEW` / `CATALOG_FORM_SCHEMA_EDIT` from the `@RequestMapping("form-schema")` path and applies them to the inherited endpoints. Rename the path → role names follow automatically. See <<user-roles>>.
+* **`validateConstraint` is the only custom logic**: when `FormSchemaFormService.save()` hits `CODE_UNIQUE_CONSTRAINT` it throws `ConstraintViolationException`, which the catalog's save wrapper passes to this hook as a string. The hook converts the DB-layer violation into a field-level error on `code` — the admin sees the error under the input, not a 500 page. Same contract used by every `CatalogController` in the app.
+* **No custom endpoints beyond the base.** The JSON schema preview/validation flows that you might expect to live here are instead handled inside the edit form's Thymeleaf fragment (`/form-schema/fields`) which hosts the embedded editor and calls `FormSchemaService` directly for preview rendering.
+
+== Advanced Patterns
+
+=== Resolving a Schema With a Default Fallback
+
+When a process step should work even if the admin hasn't defined the schema yet:
+
+[source,java]
+----
+FormSchema schema = formSchemaService.getActiveByCode(configuredCode)
+    .or(() -> formSchemaService.getActiveByCode("default-underwriter-form"))
+    .orElseThrow(() -> new MisconfigurationException(
+        "Neither '" + configuredCode + "' nor 'default-underwriter-form' schemas are configured"));
+----
+
+The SDK itself does **not** ship a default schema; wire one into your Flyway seed script if you want the fallback path to work on a fresh DB.
+
+=== Caching Lookup Results
+
+`FormSchemaService.getActiveByCode` hits the DB on every call. For a hot path (every request that renders a decision panel), wrap a cache in the application layer:
+
+[source,java]
+----
+@Service
+public class CachedFormSchemaLookup {
+
+    @Autowired private FormSchemaService formSchemaService;
+
+    @Cacheable(value = "form-schema", key = "#code", unless = "#result == null")
+    public FormSchema getByCode(String code) {
+        return formSchemaService.getActiveByCode(code).orElse(null);
+    }
+
+    @CacheEvict(value = "form-schema", allEntries = true)
+    public void invalidate() {}                               // <1>
+}
+----
+<1> Wire `invalidate()` to fire on `FormSchemaFormMapper`-driven save and on the `@Undeletable` toggle. Envers doesn't give you a bean-level save callback — either subclass the `CatalogController` and invalidate from there, or attach a JPA lifecycle listener on `FormSchema`.
+
+Schemas change rarely (days/weeks between edits); caching is a clean win when the form-render path is latency-sensitive.
+
+=== Exposing Schemas to a JavaScript Renderer
+
+Typical controller that feeds the schema to a client-side form lib (e.g., react-jsonschema-form, uniforms):
+
+[source,java]
+----
+@RestController
+@RequestMapping("/api/form-schema")
+public class FormSchemaApiController {
+
+    @Autowired private FormSchemaService formSchemaService;
+
+    @GetMapping("/{code}")
+    public String get(@PathVariable String code) {
+        return formSchemaService.getActiveByCode(code)
+            .map(FormSchema::getSchema)                       // <1>
+            .orElseThrow(() -> new ResponseStatusException(NOT_FOUND, "Unknown schema: " + code));
+    }
+}
+----
+<1> Return the raw JSON string — let Spring's `StringHttpMessageConverter` serve it with `Content-Type: application/json`. Do **not** `@ResponseBody` a parsed `Map<String, Object>` — every round-trip through Jackson reorders keys, breaking clients that rely on declaration order for field ordering.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Reference schemas by `code`, not `id`** — `code` is stable across environments; UUID `id` differs per DB. All SDK consumers (`FixedDecisionFact`, `PendingDecision`, `ProcessActionServiceProvider`) follow this rule.
+* {ok} **Treat `schema` as an opaque JSON string** in Java — let the client-side renderer parse it. Parsing in Java locks in a schema flavor (JSON Schema vs. custom DSL) the SDK deliberately avoids.
+* {ok} **Throw a `MisconfigurationException` (or equivalent) on missing codes** — a dangling schema reference is a config bug, not a user error; surface it loudly during runtime.
+* {ok} **Imported schemas stay `active=false` until reviewed** — the `CatalogEntityToDtoMapper` ignores `active` on import by design. Keep it that way.
+* {ok} **Use `formSchemaService.getAllActive()` for dropdowns** in admin UIs referencing a schema — respects the active flag, single source of truth.
+* {ok} **Copy `@UniqueConstraint(name = ...)` into `validateConstraint`** — the `FormSchemaController` example translates `UK_form_schema_code` into a localized field error; follow the same pattern in custom controllers.
+* {ok} **Wrap the hot lookup path in a Spring cache** if you resolve the same code on every request — schemas mutate on the order of hours, reads on the order of milliseconds.
+* {ok} **Keep code names hyphen-lowercase and descriptive** — `underwriter-review`, `aml-escalation`. They surface in audit logs, error messages, and Flowable BPMN attributes; readability compounds.
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Hard-coding a schema UUID anywhere** — UUIDs differ across environments; the reference will mysteriously return `null` after DB restore or fresh deploy. Always go through `getActiveByCode`.
+* {bad} **Parsing `schema` in Java** (`objectMapper.readValue(formSchema.getSchema(), Map.class)`) — couples Java code to a specific JSON structure the SDK doesn't police. One schema change breaks Java code; keep the Java layer a pass-through.
+* {bad} **Mutating `code` post-insert via `EntityManager.merge`** — the `@Column(updatable = false)` silently drops the change. A commit succeeds, the DB still has the old code, downstream lookups keep working against the wrong record. Create a new schema and delete the old one instead.
+* {bad} **Using `FormSchemaRepository` directly in application code** — `FormSchemaService` is the contract; the repository name and queries are SDK internals. Direct-repository calls skip any future caching/validation the service layer adds.
+* {bad} **Seeding schemas via `application.properties` or Spring beans** — the module is built for DB-backed runtime editing. Seeding them as static beans defeats Envers history, the export pipeline, and admin edits. Use a Flyway migration that inserts rows instead.
+* {bad} **Implementing a custom `FormSchemaFormService` that bypasses `@MappingTarget`** — re-insert-on-edit hits `UK_form_schema_code` with the same code and fails noisily (at best) or replaces the audit trail (at worst). Keep the MapStruct contract intact.
+* {bad} **Assuming `findActiveByCode` filters on `active=true`** — it doesn't (see the note in `FormSchemaRepository` section). If you depend on strictly-active results, filter in the service layer or patch the query.
+* {bad} **Storing per-user form state in `FormSchema.schema`** — the entity is a **schema catalog**, not a submission store. Submitted form data belongs on a different entity (typically `DecisionFact` or a domain-specific submission table).
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every downstream reference to a schema uses `FormSchemaService.getActiveByCode(code)`, never a hard-coded UUID
+* {todo} Missing schemas throw a typed exception (`MisconfigurationException` or project equivalent) with the requested code in the message
+* {todo} Admin UI for `form-schema` is wired and permissioned — at minimum, `/form-schema/*` routes (from the SDK's `FormSchemaController`) require the catalog-admin role
+* {todo} `UK_form_schema_code` constraint violation translates to a field-level error via `validateConstraint` in the custom controller (if any)
+* {todo} JSON schemas validated at the client — the SDK doesn't lint `schema`; a bad JSON string saves silently and fails only at render time
+* {todo} `FormSchemaExporter` version (`"2"`) matches the current DB schema — run Flyway migrations before importing older exports
+* {todo} Envers `aud_form_schema` table present and indexed on `(rev, id)` — full history is the audit source of truth
+* {todo} Cache layer in place if the lookup path is on the per-request critical path
+* {todo} Flyway seed migration creates baseline schemas per environment (dev/stage/prod differ; seed per-env appropriately)
+* {todo} Monitoring alerts on `MisconfigurationException` with "schema X not found" — signals that a Flowable BPMN or decision configuration references a schema that was deleted
+* {todo} Export→import round-trip tested across environments — imported rows land as `active=false`; the reviewer activates them deliberately
+* {todo} Audit history tab wired on the `form-schema` detail page — tracks who edited which schema and when (see <<entity-module-sdk-reference-hierarchy>> for history tab wiring)
+* {todo} Filters on the `form-schema` list page use `@ListFilter` annotations where applicable — code/description free-text, active boolean (see <<list-filters-annotation-driven-jpa-query-dsl>>)
+* {todo} Documentation of in-use schema codes — a README or confluence page listing each `code` and its consumer (which BPMN task or Java caller); otherwise a deleted schema surfaces only at runtime
+
+---
+
+**Related:** <<form-classes-setup-and-usage>>, <<entity-module-sdk-reference-hierarchy>>, <<list-filters-annotation-driven-jpa-query-dsl>>
+
+**Next:** <<form-classes-setup-and-usage>>

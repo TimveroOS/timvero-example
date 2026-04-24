@@ -1,0 +1,537 @@
+[[user-roles]]
+= User Roles — role-based access, permissions & dashboards
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The user-roles module (`com.timvero.structure.role`) is the SDK layer that models a single back-office role: its permission set, counter visibility, landing page, and assigned BI dashboard. Roles are persisted `UserRole` entities — not hard-coded enums — so administrators edit them live. This guide covers the entity, its edit/list/export pipelines, and the three-source permission model that drives authorization checks everywhere else in the platform. For user accounts and auditor events, see <<user-management>>.
+
+== What You Need to Know
+
+The module packages **four cooperating pieces**, each in its own subpackage. Skip past a piece only after you understand how it feeds the next:
+
+[cols="1,3,3", options="header"]
+|===
+|Piece |Purpose |Key types
+
+|**Entity** (`entity/`)
+|Persistent role definition — name, description, god flag, landing page, `BiDashboard` assignment, plus two `@ElementCollection<String>` sets: `permissions` and `counters`. Both collections are EAGER-fetched because every authorization check dereferences them.
+|`UserRole`, `UserRoleRepository`
+
+|**Form pipeline** (`from/`)
+|Edit-form DTO, MapStruct mapper, and `EntityFormService` that assembles dropdown sources (start pages, BI dashboards, counter names, role configurations, role details) and groups active permissions by their defining `UserRoleConfiguration` for the detail view.
+|`UserRoleForm`, `UserRoleFormMapper`, `UserRoleFormService`
+
+|**Filter pipeline** (`filter/`)
+|`ListFilter` subclass with `LIKE` on name + `IN` on permissions, plus a `FilterListService` that builds the permission dropdown from **three sources**: `EntityRoleDetails` (per-entity actions/tabs), `UserRoleConfiguration` (free-form permission containers), and registered `EntityCounter` names.
+|`UserRoleFilter`, `UserRoleFilterService`
+
+|**Export pipeline** (`export/`)
+|`EntityExporter` implementation for roles — used by the environment-transfer machinery to ship role definitions between dev, staging, and production. Skips the default role (the bootstrap-created one with `createdBy == null`).
+|`UserRoleExportData`, `UserRoleExporter`, `UserRoleToDtoMapper`
+|===
+
+Key characteristics:
+
+- **Permissions are plain `String` codes** — stored in `user_role_permission` join table. No enum constraint at the DB level; the authoritative list is built at runtime from the `UserRoleConfiguration` and `EntityRoleDetails` beans discovered by Spring.
+- **Counters are plain `String` names** — stored in `user_role_counter`. Presence of a counter name in the set grants the role visibility of that counter on the launchpad (see <<counters>>).
+- **God-mode escape hatch** — `UserRole.god == true` flags a super-admin role that bypasses permission checks in the security filter. Typically one `SYSTEM` role seeded by bootstrap migrations.
+- **Second-level cached** — `@Cache(usage = READ_WRITE)` on the entity; role definitions change rarely but are read on every request.
+- **Unique role name** — enforced by DB constraint `uk_lnth8w122wgy7grrjlu8hjmuu`; `UserRoleFormService.validateConstraint` translates the violation into a field-level validation error.
+
+== Architecture Overview
+
+[source]
+----
+  Application code             SDK registration                     UserRole entity
+  ─────────────────            ───────────────────                   ───────────────
+
+  @Bean UserRoleConfiguration           ┐
+  setPermissionContainers(              │  Discovered at startup
+     CustomPermission.class) ───────────┤  by UserRoleRegister          ┌────────────┐
+                                        │                               │  UserRole  │
+  EntityRoleDetails registered          ├─► UserRoleRegister.           │            │
+  by @EnableAction /                    │   getAllPermissions() ───────►│permissions │
+  @EnableHistoryTab etc.   ─────────────┤                               │  [strings] │
+                                        │                               │            │
+  EntityCounterService                  │                               │  counters  │
+  .getCounterNames() ───────────────────┘                               │  [strings] │
+                                                                        │            │
+                           ─── authorization time ───                   │  god       │
+                                                                        │  startPage │
+  HTTP request                                                          │  biDash… ──┼──► BiDashboard
+     │                                                                  └─────┬──────┘
+     ▼                                                                        │
+  Spring Security filter ──► BackOfficeUser.getAuthorities() ◄─────────────── (EAGER)
+     │                               │
+     │                               │  GrantedAuthority per permission
+     ▼                               │  + "ROLE_<role.name>"
+  @PreAuthorize / menu/link renderer ┘
+
+                           ─── list panel ───
+
+  GET /users/roles?name=...&permissions=...
+     │
+     ▼
+  UserRoleFilterService.doFilter()
+     │
+     ├─► getFilterValues(): merge permissions from
+     │     • EntityRoleDetails (menu/action/tab per entity)
+     │     • UserRoleConfiguration (custom permission containers)
+     │     • EntityCounterService (per-counter visibility)
+     │
+     ▼
+  FilterPage<UserRole>
+----
+
+The **left column** (application code) contributes permission vocabulary; the **middle column** (SDK) aggregates it; the **right column** (entity) stores a role's concrete subset. The filter panel and edit form both re-derive the full vocabulary from the middle column every render, so adding a new permission container only requires a Spring bean — no migration, no UI change.
+
+== Entity — UserRole
+
+The entity is deliberately flat — six scalar fields plus two `@ElementCollection<String>` sets:
+
+[source,java]
+----
+@Entity
+@Table(name = "user_role")
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+public class UserRole extends AbstractAuditable implements NamedEntity {
+
+    public static final String NAME_UNIQUE_CONSTRAINT = "uk_lnth8w122wgy7grrjlu8hjmuu";
+
+    @Column(name = "name", unique = true, nullable = false)
+    private String name;
+
+    @Column(name = "description", length = Length.LONG)
+    private String description;
+
+    @Column(name = "god", nullable = false)
+    private boolean god = false;                                       // <1>
+
+    @Column(name = "start_page")
+    private String startPage;                                          // <2>
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "bi_dashboard_id")
+    private BiDashboard biDashboard;                                   // <3>
+
+    @ElementCollection(fetch = FetchType.EAGER)
+    @CollectionTable(name = "user_role_permission",
+        joinColumns = @JoinColumn(name = "user_role"))
+    @Column(name = "permission")
+    @Fetch(FetchMode.SELECT)
+    private List<String> permissions;                                  // <4>
+
+    @ElementCollection(fetch = FetchType.EAGER)
+    @CollectionTable(name = "user_role_counter",
+        joinColumns = @JoinColumn(name = "user_role"))
+    @Column(name = "counter")
+    @Fetch(FetchMode.SELECT)
+    private List<String> counters;                                     // <5>
+}
+----
+<1> Super-admin flag. The security layer checks `god` **before** the permission list — god roles see everything regardless of `permissions` content. Keep the count of god roles near one (commonly `SYSTEM`).
+<2> URL fragment the user lands on after login — e.g., `/credit`, `/participant`. `UserRoleFormService` exposes the list via the `startPages` config property (default `{'/user':'menu.user'}`). Override in `application.properties`:
++
+[source,properties]
+----
+startPages={'/user':'menu.user', '/credit':'menu.credit', '/participant':'menu.participant'}
+----
+<3> Optional. When set, the role's landing dashboard is this `BiDashboard`. See <<bi-dashboard-embedding>> for how the embedded Superset iframe picks this up.
+<4> The permission set. Strings — **not enum references** — because the vocabulary is assembled from multiple sources at startup. Compared by equality against authorization checks elsewhere.
+<5> The counter-visibility set. Per-counter string names; presence = launchpad tile is visible.
+
+`AbstractAuditable` supplies `id`, `createdAt`, `createdBy`, `updatedAt`, `updatedBy`. `NamedEntity.getDisplayedName()` returns `name` — used by filter dropdowns and UI links.
+
+[WARNING]
+====
+`@ElementCollection(fetch = EAGER)` on **both** collections means every `findById` issues three selects (main row + permissions + counters) via `FetchMode.SELECT`. Acceptable because the row count is small (dozens) and the second-level cache absorbs repeat reads. Do **not** switch to `FetchMode.JOIN` — it would duplicate the main row across the Cartesian product of the two collections.
+====
+
+=== UserRoleRepository
+
+A single custom finder plus Spring Data's usual methods:
+
+[source,java]
+----
+public interface UserRoleRepository extends JpaRepository<UserRole, UUID>,
+                                             JpaSpecificationExecutor<UserRole> {
+    UserRole findByName(String name);
+}
+----
+
+`findByName` is used by user-account seeding code and tests (`findByName("SYSTEM")`) — the uniqueness constraint guarantees at most one match.
+
+== The Permission Model — three sources, one flat set
+
+`UserRoleRegister` is the single @Service that aggregates the platform's permission vocabulary. At startup it collects:
+
+[cols="1,3,3", options="header"]
+|===
+|Source |What it contributes |How it's registered
+
+|`UserRoleConfiguration` beans
+|A named group of permission **strings** — each string matches the name of a `public static final String` field in one of the container classes (the constant's value must equal its field name; `setPermissionContainers` asserts this at startup)
+|Application defines an `@Bean UserRoleConfiguration`, calls `setPermissionContainers(CustomPermission.class, ...)`. Spring injects every such bean as a `List<UserRoleConfiguration>`.
+
+|`EntityRoleDetails` instances
+|Per-entity permission strings grouped into three buckets: **main** (list-page access), **actions** (buttons), **tabs** (detail-page tabs). Each bucket entry is an `EntityRoleDescription(elementName, role)` — the element name is an i18n key, the role is the raw permission string.
+|Registered imperatively via `userRoleRegister.registerRoleDetails(details)` — typically inside controller/feature auto-configuration. The SDK's entity-module tooling does this automatically for `@EnableAction`, `@EnableHistoryTab`, etc.
+
+|Registered counter names
+|One string per `EntityCounter` bean in the application. Having the name in the role's `counters` collection grants the launchpad tile.
+|`EntityCounterService.getCounterNames()` — enumerates `@Component`-registered counters.
+|===
+
+All three streams are flattened into `UserRoleRegister.getAllPermissions()` — a single `List<String>` cached after first access. The filter panel, the edit form's "assign permissions" checklist, and the detail view all iterate this list.
+
+=== Application Wiring Example
+
+From the example project — a single bean registers the application's custom permission constants:
+
+[source,java]
+----
+include::{sourcedir}/CustomConfiguration.java[lines=24..29]
+----
+
+And the container itself — a marker interface that extends SDK `Permission`:
+
+[source,java]
+----
+include::{sourcedir}/CustomPermission.java[]
+----
+
+To add your own application-wide permissions, extend `CustomPermission` with `public static final String` fields (value equal to field name):
+
+[source,java]
+----
+public interface CustomPermission extends Permission {
+    String CUSTOM_APPROVE_LOAN = "CUSTOM_APPROVE_LOAN";
+    String CUSTOM_VIEW_REPORTS = "CUSTOM_VIEW_REPORTS";
+}
+----
+
+The `UserRoleConfiguration` will pick them up reflectively at startup. **Value-must-equal-name** is enforced in `UserRoleConfiguration.setPermissionContainers`:
+
+[source,java]
+----
+if (!field.getName().equals(field.get(pc))) {
+    throw new RuntimeException("Value of field '" + field.getName()
+        + "' not equals '" + field.get(pc) + "'");
+}
+----
+
+Catches copy-paste typos at boot rather than silently producing a permission that can never be granted.
+
+== UserRoleFormService — the edit pipeline
+
+`UserRoleFormService extends EntityFormService<UserRole, UserRoleForm, UUID>` — the SDK form-service base (see <<form-classes-setup-and-usage>>). It owns two responsibilities beyond the generic CRUD:
+
+=== assembleEditModel — Populate Dropdown Sources
+
+Called when the edit page opens; fills the model with every dropdown the form template needs:
+
+[source,java]
+----
+@Override
+protected void assembleEditModel(UserRole role, UserRoleForm form,
+                                  Map<String, Object> model) {
+    model.put("userRoleForm", form);
+    model.put("permissions", roleContainer.getAllPermissions());
+    model.put("roleConfigurations", roleContainer.getRoleConfigurations());
+    model.put("roleDetails", roleContainer.getRoleDetails());
+    model.put("counters", counterService.getCounterNames());
+    model.put("startPages", startPages);
+    if (biService != null) {
+        Map<UUID, String> biDashboards = biService.findActive().stream()
+            .collect(Collectors.toMap(BiDashboard::getId, BiDashboard::getName));
+        model.put("biDashboards", biDashboards);
+    }
+}
+----
+
+Notes:
+
+- `biService` is `@Autowired(required = false)` — the BI module is optional; when absent the dashboard dropdown is simply omitted from the form.
+- `startPages` is loaded from application config with a safe default: `@Value("#{${startPages:{'/user':'menu.user'}}}")`. SpEL syntax — the `${...}` is a property placeholder, the outer `#{...}` evaluates the resulting string as a map literal.
+
+=== getDetailsModel — Permission Grouping for Read-Only View
+
+The detail page shows "what this role can do" organized by source — not the raw permission strings. `getDetailsModel` walks the full configuration list and filters each to only the permissions this role actually holds:
+
+[source,java]
+----
+for (UserRoleConfiguration configuration : roleContainer.getRoleConfigurations()) {
+    for (String permission : configuration.getAllPermissions()) {
+        if (entity.getPermissions().contains(permission)) {
+            roleConfigurations.computeIfAbsent(configuration.getName(),
+                n -> new ArrayList<>()).add(permission);
+        }
+    }
+}
+----
+
+Same shape for `EntityRoleDetails` — iterates `main` / `actions` / `tabs`, keeps only matching entries, skips entity blocks that end up empty. The result is a display model grouped by configuration name and by entity, rather than the flat permission list stored on the entity.
+
+=== Unique-Constraint Translation
+
+The DB name uniqueness constraint gets translated into a field-level error:
+
+[source,java]
+----
+@Override
+protected void validateConstraint(String constraint, Binding binding) {
+    if (UserRole.NAME_UNIQUE_CONSTRAINT.equals(constraint)) {
+        binding.rejectValue("name", "error.userRole.name.exists",
+            "Role with this name exists");
+    }
+}
+----
+
+Without this override, a duplicate name would bubble up as a generic `DataIntegrityViolationException`. See <<form-classes-setup-and-usage>> for how `EntityFormService` routes constraint violations.
+
+== UserRoleForm + UserRoleFormMapper
+
+`UserRoleForm` mirrors the entity but replaces `BiDashboard biDashboard` with `UUID biDashboard` (the FK value), and defensively null-initializes the list fields:
+
+[source,java]
+----
+public List<String> getPermissions() {
+    return permissions != null ? permissions : (permissions = new ArrayList<>());
+}
+----
+
+This avoids `NullPointerException` when a template reads the list via `#field.permissions.contains(...)` for an unsaved role.
+
+The mapper uses `ReferenceMapper` to resolve the dashboard UUID → `BiDashboard` proxy:
+
+[source,java]
+----
+@Mapper(uses = ReferenceMapper.class)
+public interface UserRoleFormMapper extends EntityToFormMapper<UserRole, UserRoleForm> {
+    @Override void toEntity(UserRoleForm form, @MappingTarget UserRole entity);
+    @Override @InheritConfiguration UserRole createEntity(UserRoleForm form);
+    @Override UserRoleForm toForm(UserRole entity);
+}
+----
+
+`@InheritConfiguration` on `createEntity` reuses the mapping rules from `toEntity` — a single declaration covers both create and edit paths.
+
+== UserRoleFilter + UserRoleFilterService
+
+=== UserRoleFilter
+
+Two fields — name search and permission intersection:
+
+[source,java]
+----
+public class UserRoleFilter extends ListFilter {
+
+    @Field(restriction = Restriction.LIKE)
+    private String name;
+
+    @Field(restriction = Restriction.IN, value = "permissions")
+    private List<String> permissions;
+    /* getters/setters */
+}
+----
+
+See <<list-filters-annotation-driven-jpa-query-dsl>> for the annotation semantics. The `IN` restriction matches roles whose `permissions` `@ElementCollection` contains **any** of the selected strings — useful for "find roles that can approve loans" queries.
+
+=== UserRoleFilterService — the Three-Source Permission Picker
+
+The overridden `getFilterValues` populates the permissions dropdown from the **same three sources** as `UserRoleRegister`, but with localized labels prefixed by the source's display name:
+
+[source,java]
+----
+@Override
+protected FilterValues getFilterValues(Locale locale) {
+    return super.getFilterValues(locale).add("permissions", getPermissions(locale));
+}
+
+public Map<String, String> getPermissions(Locale locale) {
+    Map<String, String> permissions = new LinkedHashMap<>();
+    permissions.putAll(getRoleDetailsPermissions(locale));          // <1>
+    permissions.putAll(getRoleConfigurationsPermissions(locale));   // <2>
+    permissions.putAll(getCountersPermissions(locale));             // <3>
+    return permissions;
+}
+----
+<1> `"<EntityName>: <ElementName>"` — e.g., `"Credit: Approve"`. Covers all three `EntityRoleDetails` buckets (main, actions, tabs) in a flat list.
+<2> `"<ConfigurationName>: <PermissionName>"` — e.g., `"Custom: VIEW_REPORTS"`. Iterates every configuration bean.
+<3> `"Counters: <CounterName>"` — e.g., `"Counters: Pending applications"`. One entry per registered counter.
+
+The three prefix styles let users scan a long dropdown and find the right permission by category. Localization uses `EnumUtils.getLocalizedValue` with message-key prefixes `menu.`, `permission.`, `counter.`, `role.permissions.counters`.
+
+== UserRoleExporter — environment transfer
+
+The export pipeline ships role definitions as JSON snapshots between environments. `UserRoleExportData` is a flat DTO shape (no relations):
+
+[source,java]
+----
+public class UserRoleExportData {
+    private String name;
+    private String description;
+    private String startPage;
+    private boolean god = false;
+    private List<String> permissions;
+    private List<String> counters;
+    /* getters/setters */
+}
+----
+
+Notably, `biDashboard` is **absent** — BI dashboard assignment is environment-specific (dashboard IDs differ between staging and prod) and must be reassigned manually after import.
+
+`UserRoleExporter` registers with `@Order(1100)` (roles export after reference data, before user accounts):
+
+[source,java]
+----
+@Service @Order(1100)
+public class UserRoleExporter implements EntityExporter<UserRoleExportData> {
+
+    @Override
+    public Iterable<UUID> loadKeys() {
+        return repository.findAll().stream()
+            // exclude default role, which is created
+            // when the system starts for the first time
+            .filter((role) -> !Objects.equals(role.getCreatedBy(), null))
+            .map(UserRole::getId)
+            .toList();
+    }
+
+    @Override @Transactional
+    public void save(UUID key, UserRoleExportData dto) {
+        UserRole role = repository.findById(key).orElseGet(() -> new UserRole(key));
+        mapper.toEntity(dto, role);
+        repository.save(role);
+    }
+}
+----
+
+Two subtle details:
+
+- **Bootstrap-role filter** — the SQL-seeded `SYSTEM` role has `createdBy == null` (no user existed when the row was inserted). Excluding it prevents clobbering the target env's bootstrap row with an imported copy.
+- **ID-preserving upsert** — `findById(key).orElseGet(() -> new UserRole(key))` keeps the UUID stable across environments. This matters because `UserAccount.roleId` references a UUID; changing role IDs on import would break account assignments.
+
+The `UserRoleToDtoMapper` uses `@InheritInverseConfiguration` for round-trip symmetry between `toEntity` and `toForm`.
+
+== Advanced Patterns
+
+=== Bootstrapping a God Role at Startup
+
+Seed the `SYSTEM` role via Flyway or a `CommandLineRunner`. Example `CommandLineRunner` that runs once:
+
+[source,java]
+----
+@Component
+public class SystemRoleInitializer implements CommandLineRunner {
+
+    @Autowired private UserRoleRepository repository;
+
+    @Override @Transactional
+    public void run(String... args) {
+        if (repository.findByName("SYSTEM") != null) return;
+        UserRole system = new UserRole();
+        system.setName("SYSTEM");
+        system.setDescription("Super-admin, bypasses permission checks");
+        system.setGod(true);
+        system.setStartPage("/user");
+        system.setPermissions(List.of());
+        system.setCounters(List.of());
+        repository.save(system);
+    }
+}
+----
+
+Because the role's `createdBy` is `null` (no authenticated user on bootstrap), `UserRoleExporter` will correctly skip it on environment transfer.
+
+=== Computing Effective Permissions for a User
+
+A user's effective set is just their role's `permissions` collection — no role inheritance, no deny rules:
+
+[source,java]
+----
+public Set<String> effectivePermissions(UUID userId) {
+    UserAccount user = userRepo.getReferenceById(userId);
+    UserRole role = user.getRole();
+    if (role.isGod()) return Set.copyOf(roleContainer.getAllPermissions());
+    return Set.copyOf(role.getPermissions());
+}
+----
+
+God roles are expanded to the full vocabulary only for display purposes — authorization checks short-circuit on `role.isGod()` before inspecting the set.
+
+=== Testing Permission Coverage
+
+Assert that every UI action has at least one non-god role that holds its permission — catches newly-added permissions that nobody can actually use:
+
+[source,java]
+----
+@Test
+void everyActionPermissionIsAssignedToAtLeastOneRole() {
+    Set<String> allActionRoles = roleContainer.getRoleDetails().stream()
+        .flatMap(rd -> rd.getAllRoles().stream())
+        .collect(Collectors.toSet());
+
+    Set<String> assignedAnywhere = roleRepository.findAll().stream()
+        .filter(r -> !r.isGod())
+        .flatMap(r -> r.getPermissions().stream())
+        .collect(Collectors.toSet());
+
+    assertThat(allActionRoles).allMatch(assignedAnywhere::contains);
+}
+----
+
+Run in CI — a forgotten role assignment is usually silent until a user complains they can't see a button.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Keep permission container constants self-valued** — `public static final String FOO = "FOO"` — `UserRoleConfiguration.setPermissionContainers` asserts this at startup so typos fail fast
+* {ok} **Group related permissions into one `Permission` interface** — e.g., `CreditPermission`, `ParticipantPermission` — then register each via its own `UserRoleConfiguration` bean; the filter panel labels them by configuration name
+* {ok} **Reserve `god = true` for a single bootstrap role** — usually `SYSTEM`, seeded via `CommandLineRunner` or Flyway with `createdBy = null` so `UserRoleExporter` skips it
+* {ok} **Use `UserRole.isGod()` to short-circuit authorization checks** — cheaper than expanding the permission set and semantically clearer
+* {ok} **Let `UserRoleExporter` ship roles between environments** — the `createdBy == null` filter keeps bootstrap rows immune to overwrite
+* {ok} **Reassign `biDashboard` after environment imports** — dashboard UUIDs differ; the DTO excludes the field by design
+* {ok} **Reference roles by UUID in `UserAccount.roleId`** — the exporter preserves UUIDs, so account-to-role links survive imports
+* {ok} **Add `@Order` when layering multiple `UserRoleConfiguration` beans** — determines the order they appear in the edit form's grouped checklist
+* {ok} **Expose new permissions via a `UserRoleConfiguration` bean, not by editing the SDK** — the registration is purely additive; the SDK never needs to know application permissions
+* {ok} **Localize every permission and counter name** — `permission.<CODE>`, `counter.<NAME>`; `UserRoleFilterService` falls back to the raw code if the key is missing, which is ugly in production
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Hard-coding permission strings at call sites** — `@PreAuthorize("hasAuthority('APPROVE_LOAN')")` works, but a rename in the `Permission` interface won't update the annotation; reference the constant instead
+* {bad} **Permission value differs from field name** — `setPermissionContainers` throws at boot; do not catch and ignore
+* {bad} **Multiple `god = true` roles** — defeats the permission model's audit value; every god user's actions are indistinguishable
+* {bad} **Exporting the default `SYSTEM` role** — the exporter already filters it; adding a manual override reintroduces the clobber risk
+* {bad} **Treating `permissions` as a `Set`** — it's a `List<String>` in JPA; rely on `.contains()` semantics but don't bank on uniqueness (duplicates won't error, they just waste rows)
+* {bad} **Changing a permission string after release** — every role row referencing the old string silently loses access; treat permission codes as an append-only log, deprecate rather than rename
+* {bad} **Using `FetchType.LAZY` on the `@ElementCollection`s** — every authorization check would trigger a new query outside the session; EAGER + second-level cache is correct here
+* {bad} **Storing counters as a separate entity relation** — the string-based `@ElementCollection` is intentional; counter names are runtime-assembled and don't have stable DB rows
+* {bad} **Filtering the list panel by `god`** — the filter doesn't expose the field; if you need to find god roles, query the repository directly
+* {bad} **Embedding BI-dashboard IDs in export snapshots** — the DTO deliberately omits `biDashboard`; reassign per environment
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every application `Permission` interface registered via a `UserRoleConfiguration` bean in the main config
+* {todo} All permission constants have `value == fieldName` (enforced at boot but verify in tests for shared modules)
+* {todo} `SYSTEM` (or equivalent) god role seeded with `createdBy = null` so the exporter skips it
+* {todo} Exactly one role has `god = true` in production
+* {todo} `application.properties` defines `startPages={...}` with every menu root users may land on
+* {todo} i18n keys exist: `permission.<CODE>` for every registered permission, `counter.<NAME>` for every counter, `menu.<EntityName>` for every `EntityRoleDetails` entry
+* {todo} `UserRoleExporter` registered at `@Order(1100)` (or earlier than `UserAccountExporter`, whatever value that uses)
+* {todo} CI test asserts every registered permission is assigned to at least one non-god role
+* {todo} CI test round-trips `UserRoleExportData` through `UserRoleToDtoMapper` and compares before/after
+* {todo} BI dashboards reassigned to all roles after any environment import (snapshot excludes the FK by design)
+* {todo} Unique constraint `uk_lnth8w122wgy7grrjlu8hjmuu` exists in the target schema (default Flyway migrations create it)
+* {todo} `user_role_permission` and `user_role_counter` join tables have indexes on `user_role` (FK column) for EAGER fetch performance
+* {todo} Second-level cache region for `UserRole` sized for the expected role count (typically < 100 entries)
+* {todo} Production monitoring captures roles with zero assigned permissions — usually a sign of a broken import or an abandoned placeholder
+* {todo} Password/session policy in place for god-role users (see <<password-management>>)
+
+---
+
+**Related:** <<user-management>>, <<entity-module-sdk-reference-hierarchy>>, <<list-filters-annotation-driven-jpa-query-dsl>>, <<form-classes-setup-and-usage>>, <<entity-counters-and-launchpad-integration>>, <<bi-dashboard-embedding>>, <<password-management>>
+
+**Next:** <<user-management>>, <<bi-dashboard-embedding>>

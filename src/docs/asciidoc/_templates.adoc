@@ -1,3 +1,6 @@
+[[html-template-integration]]
+[[form-templates-html-template-integration]]
+[[form-templates]]
 = HTML Template Integration
 
 :templatedir: ../../main/resources/templates

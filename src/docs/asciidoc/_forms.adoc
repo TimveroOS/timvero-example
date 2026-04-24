@@ -1,3 +1,6 @@
+[[forms]]
+[[form-classes]]
+[[form-classes-setup-and-usage]]
 = Form classes setup and usage
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -78,8 +81,113 @@ The form classes use standard Bean Validation (JSR-303) annotations:
 @Email            // Valid email format
 @PastOrPresent    // Date must be in the past or present
 @Valid            // Cascade validation to nested objects
-@Phone            // Custom phone validation (platform-specific)
+@Phone            // Custom phone validation (platform-specific) — see below
 ----
+
+=== @Phone — SDK-Provided Constraint
+
+The `@Phone` annotation (from `com.timvero.common.validation.annotation`) validates international phone numbers using Google's libphonenumber:
+
+[source,java]
+----
+@Phone(message = "Please provide a valid phone number")
+private String phone;
+----
+
+Behavior:
+
+- Accepts `null` (use `@NotBlank` / `@NotNull` separately to require a value)
+- Parses the value as an international number (with `+country-code`)
+- Validates both format AND that the number is assigned/reachable (libphonenumber's `isValidNumber`)
+- `mobileCheck` / `externalCheck` optional flags on the annotation enable stricter subtype checks
+
+**Automatic E.164 normalization via Jackson**: when the API module is active, any `@Phone`-annotated field on a request DTO is also normalized by `PhoneFieldDeserializer` — the incoming value `"+48 123 456 789"` is parsed and reformatted to `"+48123456789"` (E.164 format) before validation runs. See <<api-module>> for the setup (configured via `application.phone.region`).
+
+=== ValidationUtils — Shared Regex Constants
+
+`com.timvero.common.validation.ValidationUtils` exposes regex patterns commonly needed in forms and action classes:
+
+[cols="2,2,2", options="header"]
+|===
+|Constant |Pattern |Typical use
+
+|`PATTERN_DATEPICKER_FORMAT`
+|`dd/MM/yyyy`
+|`@DateTimeFormat(pattern = ValidationUtils.PATTERN_DATEPICKER_FORMAT)` on `LocalDate` action-class parameters
+
+|`TIME24HOURS_PATTERN`
+|`([01]?[0-9]\|2[0-3]):[0-5][0-9]`
+|Validating `HH:mm` time strings
+
+|`PHONE_PATTERN`
+|`^\+\d{7,15}$`
+|Basic phone-format check when you need a cheap pattern match before full libphonenumber validation
+|===
+
+The class also provides `isBoolean`, `isDouble`, `isLong`, `isTime` helper methods for type-safe string parsing — useful in custom validators that can't rely on Spring's data binding.
+
+TIP: Prefer `@Phone` over `PHONE_PATTERN` for actual phone fields — it catches invalid-but-pattern-matching numbers (e.g., `+00000000`). Use the regex only when you need a lightweight pre-check before allocating the libphonenumber parser.
+
+=== Messages — Shared Validation Message Keys
+
+Rather than scattering `{error.phone.number}` magic strings across `@Phone(message = "...")` calls, the SDK provides `com.timvero.ground.tools.Messages` — a class of `public static final String` constants wrapping every validation message key the SDK uses:
+
+[source,java]
+----
+@Phone(message = Messages.PHONE_INCORRECT)
+private String phone;
+
+@Email(message = Messages.EMAIL_NOT_VALID)
+private String email;
+
+@Past(message = Messages.DATE_PAST)
+private LocalDate birthDate;
+----
+
+Every constant is already a curly-braced message code (`{error.phone.number}`) — Bean Validation resolves it against the default `ValidationMessages.properties` or your Spring `MessageSource`.
+
+.All Messages constants
+[cols="2,3,3", options="header"]
+|===
+|Constant |Key |Typical use
+
+|`NOT_BLANK` |`{error.blank}` |Required field cannot be blank
+|`NAME` |`{error.name}` |Invalid name format
+|`INCORRECT` |`{error.incorrect}` |Generic "value is wrong"
+|`NUMBER` |`{error.number}` |Not a valid number
+|`NOT_ENOUGH_MONEY` |`{error.balance}` |Balance / amount too small
+|`POSITIVE_NUMBER` |`{error.positive}` |Must be > 0
+|`LENGTH` |`{error.length}` |Outside allowed length
+|`CYRILLIC` |`{error.cyrillic}` |Must be Cyrillic only
+|`ENGLISH` |`{error.english}` |Must be English only
+|`CYRILLIC_ENGLISH` |`{error.cyrillic.english}` |Either alphabet allowed
+|`LOGIN_LENGTH` |`{error.fixed.login.length}` |Login length mismatch
+|`OUT_OF_LIMITS` |`{error.limit}` |Outside numeric limits
+|`URL_INCORRECT` |`{error.url.incorrect}` |Malformed URL
+|`DATE_BIRTH_18` |`{error.18yo}` |Must be 18 or older
+|`DATE_FUTURE` |`{error.date.future}` |Must be in the future
+|`DATE_PAST` |`{error.date.past}` |Must be in the past
+|`PHONE_INCORRECT` |`{error.phone.number}` |Invalid phone
+|`EXPRESSION_COMPILATION_ERROR` |`{error.expression.compilation}` |SpEL / formula syntax error
+|`INDIVIDUAL_NUMBER_INCORRECT` |`{error.individual.number}` |Invalid personal id
+|`DOCUMENT_NUMBER_INCORRECT` |`{error.document.number}` |Invalid document number
+|`EMAIL_NOT_VALID` |`{error.email.notvalid}` |Invalid email
+|`URL_NOT_VALID` |`{error.url.notvalid}` |Invalid URL
+|`SUITABLE_TEST_ENTITY` |`{info.suitable.test.entity}` |Used by notification test UI
+|`NOT_SUITABLE_TEST_ENTITY` |`{info.not_suitable.test.entity}` |Same
+|===
+
+Define the localized messages in `messages.properties`:
+
+[source,properties]
+----
+error.phone.number=Please provide a valid phone number
+error.email.notvalid=Please provide a valid email
+error.18yo=You must be at least 18 years old
+error.blank=This field is required
+----
+
+Missing keys fall back to the key name itself — acceptable for development, obvious in production, so keep the `messages.properties` coverage complete.
 
 == Form Processing Architecture
 
@@ -100,9 +208,9 @@ These actions are parameterized with:
 * **Entity Type**: `Client` - The JPA entity class
 * **Form Type**: `ClientForm` - The form DTO class
 
-=== Form Service Layer
+=== Form Service Layer — EntityFormService Contract
 
-Actions delegate form processing to specialized service classes:
+Actions delegate form processing to subclasses of `EntityFormService<E, F, ID>` (from `com.timvero.base.form`):
 
 .EntityFormService Usage
 [source,java]
@@ -110,16 +218,65 @@ Actions delegate form processing to specialized service classes:
 include::{sourcedir}/client/form/ClientFormService.java[tags=form-service]
 ----
 
-The `EntityFormService` provides:
+The abstract base provides these extension points and services:
 
-* **Entity to Form mapping**: Converting entities to form objects for editing
-* **Form to Entity mapping**: Converting form submissions to entity objects
-* **Validation integration**: Coordinating with Bean Validation
-* **Persistence operations**: Saving and updating entities
+[cols="2,3,3", options="header"]
+|===
+|Method |Purpose |When to override
 
-=== MapStruct Mappers
+|`assembleEditModel(entity, form, model)`
+|**Abstract** — populate the `model` map with data needed by the edit template (dropdowns, reference lists, enum values)
+|**Always** — this is the only method you _must_ implement
 
-Form-to-entity conversion is handled by MapStruct mappers:
+|`validateConstraint(constraint, binding)`
+|Translate a DB constraint violation name into a user-facing `rejectValue` call
+|When you rely on unique/FK constraints to enforce business rules and want localized error messages
+
+|`loadEntity(id)`
+|Load an entity by id for edit. Default: `entityManager.getReference(entityClass, id)` (lazy proxy)
+|When you need eager-loading, security filtering, or custom fetch strategies
+
+|`saveEntity(entity)`
+|Persist-or-merge the entity. Default: `isNew()` → `persist`, else `merge`
+|For specialized persistence (publisher patterns, outbox, custom repositories)
+
+|`getEditModel(id)`
+|Public entry — called by the controller. Not typically overridden
+|Rarely
+
+|`save(id, form)` / `save(id, form, prePersist)`
+|Public entry — called by the controller. Not typically overridden
+|Only via `prePersist` callback (see Advanced Patterns below)
+
+|`delete(id)`
+|Public entry — removes by id
+|Rarely
+|===
+
+**Generics are resolved at runtime** via Spring's `ResolvableType` — you don't need to pass `Class<E>` / `Class<F>` / `Class<ID>` to the constructor. The base class inspects the subclass's generic parameters and caches them (`getEntityClass()`, `getFormClass()`, `getIdClass()`).
+
+**The `assembleEditModel` pattern** keeps controllers thin: instead of pre-loading dropdowns in every controller, each FormService declares its UI dependencies once. The base `getEditModel(id)` method seeds `model["entity"]` and `model["form"]`, then calls your override to enrich it.
+
+=== MapStruct Mappers — EntityToFormMapper Contract
+
+Form↔entity conversion is governed by the three-method `EntityToFormMapper<E, F>` interface:
+
+[source,java]
+----
+public interface EntityToFormMapper<E, F> {
+    void toEntity(F form, @MappingTarget E entity) throws ValidationException;      // <1>
+
+    @InheritConfiguration
+    E createEntity(F form) throws ValidationException;                              // <2>
+
+    F toForm(E entity);                                                             // <3>
+}
+----
+<1> **Update path** — mutates an existing entity in place. `@MappingTarget` tells MapStruct to write into the passed entity rather than create a new one, preserving `id`, `version`, audit fields, and associations not exposed in the form.
+<2> **Create path** — produces a new entity. `@InheritConfiguration` reuses the field-mapping rules defined for `toEntity`, so you don't repeat the mapping definitions.
+<3> **Read path** — builds a form from an entity for display/edit. Typically uses `@InheritInverseConfiguration` in implementations.
+
+Real-world mappers:
 
 .Mapper Structure
 [source,java]
@@ -129,7 +286,7 @@ include::{sourcedir}/application/form/ApplicationFormMapper.java[tags=mapper]
 include::{sourcedir}/participant/form/ParticipantFormMapper.java[tags=mapper]
 ----
 
-MapStruct automatically generates implementation classes that provide:
+MapStruct generates implementations at compile time that provide:
 
 * **Bidirectional mapping**: Entity ↔ Form conversion
 * **Nested object mapping**: Automatic handling of complex object structures
@@ -137,6 +294,64 @@ MapStruct automatically generates implementation classes that provide:
 * **Null handling**: Safe mapping of optional fields
 
 For detailed information about MapStruct features and configuration, see the https://mapstruct.org/documentation/stable/reference/html/[official MapStruct documentation].
+
+[NOTE]
+====
+**Why `@MappingTarget` matters for updates**: without it, `toEntity` would create a new instance, losing the id and all fields not present in the form. The edit action would silently insert a new row instead of updating the existing one. Always use `@MappingTarget` for the update path.
+====
+
+=== ReferenceMapper — ID ↔ Entity Bridge
+
+When a form references another entity (a dropdown selects an existing `Country`, `Document`, `Product`), the form DTO carries the **id**, not the full entity. MapStruct needs a way to resolve id → entity on save and entity → id on load. That's what `com.timvero.base.mapping.ReferenceMapper` provides:
+
+[source,java]
+----
+@Component
+public class ReferenceMapper {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    public <ID extends Serializable, T extends Persistable<ID>> T fromID(ID key, @TargetType Class<T> entityClass) {
+        if (key == null) {
+            return null;
+        }
+        return entityManager.find(entityClass, key);       // <1>
+    }
+
+    public <ID extends Serializable> ID toID(Persistable<ID> entity) {
+        return entity != null ? entity.getId() : null;     // <2>
+    }
+}
+----
+<1> `fromID` loads an entity by id using `EntityManager.find()` — returns `null` for `null` key, full entity otherwise. The `@TargetType` parameter is resolved by MapStruct from the target field's type.
+<2> `toID` extracts the id from an entity — `null`-safe, trivial on the surface but standardizes the direction form→entity mapping needs.
+
+Activate `ReferenceMapper` in a MapStruct mapper via `@Mapper(uses = ReferenceMapper.class)`:
+
+[source,java]
+----
+include::{sourcedir}/product/form/ExampleCreditProductAdditiveFormMapper.java[lines=12..14]
+----
+
+Once declared in `uses`, MapStruct automatically picks `ReferenceMapper.fromID` / `toID` whenever it needs to convert between an `ID` field and a `Persistable<ID>` field — no explicit `@Mapping(source=..., qualifiedByName=...)` needed for the common case.
+
+When to add `uses = ReferenceMapper.class`:
+
+- Form has an id field (e.g., `UUID countryId`) that maps to an entity association on the target (`Country country`)
+- Form exposes a dropdown of existing entities — user picks one, form carries the id
+- Nested create/update where the parent already exists and you only reference it
+
+When it's **not** needed:
+
+- Form-to-form or entity-to-entity mappings where both sides have matching types
+- Pure value objects without id-based references
+- Simple `@Embedded` nested forms that carry all data inline
+
+[NOTE]
+====
+`fromID` uses `EntityManager.find()`, which **loads the full entity** via the first-level cache or a DB query. If you have many references and only need the id for later association, consider `EntityManager.getReference()` (returns a lazy proxy) instead — but that requires a custom qualifier method rather than the default `fromID`.
+====
 
 === Processing Flow
 
@@ -169,6 +384,204 @@ ClientFormMapper.formToEntity(ClientForm form)
     ↓
 Client entity (persisted to database)
 ----
+
+== Save Lifecycle
+
+`EntityFormService.save()` runs a strict sequence inside a transaction annotated `@Transactional(rollbackFor = ValidationException.class)`. Understanding this sequence prevents a class of surprising bugs.
+
+[source]
+----
+save(id, form, prePersist)
+   │
+   ├── id != null ?
+   │     ├── yes → entity = initializeAndUnproxy(loadEntity(id))
+   │     │         mapper.toEntity(form, entity)
+   │     │         form-id != entity-id ? → detach + mapper.createEntity(form)    // <1>
+   │     └── no  → entity = mapper.createEntity(form)
+   │
+   ├── prePersist callback (optional) — last chance to tweak before persist
+   │
+   ├── saveEntity(entity)                          // persist if new, merge otherwise
+   │
+   ├── entityManager.flush()                       // forces DB constraints to fire NOW  // <2>
+   │
+   ├── catch DataIntegrityViolationException / ConstraintViolationException:
+   │      handleConstraintViolationException(cve) {
+   │          binding = ValidationException.binding()
+   │          validateConstraint(cve.constraintName, binding)   // your override
+   │          binding.throwIfNotEmpty()
+   │          // if no rejection was added — original exception re-thrown
+   │      }
+   │
+   └── return entity.getId()
+----
+<1> **The id-swap path**: if the form carries a different id than the loaded entity (e.g., a "copy" action presented the form with a new id), the loaded entity is detached and a new one is created via `createEntity`. This is why the base class accepts the id-mismatch rather than throwing.
+<2> **Why `flush()` is explicit**: without it, DB constraints are checked only at transaction commit — *after* the controller method returned. By flushing inside `save()`, any DB error is caught at the right layer and can be translated to a `ValidationException` that rolls back cleanly.
+
+=== The prePersist Callback
+
+`save(id, form, prePersist)` accepts a `BiConsumer<F, E>` that fires after mapping but before `saveEntity`:
+
+[source,java]
+----
+UUID id = formService.save(formId, form, (f, entity) -> {
+    entity.setOwner(currentUser);                  // <1>
+    entity.setSource(ApplicationSource.BACKOFFICE);
+});
+----
+<1> Set fields that don't belong on the form (ownership, source, computed defaults) after mapping but before persist. Useful when the value depends on the request context rather than form data.
+
+== ValidationException & Error Handling
+
+=== Binding Pattern
+
+`ValidationException.Binding` is a fluent builder for collecting field-level errors:
+
+[source,java]
+----
+public class ClientFormService extends EntityFormService<Client, ClientForm, UUID> {
+
+    @Override
+    protected void validateConstraint(String constraint, Binding binding) {
+        if ("uk_client_email".equals(constraint)) {
+            binding.rejectValue("contactInfo.email", "client.email.duplicate");
+        }
+        if ("uk_client_ssn".equals(constraint)) {
+            binding.rejectValue("individualInfo.ssn", "client.ssn.duplicate");
+        }
+    }
+}
+----
+
+Three `rejectValue` overloads cover the common cases:
+
+[cols="3,2", options="header"]
+|===
+|Signature |Use
+
+|`rejectValue(field, errorCode)`
+|Simple field error with i18n code
+
+|`rejectValue(field, errorCode, defaultMessage)`
+|Same + fallback if the code isn't resolved
+
+|`rejectValue(field, errorCode, errorArgs, defaultMessage)`
+|Same + arguments for message interpolation (e.g., `{0}`, `{1}` placeholders)
+|===
+
+Throw with `binding.throwIfNotEmpty()` — a no-op if no rejections were added (lets the base class re-throw the original `ConstraintViolationException`).
+
+=== Rejection & MessageSourceResolvable
+
+`Rejection` implements Spring's `MessageSourceResolvable`:
+
+[source,java]
+----
+public String[] getCodes() {
+    return MESSAGE_CODES_RESOLVER.resolveMessageCodes(errorCode, null, field, null);
+}
+----
+
+`DefaultMessageCodesResolver` generates a code **hierarchy** from the `(errorCode, field)` pair — e.g., from `rejectValue("contactInfo.email", "client.email.duplicate")` you get resolution attempts:
+
+1. `client.email.duplicate.contactInfo.email`  (most specific)
+2. `client.email.duplicate.email`
+3. `client.email.duplicate`                     (fallback)
+
+Define the most general key (`client.email.duplicate`) in `messages.properties`; specific keys override only where needed.
+
+=== Transaction Rollback
+
+`save()` is annotated `@Transactional(rollbackFor = ValidationException.class)` — because `ValidationException` is a **checked** exception, it doesn't trigger rollback by default. The `rollbackFor` attribute restores the rollback.
+
+WARNING: If you override `save()` in a subclass and forget to replicate `rollbackFor = ValidationException.class`, the transaction commits even on validation failure — and the partially-saved state is persisted. Always copy the annotation when overriding.
+
+== Advanced Patterns
+
+=== Populating Dropdowns in assembleEditModel
+
+Real-world `assembleEditModel` examples from `timvero-example`:
+
+[source,java]
+----
+// ClientFormService — static enum-based dropdown
+@Override
+protected void assembleEditModel(Client entity, ClientForm form, Map<String, Object> model) {
+    model.put("countries", Country.values());
+}
+
+// ApplicationFormService — multiple enum lists
+@Override
+protected void assembleEditModel(Application entity, ApplicationForm form, Map<String, Object> model) {
+    model.put("employmentTypes", Employment.values());
+    model.put("periodicities", Periodicity.values());
+}
+
+// ExampleCreditProductFormService — dynamic data from services
+@Override
+protected void assembleEditModel(ExampleCreditProduct entity, CreditProductForm form,
+                                 Map<String, Object> model) {
+    model.put("productEngines", SimpleScheduledEngine.NAME);
+    model.put("creditTypes", CreditType.values(CreditType.class));
+    model.put("templates", documentTemplateService.getTemplatesMap(
+        ApplicationContractDocumentCategory.TYPE));
+}
+----
+
+Rules of thumb:
+
+- Keep it side-effect free — runs in `@Transactional(readOnly = true)`
+- Use `Lazy.of(() -> ...)` for expensive data (Thymeleaf evaluates lazily when the template asks)
+- For shared dropdowns across many forms, factor into a bean and autowire — `@Autowired CountryService` + `model.put("countries", countryService.all())`
+
+=== Overriding loadEntity for Eager Fetch
+
+The default `loadEntity(id)` returns a Hibernate reference (lazy proxy). If your edit template reads associations, override with a fetch query:
+
+[source,java]
+----
+@Override
+protected Participant loadEntity(UUID id) {
+    return participantRepository.findByIdWithCollections(id)         // <1>
+        .orElseThrow(() -> new EntityNotFoundException("Participant " + id));
+}
+----
+<1> Repository method with `@EntityGraph` or `JOIN FETCH` to pre-load associations. Prevents N+1 in the edit template.
+
+=== Mapping DB Constraints to Fields
+
+Useful constraint names to intercept:
+
+[cols="2,3", options="header"]
+|===
+|Constraint type |Pattern
+
+|Unique index (`UNIQUE (email)`)
+|`uk_<table>_<columns>` or `idx_<table>_<columns>` depending on naming convention
+
+|Foreign key (`FK (application_id)`)
+|`fk_<table>_<column>`
+
+|Check constraint
+|`ck_<table>_<description>`
+|===
+
+Pattern for mapping:
+
+[source,java]
+----
+@Override
+protected void validateConstraint(String constraint, Binding binding) {
+    switch (constraint) {
+        case "uk_client_email"       -> binding.rejectValue("contactInfo.email", "duplicate");
+        case "uk_client_phone"       -> binding.rejectValue("contactInfo.phone", "duplicate");
+        case "fk_client_country_id"  -> binding.rejectValue("country", "invalid.reference");
+        default                      -> { /* fall through — base class re-throws */ }
+    }
+}
+----
+
+If your `validateConstraint` doesn't recognize the constraint and doesn't add a binding, the original `ConstraintViolationException` is re-thrown — preserves the stack trace and surfaces as a 500 error, which is the correct default for unknown DB failures.
 
 == Template Integration
 
@@ -270,3 +683,55 @@ mvn clean compile
 
 # Check generated classes in target/generated-sources/annotations/
 ```
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Extend `EntityFormService<E, F, ID>` with concrete type parameters** — `ResolvableType` resolves them at construction; no `Class<?>` constructor args needed
+* {ok} **Always implement `assembleEditModel()`** — it's the single extension point for populating the edit-template model
+* {ok} **Use `@MappingTarget` in `toEntity`** — preserves entity id, version, and non-form fields during update
+* {ok} **Use `@InheritConfiguration` on `createEntity`** and `@InheritInverseConfiguration` on `toForm` — reuses mapping rules, prevents drift
+* {ok} **Wrap business-level validation errors in `ValidationException.Binding`** — integrates with Spring's `MessageSourceResolvable`, supports i18n code hierarchy
+* {ok} **Override `validateConstraint()` for every DB constraint** your form relies on — users see localized field errors instead of raw stack traces
+* {ok} **Copy `@Transactional(rollbackFor = ValidationException.class)`** when overriding `save()` — checked exception doesn't trigger rollback by default
+* {ok} **Use the `prePersist` callback for request-scoped context** (owner, source, current user) — keeps form DTOs free of server-only fields
+* {ok} **Override `loadEntity` with `@EntityGraph` / `JOIN FETCH`** when the edit template touches associations — avoids N+1
+* {ok} **Declare `@Valid` on nested form fields** — Bean Validation doesn't cascade without it
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Missing `@MappingTarget` in `toEntity`** — creates a new entity on update, silently inserts instead of updating
+* {bad} **Overriding `save()` without `@Transactional(rollbackFor = ValidationException.class)`** — commits partial state on validation failure
+* {bad} **Throwing `ValidationException` from inside a nested `@Transactional(propagation = REQUIRES_NEW)` block** — outer transaction doesn't see the rollback; use the `Binding` pattern inside the outer transaction instead
+* {bad} **Side effects in `assembleEditModel()`** — runs in read-only transaction; mutations surface as unpredictable flush failures
+* {bad} **Relying on Bean Validation for uniqueness** — `@UniqueConstraint` doesn't exist at the Bean Validation level; enforce via DB constraint + `validateConstraint` mapping
+* {bad} **Catching `ConstraintViolationException` manually in a subclass** — the base class already does this; duplicate catch swallows the binding logic
+* {bad} **Doing `entityManager.flush()` before the base class does** — premature flush bypasses the constraint-violation translation in the base
+* {bad} **Passing `null` for required form fields because "validation will catch it"** — it won't; `@NotNull` on the form field is client-side, `@Column(nullable=false)` on the entity throws `PropertyValueException` (not handled), map them carefully
+* {bad} **Storing entity references in form DTOs** — forms are web-layer DTOs, entities are persistence; MapStruct bridges them. Mixing leaks lazy proxies to the template
+* {bad} **Overriding `getEditModel` instead of `assembleEditModel`** — loses the automatic `entity`/`form` seeding, leading to NPEs in templates
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every entity with an edit form has a `FormService extends EntityFormService<E, F, ID>`
+* {todo} Every `EntityFormService` implements `assembleEditModel()`
+* {todo} Every `EntityToFormMapper` uses `@MappingTarget` on the update method
+* {todo} MapStruct implementations are generated (`mvn clean compile` succeeds, `target/generated-sources/annotations/` populated)
+* {todo} `validateConstraint()` handles all DB constraints the form depends on
+* {todo} i18n message keys exist for every `rejectValue` error code used
+* {todo} `@Transactional(rollbackFor = ValidationException.class)` present on any overridden `save()` method
+* {todo} Form DTOs have `@Valid` on all nested objects
+* {todo} `@NotNull` / `@NotBlank` / `@Email` / `@PastOrPresent` annotations present on required fields
+* {todo} Edit templates don't access lazy associations outside `assembleEditModel` pre-loading
+* {todo} Controllers use `@Valid @ModelAttribute FormClass form, BindingResult result`
+* {todo} Bean validation tested — invalid input returns to the form with error messages, not a 500
+* {todo} DB-constraint-triggered errors tested — duplicate entries surface as field-level errors
+* {todo} Tests cover the id-swap path if copy actions are in use
+
+---
+
+**Related:** <<form-templates-html-template-integration>>, <<entity-actions-setup-and-usage>>, <<credit-product-module-entity-model-lifecycle-rates>>, <<entity-module-sdk-reference-hierarchy>>
+
+**Next:** <<form-templates-html-template-integration>>, <<entity-actions-setup-and-usage>>

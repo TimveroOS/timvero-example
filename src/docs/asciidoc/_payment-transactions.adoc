@@ -1,3 +1,4 @@
+[[payment-transactions]]
 = Payment Transactions Framework
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -816,6 +817,397 @@ Financial regulations require:
 * **Connection Pooling** - Efficient gateway connection management
 * **Caching** - Cache gateway configuration and metadata
 * **Batch Processing** - Group transactions where possible (NACHA)
+
+[[payment-transactions-sdk-internals]]
+[[sdk-internals-transfer-transactions]]
+== SDK Internals — Transfer Transactions
+
+Everything above describes the framework from the integrator's point of view. This section drops to the SDK module that backs it: `com.timvero.transfer.transaction`. The module ships **13 files in 3 subpackages** — `entity` (JPA model), `service` (orchestration), `gateway` (provider SPI). If you are implementing a new gateway, subclassing `PaymentTransaction`, or debugging a stuck row, work from here.
+
+=== Subpackage Map
+
+[cols="1,3", options="header"]
+|===
+| Subpackage | Purpose
+
+| `transfer.transaction.entity`
+| Persistence: the `PaymentTransaction` single-table inheritance root, the `TransactionStatus` / `TransactionType` enums, the Spring Data repository. Four files. See <<entity-module-sdk-reference-hierarchy>> for the `BaseEntity<Long>` base.
+
+| `transfer.transaction.service`
+| Orchestration: `PaymentTransactionService` drives gateway calls, `PaymentTransactionHandler` is the SPI for post-success side effects (creating credit operations etc.), `PaymentTransactionHandlerAgregator` fans out to every registered handler. Three files.
+
+| `transfer.transaction.gateway`
+| Provider SPI: the `PaymentGateway` base contract plus three refinement interfaces (`VoidablePaymentGateway`, `RefundablePaymentGateway`, `PartialRefundablePaymentGateway`), the `TransactionResult` value object, and a `TestPaymentGateway` reference implementation. Six files.
+|===
+
+=== The `PaymentTransaction` Entity
+
+`PaymentTransaction` is an abstract `@Entity` mapped with `InheritanceType.SINGLE_TABLE` on `payment_transaction` and discriminated by a `participant` column. Every domain that processes payments extends it with its own `@DiscriminatorValue` — `BorrowerTransaction` earlier in this doc is one such subclass. It carries a `Long` id (see <<entity-module-sdk-reference-hierarchy>> for the `BaseEntity<Long>` base) and is Envers-audited with `RelationTargetAuditMode.NOT_AUDITED` so related entities aren't recursively pulled into each revision (see <<audit-module-sdk-reference-internals>>).
+
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Purpose
+
+| `type` | `TransactionType` | `INCOMING` or `OUTGOING` — set at creation, `updatable = false`. Stored via `EnumCodeType` so the DB holds the stable integer code, not the name.
+| `status` | `TransactionStatus` | Lifecycle state (13 values — see below). Setter stamps `completedAt` when `status.isComplete()` flips true.
+| `amount` | `MonetaryAmount` | `@Embedded` with `MonetaryAmountType` composite mapping: `currency` + `amount` columns. Always positive; direction comes from `type`.
+| `externalId` | `String` | Provider's message/transaction id. Part of the unique constraint that prevents duplicates.
+| `service` | `String` | Which gateway bean handled it (`PaymentGateway.getName()`). Part of the unique constraint.
+| `description` | `String(Length.LONG)` | Free-text; set by whoever created the row.
+| `trace` | `String(Length.LONG)` | Append-only log of raw gateway responses + stack traces. Use `addTrace(String)` / `addTrace(Throwable)`, never the setter, to preserve history.
+| `refundTarget` | `PaymentTransaction` | Self-referencing `@OneToOne` — points to the original transaction this one refunds. Triggers the refund-dispatch branch in `PaymentTransactionService.proceed()`.
+| `paymentMethod` | `PaymentMethod` | `@ManyToOne` with `CASCADE.{MERGE, PERSIST}` — the method determines which gateway is picked.
+| `exportedAt` | `Instant` | Bookkeeping flag for downstream integrations (reporting, accounting).
+| `completedAt` | `Instant` | Stamped automatically by `setStatus()` when the new status is terminal.
+|===
+
+The table declares a unique constraint `UK4ouv9847hue00f2laj6bxmaia` on `(type, service, external_id)` — this is the framework's duplicate guard. Two `INCOMING` rows with the same `(externalId, service)` cannot coexist, and `TransactionStatus.DUPLICATE` is the lane used when the gateway itself reports a duplicate.
+
+One abstract method is forced onto every subclass:
+
+[source,java]
+----
+public abstract String getOrderId();
+----
+
+`PaymentTransactionService` calls this when invoking `gateway.proceedIncoming/proceedOutgoing(orderId, method, amount)`. The `orderId` is the correlation id the provider sees — pick something stable and meaningful (credit id + sequence, application id, etc.), because it shows up in provider dashboards and reconciliation files.
+
+`getOutgoingAmount()` / `getIncomingAmount()` are `@Transient` helpers that flip the sign based on `type` — use them when aggregating across mixed-direction transactions (e.g. a net ledger view).
+
+=== TransactionStatus — the lifecycle state machine
+
+`TransactionStatus` is a 13-state enum implementing `Codded`, so the DB stores the integer code (200–990) — status order isn't alphabetical, it's **numeric**. Each value carries two booleans:
+
+* `successful` — "was money moved in the intended direction?"
+* `complete` — "is this row terminal, nothing more will happen?"
+
+[cols="1,1,1,1,3", options="header"]
+|===
+| Status | Code | successful | complete | Meaning
+
+| `DRAFT` | 200 | false | false | Row created, not yet queued for execution.
+| `READY_FOR_EXECUTION` | 300 | false | false | Picked up by `proceed()` on the next tick.
+| `IN_PROGRESS` | 400 | false | false | Gateway returned `NOT_FINISHED` (async settlement pending).
+| `UNAVAILABLE` | 500 | false | true | Gateway threw `IOException` or returned `ERROR`. **Retried** — `proceed()` re-enters from this state.
+| `DUPLICATE` | 550 | false | true | Gateway reported a duplicate (`TransactionResult.duplicate = true`). Terminal.
+| `CANCELLED` | 600 | false | true | Cancelled before execution.
+| `FAILED` | 700 | false | true | Gateway returned `FAIL` (declined, insufficient funds, etc.).
+| `CHARGEBACK` | 750 | false | true | Previously-successful transaction reversed by the bank. Set by out-of-band chargeback intake, not by `proceed()`.
+| `SUCCEED` | 800 | **true** | true | Terminal success. `PaymentTransactionHandler`s run after this flip.
+| `READY_FOR_VOID` | 900 | **true** | false | Voidable transaction queued for cancellation. Still counts as successful until voided.
+| `VOID_UNAVAILABLE` | 930 | **true** | true | Void attempt threw — retried by `proceed()`.
+| `VOID_FAILED` | 950 | **true** | true | Gateway refused to void.
+| `VOIDED` | 990 | false | true | Void succeeded.
+|===
+
+The enum's `in(TransactionStatus...)` method is the clean way to write status predicates — prefer it over chained `==` comparisons.
+
+IMPORTANT: `UNAVAILABLE` and `VOID_UNAVAILABLE` are `complete = true` but `PaymentTransactionService.proceed()` explicitly re-processes them. "Complete" in this enum means "no longer in motion **on its own**" — operators or schedulers can still nudge it forward. Don't rely on `isComplete()` to mean "will never change again".
+
+=== `PaymentTransactionRepository`
+
+[source,java]
+----
+public interface PaymentTransactionRepository
+        extends JpaRepository<PaymentTransaction, Long>,
+                JpaSpecificationExecutor<PaymentTransaction>,
+                SynchronousAccessRepository<PaymentTransaction, Long> {
+
+    boolean existsByRefundTargetId(Long transactionId);
+
+    List<PaymentTransaction> findAllByRefundTargetId(Long transactionId);
+}
+----
+
+Three interfaces worth noting:
+
+* `JpaRepository` — standard CRUD.
+* `JpaSpecificationExecutor` — enables dynamic filters; admin list views use this to compose status/type/date filters (see <<list-filters>>).
+* `SynchronousAccessRepository` — adds `getSync(id)` which takes a **pessimistic write lock**. `PaymentTransactionService.proceed()` calls `getSync()` before flipping status, so concurrent workers can't both try to push the same transaction to the gateway. See <<entity-module-sdk-reference-hierarchy>> and <<reload-infrastructure>> for the lock contract.
+
+The two custom finders drive the refund UI: "can this transaction be refunded further?" requires knowing whether a refund row already exists.
+
+=== `PaymentTransactionService` — the orchestrator
+
+The service is **not** `@Service`-annotated in the SDK — downstream projects register the bean (often as a subclass that overrides `proceed()`/`cancel()` for project-specific trace format). It wires itself up at `@PostConstruct` by collecting every `PaymentGateway` on the classpath and indexing them by `methodType`:
+
+[source,java]
+----
+@PostConstruct
+protected void init() {
+    gateways = new HashMap<>();
+    if (list != null) {
+        for (PaymentGateway gateway : list) {
+            PaymentGateway prev = gateways.put(gateway.getMethodType(), gateway);
+            if (prev != null)
+                throw new RuntimeException("Multiple Payment Methods for type :" + prev.getMethodType());
+        }
+    }
+}
+----
+
+This enforces **one gateway per method type** — if two beans both return `"ACH"` from `getMethodType()`, the bean graph fails to start. That is intentional: gateway selection is purely by `PaymentMethod.getType()`, so ambiguity would mean silent mis-routing.
+
+==== `proceed(Long transactionId)` — the main loop
+
+[source,java]
+----
+@Async
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void proceed(Long transactionId) {
+    final PaymentTransaction transaction = transactionRepository.getSync(transactionId);
+
+    if (transaction.getStatus() == TransactionStatus.READY_FOR_EXECUTION
+            || transaction.getStatus() == TransactionStatus.UNAVAILABLE) {
+        try { proceed(transaction); }
+        catch (Exception e) {
+            transaction.setStatus(TransactionStatus.UNAVAILABLE);
+            transaction.addTrace(e);
+        }
+    } else if (transaction.getStatus() == TransactionStatus.READY_FOR_VOID
+            || transaction.getStatus() == TransactionStatus.VOID_UNAVAILABLE) {
+        try { cancel(transaction); }
+        catch (Exception e) {
+            transaction.setStatus(TransactionStatus.VOID_UNAVAILABLE);
+            transaction.addTrace(e);
+        }
+    }
+
+    TransactionUtils.afterTransaction(() -> handlerAgregator.handle(transactionId));
+}
+----
+
+Five things to internalise:
+
+1. `@Async` + `@Transactional(REQUIRES_NEW)` — each invocation opens its own transaction on a Spring async executor. Caller's transaction never blocks on the gateway.
+2. `getSync()` pessimistic-locks the row, so parallel schedulers can't double-process.
+3. The **same method** dispatches on both execution and void paths — status is the switch. `READY_FOR_VOID` / `VOID_UNAVAILABLE` flow through `cancel()`, everything else through `proceed(transaction)`.
+4. Any `Exception` is caught and funneled back into `UNAVAILABLE` / `VOID_UNAVAILABLE` with the stack trace appended to `trace`. Nothing propagates out — the async executor would just log and drop it anyway.
+5. `TransactionUtils.afterTransaction(...)` schedules handler dispatch **after** the JPA commit. Handlers therefore run with the new status already visible in the DB — no dirty-read windows. A sibling `proceedSync(Long)` variant exists for callers who need synchronous dispatch (tests, operator-driven retries).
+
+==== `proceed(PaymentTransaction transaction)` — gateway dispatch
+
+[source,java]
+----
+protected void proceed(final PaymentTransaction transaction) throws IOException {
+    PaymentMethod paymentMethod = transaction.getPaymentMethod();
+    PaymentGateway gateway = getGateway(paymentMethod.getType());
+
+    TransactionResult transactionResult = null;
+    if (transaction.getRefundTarget() != null
+        && paymentMethod.equals(transaction.getRefundTarget().getPaymentMethod())
+        && gateway.getName().equals(transaction.getRefundTarget().getService())) {
+
+        if (transaction.getRefundTarget().getAmount().isEqualTo(transaction.getAmount())
+            && gateway instanceof RefundablePaymentGateway) {
+            transactionResult = ((RefundablePaymentGateway) gateway)
+                    .refund(transaction.getRefundTarget().getExternalId());
+        } else if (transaction.getRefundTarget().getAmount().compareTo(transaction.getAmount()) != 0
+            && gateway instanceof PartialRefundablePaymentGateway) {
+            transactionResult = ((PartialRefundablePaymentGateway) gateway).refund(
+                transaction.getRefundTarget().getExternalId(),
+                transaction.getAmount(),
+                transaction.getOrderId());
+        }
+    }
+
+    if (transactionResult == null) {
+        transactionResult = transaction.getType() == TransactionType.INCOMING
+                ? gateway.proceedIncoming(transaction.getOrderId(), paymentMethod, transaction.getAmount())
+                : gateway.proceedOutgoing(transaction.getOrderId(), paymentMethod, transaction.getAmount());
+    }
+    ...
+}
+----
+
+The refund branch is the subtle part. A refund transaction is routed through the **provider-native refund API** only when **all three** conditions hold:
+
+1. `refundTarget` is set.
+2. `paymentMethod` on this transaction equals `refundTarget.getPaymentMethod()` (same card/account).
+3. The gateway that originally handled the target is still the gateway responsible for this method type (`gateway.getName().equals(refundTarget.getService())`).
+
+If the **amounts match** and the gateway implements `RefundablePaymentGateway`, it calls `refund(targetId)` (full refund). If amounts **differ** and the gateway implements `PartialRefundablePaymentGateway`, it calls `refund(targetId, amount, orderId)`. If neither contract is implemented, or the gateway has switched since the original payment, it falls through to `proceedOutgoing()` — a new "money out" transaction, independent of the original. That fallback is legal but means the provider won't book it as a refund — reconciliation sees it as a disbursement. Worth knowing when designing chargeback/refund flows.
+
+After dispatch, the result is mapped back to status:
+
+[cols="1,2", options="header"]
+|===
+| `TransactionResult.Status` | Mapped `TransactionStatus`
+
+| `SUCCESS` (not duplicate) | `SUCCEED`
+| `SUCCESS` (duplicate) | `DUPLICATE`
+| `FAIL` | `FAILED`
+| `NOT_FINISHED` | `IN_PROGRESS`
+| `ERROR` | `UNAVAILABLE` (will retry)
+|===
+
+`transaction.setService(gateway.getName())` and `transaction.setExternalId(transactionResult.getId())` happen **before** the status flip, so every post-success handler sees a fully-identified row.
+
+==== `cancel()` — void path
+
+Void is only attempted if the gateway implements `VoidablePaymentGateway` **and** the original gateway (`transaction.getService()`) is still the responsible one. If the gateway has been swapped out between the original send and the void attempt, the transaction is flipped to `VOID_FAILED` with a trace line — it will not auto-retry from `VOID_FAILED`, so operators must re-enqueue manually.
+
+=== `PaymentTransactionHandler` + `PaymentTransactionHandlerAgregator`
+
+Post-success side effects live in `PaymentTransactionHandler`:
+
+[source,java]
+----
+public interface PaymentTransactionHandler {
+    void handle(PaymentTransaction transaction);
+}
+----
+
+Every `@Component` that implements this interface is collected `@Lazy List<PaymentTransactionHandler>` into the aggregator and invoked in Spring's bean-ordering:
+
+[source,java]
+----
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void handle(Long transactionId) {
+    handlers.forEach(h -> {
+        try {
+            final PaymentTransaction transaction = transactionRepository.getSync(transactionId);
+            h.handle(transaction);
+        } catch (Exception e) {
+            log.error("Error processing transaction " + transactionId + " in handler " + h, e);
+        }
+    });
+}
+----
+
+Three things to notice:
+
+1. Each handler runs in its **own `REQUIRES_NEW` transaction** — so a failure in one handler doesn't roll back what earlier handlers did. A failed handler is logged and skipped; the next handler reads the latest committed state via `getSync()`.
+2. Handlers are `@Lazy` — this breaks the cycle that would otherwise form (handlers often call services that in turn depend on `PaymentTransactionService`).
+3. Handlers are invoked both from the post-commit `afterTransaction` hook **and** from `PaymentTransactionService.rehandle(Long)` — operators can replay handlers (e.g. if a credit operation wasn't created because the handler threw). Handlers must therefore be **idempotent**: check whether the side effect already exists before creating it.
+
+The example project's `BorrowerTransactionService.handle()` (shown earlier in this doc) is one such handler — it reads `transaction.getOperation()` and early-returns if the operation is already linked.
+
+=== The Gateway SPI
+
+`PaymentGateway` is the base contract:
+
+[source,java]
+----
+public interface PaymentGateway {
+    String getMethodType();
+    String getName();
+    boolean verify(PaymentMethod method) throws IOException;
+    TransactionResult proceedIncoming(String orderId, PaymentMethod method, MonetaryAmount amount) throws IOException;
+    TransactionResult proceedOutgoing(String orderId, PaymentMethod method, MonetaryAmount amount) throws IOException;
+}
+----
+
+Three orthogonal **capability interfaces** layer on top — a gateway implements the ones it supports:
+
+[cols="1,2", options="header"]
+|===
+| Interface | Capability
+
+| `VoidablePaymentGateway`
+| Can cancel a not-yet-settled transaction by its external id. Enables the `READY_FOR_VOID` → `VOIDED` flow. Asked: "given I have `externalId`, can you make the money not move?"
+
+| `RefundablePaymentGateway`
+| Can reverse a fully-settled transaction at the **full** original amount. Used only when `refundTarget.amount == current.amount`.
+
+| `PartialRefundablePaymentGateway`
+| Can reverse for an arbitrary sub-amount. Signature takes `(targetId, amount, orderId)` because partial refunds typically book as separate provider-side rows.
+|===
+
+Gateways compose these freely. A card processor usually implements all three. An ACH rail might only implement `PartialRefundablePaymentGateway`. A one-way disbursement gateway implements none — and `PaymentTransactionService` will silently fall through to `proceedOutgoing()` for refunds, booking them as fresh disbursements. That is a gateway-selection decision, not an error.
+
+=== `TransactionResult`
+
+A final (effectively — no setters) value object:
+
+[source,java]
+----
+public class TransactionResult {
+    public enum Status { NOT_FINISHED, SUCCESS, FAIL, ERROR }
+
+    private final String id;          // Provider's id → stored on externalId
+    private final MonetaryAmount amount;
+    private final Status status;
+    private final boolean duplicate;  // true → TransactionStatus.DUPLICATE
+    private final String raw;         // Appended to PaymentTransaction.trace
+}
+----
+
+* `NOT_FINISHED` maps to `IN_PROGRESS` — use for async rails (ACH, wire) where the provider acknowledges but hasn't settled.
+* `ERROR` maps to `UNAVAILABLE` and will be retried. Use when the **provider was unreachable**, not when it gave a decisive "no". A declined card is `FAIL`, not `ERROR`.
+* `duplicate = true` forces `DUPLICATE` even if `status = SUCCESS`. Use when the provider tells you "we already booked this, here's the existing id."
+* `raw` should be the provider's literal response body (or a trimmed version) — it's the only forensic evidence you'll have when reconciling a month later.
+
+=== `TestPaymentGateway`
+
+`TestPaymentGateway` is a no-network reference implementation that implements `VoidablePaymentGateway` **and** `RefundablePaymentGateway` — useful in tests that need to exercise the void/refund branches without stubbing. It takes its `methodType` from the constructor, so test projects can register several test gateways for different method types. `getName()` is hard-coded to `"TEST"`, and `verify()` always returns `true`.
+
+It is **not** auto-wired — there is a commented-out line in `PaymentTransactionService.init()` (`//if (!gateways.containsKey(TestPaymentGateway.TEST_GATEWAY_TYPE)) gateways.put(...)`) that would register it as a fallback. Left commented so production deploys don't accidentally process real traffic against a test stub. Register explicitly in your `@TestConfiguration` when you want it.
+
+=== Wiring Diagram
+
+[source]
+----
+                  (admin UI / API)
+                          │
+                          ▼
+              new PaymentTransaction ───────► DB (DRAFT → READY_FOR_EXECUTION)
+                                                       │
+                                  ┌────────────────────┘
+                                  ▼
+                PaymentTransactionService.proceed(id) ──────────► @Async executor
+                    │
+                    │ getSync(id)  — pessimistic lock
+                    │ getGateway(method.getType())
+                    │
+                    ▼
+                PaymentGateway.proceedIncoming / proceedOutgoing
+                (or .refund() if refundTarget matches this gateway)
+                    │
+                    ▼
+                TransactionResult → setStatus + setExternalId + setService + addTrace
+                    │
+                    ▼
+        TransactionUtils.afterTransaction(() -> handlerAgregator.handle(id))
+                    │
+                    ▼  (post-commit, REQUIRES_NEW per handler)
+        PaymentTransactionHandler #1 → e.g. BorrowerTransactionService — creates CreditPayment
+        PaymentTransactionHandler #2 → e.g. reconciliation, notifications, …
+----
+
+See <<payment-hub>> for where upstream intake queues rows into this module, <<credit-operations-framework>> for what successful handlers do with the result, and <<credit-servicing>> for the servicing-side entity this all ultimately updates.
+
+[[payment-transactions-anti-patterns]]
+== Anti-Patterns
+
+* {bad} **Registering two `PaymentGateway` beans with the same `getMethodType()`** — `PaymentTransactionService.init()` throws `"Multiple Payment Methods for type :..."` at startup. The framework has no priority/ordering mechanism on gateways; if you need A/B routing, wrap two concrete gateways behind a single bean that picks internally.
+* {bad} **Putting business logic into `PaymentGateway.proceedIncoming/proceedOutgoing`** — gateways should speak provider protocol and return a `TransactionResult`. Status mapping, credit-operation creation, notifications — all of that belongs in a `PaymentTransactionHandler`, which runs post-commit in a separate transaction and is replayable via `rehandle(id)`. Logic inside the gateway runs inside the pessimistically-locked row transaction and rolls back on any failure downstream.
+* {bad} **Returning `TransactionResult.Status.ERROR` for a declined payment** — `ERROR` maps to `UNAVAILABLE` and is **re-processed** on the next tick, so every decline turns into a retry storm against the provider. Declines are `FAIL` (terminal). Use `ERROR` only when the provider was unreachable or returned an indeterminate result.
+* {bad} **Mutating `trace` via `setTrace()`** — the setter replaces the whole field, losing prior gateway responses. Always use `addTrace(String)` / `addTrace(Throwable)`; both append, and `addTrace(Throwable)` serialises the stack trace to the string form the admin UI can render.
+* {bad} **Implementing a `PaymentTransactionHandler` that is not idempotent** — `handlerAgregator.handle()` runs once after the commit, but operators can re-invoke `PaymentTransactionService.rehandle(id)` to replay (e.g. when a downstream service was down). A handler that creates a `CreditPayment` row must check whether the operation is already linked to the transaction before creating another one.
+* {bad} **Overriding `PaymentTransaction.setStatus()` in a subclass without preserving `completedAt`** — the base setter stamps `completedAt = Instant.now()` whenever the new status is `isComplete()`. Silent override means `completedAt` never populates, reports look fine, and it only surfaces when someone filters "completed this week" and finds nothing.
+* {bad} **Comparing `MonetaryAmount` with `.equals()` for refund routing** — `proceed(PaymentTransaction)` uses `isEqualTo()` for equality and `compareTo(...) != 0` for inequality. `MonetaryAmount.equals()` includes the implementation class, so `Money` vs. `FastMoney` compare unequal at identical amounts. Follow the framework's pattern; otherwise amount-matched full refunds get routed to the partial-refund path.
+* {bad} **Assuming `isComplete() == true` means "will never change again"** — `UNAVAILABLE` / `VOID_UNAVAILABLE` are flagged complete but `proceed()` explicitly re-enters them. Use the actual terminal set (`SUCCEED`, `FAILED`, `CANCELLED`, `DUPLICATE`, `VOIDED`, `VOID_FAILED`, `CHARGEBACK`) when you need "finished forever".
+* {bad} **Skipping `refundTarget` and creating an independent `OUTGOING` transaction for refunds** — you lose the provider-native refund path, the provider books it as a disbursement for regulatory reporting, and the unique constraint on `(type, service, external_id)` won't protect you from double-refunding the same target. Always set `refundTarget` when the outgoing is logically a reversal.
+
+[[payment-transactions-production-checklist]]
+== Production Checklist
+
+* {todo} Every `PaymentGateway` bean returns a distinct `getMethodType()` — start the context in dev to catch collisions early.
+* {todo} Every `PaymentGateway` returns a stable `getName()` that survives deploys — it is written to `payment_transaction.service` and used to route refunds/voids back to the same provider.
+* {todo} Gateways that settle asynchronously return `TransactionResult.Status.NOT_FINISHED` on the first call — otherwise `PaymentTransactionService` thinks the transaction failed.
+* {todo} Every `PaymentTransaction` subclass overrides `getOrderId()` to return something stable and human-readable — it is what shows up in provider dashboards and reconciliation files.
+* {todo} Every `PaymentTransactionHandler` is idempotent (re-runnable via `rehandle(id)` without double-booking side effects).
+* {todo} Async executor for `@Async` methods is configured with bounded queue + back-pressure — unbounded defaults will queue up millions of retries during a provider outage.
+* {todo} `TransactionStatus.UNAVAILABLE` has an ops alert — these are the "provider was down, we'll retry" rows; a persistent backlog means the retry isn't working.
+* {todo} `TransactionStatus.IN_PROGRESS` has a stale-row alert — these are async settlements that should flip to a terminal state within the provider's SLA window.
+* {todo} `refundTarget` is set whenever an OUTGOING transaction is logically a reversal — enables provider-native refund dispatch instead of booking a fresh disbursement.
+* {todo} The `UK4ouv9847hue00f2laj6bxmaia` unique constraint on `(type, service, external_id)` is intact after every migration — it is the last line of defence against duplicate bookings.
+* {todo} `SynchronousAccessRepository.getSync()` is on the critical path for every status transition — don't "optimise" it away; the pessimistic lock is what keeps concurrent workers from double-sending to the provider.
+* {todo} `TestPaymentGateway` is not registered in production profiles — check `spring.profiles.active` excludes any test configuration that wires it.
+* {todo} Envers revisions on `payment_transaction` are retained per regulatory policy (Envers audits this table with `RelationTargetAuditMode.NOT_AUDITED` — see <<audit-module-sdk-reference-internals>>).
+
+**Related:** <<payment-hub>> (upstream: where rows are created and queued), <<credit-servicing>> (downstream: the credit model that successful handlers update), <<credit-operations-framework>> (what handlers produce), <<entity-module-sdk-reference-hierarchy>> (`BaseEntity`, `SynchronousAccessRepository`), <<audit-module-sdk-reference-internals>> (Envers revisions on `payment_transaction`).
 
 == Summary
 

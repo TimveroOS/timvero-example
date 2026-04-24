@@ -73,3 +73,29 @@ The entity page should display the error state, link to the exception detail pag
 == UI
 
 Exception log is available at **Tools → Exception log** (`/exception-entity`). The list page supports filtering by date range, service name, and message. Each detail page shows the full message, cause, and stack trace.
+
+[[exception-entity-admin-controller]]
+== Admin Web Controller — ExceptionEntityController
+
+The admin list/detail page is a thin `ViewableFilterController` that extends the generic filter-controller stack described in <<web-infrastructure-entity-view-controllers>>. The only project-custom bit is a Thymeleaf helper for long message truncation.
+
+[source,java]
+----
+@Controller
+@RequestMapping("/exception-entity")
+@MenuItem(order = 100_300, name = "exceptionEntity", group = "tools")
+public class ExceptionEntityController
+        extends ViewableFilterController<Long, ExceptionEntity, ExceptionEntityFilter> {
+
+    /* Used in Thymeleaf template */
+    public String truncate(String str, int maxLength) {
+        if (str == null) return "";
+        if (str.length() <= maxLength) return str;
+        return str.substring(0, maxLength) + "...";
+    }
+}
+----
+
+The path `/exception-entity` derives the role pair `EXCEPTION_ENTITY_VIEW` / `EXCEPTION_ENTITY_EDIT` automatically (see <<user-roles>>). The `@MenuItem(group = "tools")` places it in the **Tools** menu group at order `100_300`. Filtering (by `serviceName`, `createdAt`, `messageCode`) is handled by `ExceptionEntityFilter` — see <<list-filters-annotation-driven-jpa-query-dsl>>. The `truncate` helper is referenced from the list view's row renderer to clip multi-line exception messages to a column width before the user clicks into the detail page.
+
+No custom endpoints — the base controller provides `/`, `/filter`, `/{id}`, and the Excel export dispatcher out of the box.

@@ -1,0 +1,816 @@
+[[risk-subsystem]]
+= Risk Assessment Subsystem — origination risk SDK
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The `com.timvero.loan.risk` package is the **single largest module in the origination SDK** — 536 Java files across 51 subpackages. Despite the name, the runtime surface area is narrow: every risk workflow the SDK supports boils down to (a) pulling raw content from an external data source, (b) caching it in document storage, (c) parsing it into a strongly-typed object, and (d) evaluating a scripted expression over it (SpEL, JavaScript, or Python) so that downstream consumers — <<offer-engine,offer engine>>, <<feature-service,feature service>>, <<flowable-internals,decision processes>>, checkers, and form validations — can branch on the result without talking to the vendor themselves.
+
+The bulk of the file count is **JSON/XML binding classes** for the seven out-of-the-box provider integrations (Experian credit bureau, Clarity sub-prime bureau, Plaid / Tink / Truelayer open banking, Ntropy transaction enrichment, Marketcheck car pricing). A customer project writes a handful of thin `DataSource` subclasses plus `*Subject` implementations on the entities under evaluation; the DTOs, caching, and document lifecycle are already done.
+
+== What You Need to Know
+
+Before reading the package map, internalize the three cross-cutting concepts that every subsystem obeys. All 51 subpackages roll up into **eight functional areas**:
+
+[cols="1,2,3", options="header"]
+|===
+|Area |Package roots |Purpose
+
+|**Core contract**
+|`risk/`, `datasource/`
+|The small, public SPI — `ExternalDataService`, `DataSource<E>`, `MappedDataSource<E,T>`, `DataSourceManager`, `DataSourceSubject`, `DataSourceRecord`, `DataUnavailableException`. Everything else is either an SDK-provided implementation or a DTO. ~10 files.
+
+|**Persistence + caching**
+|`datasource/impl/`, `entity/`
+|`DataSourceManagerImpl` orchestrates the cache; `SubjectExternalData` is the one-row-per-(subject, source) table that points at a gzipped `Document` holding the raw vendor response. ~4 files.
+
+|**Scripting engine**
+|`scripting/`, `scripting/impl/`, `scripting/javascript/`, `scripting/python/`, `scripting/spel/`, `scripting/polyglot/`, `scripting/context/`
+|Three engines (GraalVM-based JavaScript, GraalVM-based Python, Spring SpEL) behind one `ScriptManager`. Shared helpers inject `jsonPath(...)` and `xPath(...)` into every engine's context. ~17 files.
+
+|**Expression entities & validation**
+|`scripting/expression/entity/`, `scripting/expression/form/`, `scripting/expression/validation/`
+|An `@Embeddable Expression` (engine name + script body) that admin-configurable rules embed inline, plus a Bean-Validation annotation that compiles the script at save time so invalid expressions never reach the database. ~5 files.
+
+|**Admin UI**
+|`tab/`, `action/`
+|`EntityExternalDataTabController` renders the "External Data" tab on any `DataSourceSubject`; `AbstractQueryDataSourceAction` is the page action that triggers a fresh pull. ~2 files, both abstract — subclassed in the customer project.
+
+|**Provider integrations (bureaus + open banking + auto)**
+|`impl/experian/`, `impl/clarity/`, `impl/plaid/`, `impl/tink/`, `impl/truelayer/`, `impl/ntropy/`, `impl/marketcheck/`
+|Seven vendor stacks. Each has a base `*DataSource` / `*Api` + one or more specific data sources (e.g. Plaid has four — accounts-balance, credit-bank-income, credit-sessions, liabilities). ~486 files, but 440+ of those are generated DTOs.
+
+|**Shared integration utilities**
+|`impl/` (top level)
+|`AccessToken` (common OAuth body) + `DateXmlAdapter`. 2 files, used by all provider stacks.
+
+|**Customer-side extension**
+|*(in `timvero-example`)*
+|`GithubDataSource` + `ParticipantExternalDataTab` show the minimum viable integration — a `MappedDataSource` bean + a `TabController` subclass. The rest is declarative via `application.properties`.
+|===
+
+Three cross-cutting invariants govern everything:
+
+- **Subject-driven, not caller-driven** — a `DataSource<E>` declares its subject type through its generic parameter (`DataSource<PlaidItemSubject>`, `DataSource<Borrower>`, …). `DataSourceManagerImpl.init()` resolves those generics at startup and refuses to serve a data source against a mismatched subject. The call site just passes `(entity, "experian", LoadingMode.QUERY)` — the type safety is enforced once, at wiring time.
+- **One blob per (subject, source)** — `SubjectExternalData` has a natural uniqueness on `(ownerId, type, valid=true)`. When a fresh pull happens, the old row is marked `valid=false` (retained for audit) and a new row is inserted. The gzipped response lives in the general document storage (<<storage>>), so 20 MB credit bureau payloads don't bloat JPA.
+- **Parsing is lazy and MIME-agnostic** — `DataSource.getData()` returns `Content { byte[] body, String mime }`. Only `MappedDataSource<E,T>` knows how to turn those bytes into `T`. The tab controller streams the raw document back to the browser without parsing; the rule engine parses once per evaluation; neither cares about the other.
+
+== Package Map
+
+Every subpackage in `com.timvero.loan.risk`, with file count (`*.java` in that folder, not recursive) and purpose. Read top-to-bottom — the groupings mirror the functional areas above.
+
+[cols="3,1,5", options="header"]
+|===
+|Subpackage |Files |Purpose
+
+3+^|**Core contract + persistence**
+
+|`risk/` (top level) |1 |`ExternalDataService` — the single public facade (`getExternalData`, `getDataSourceRecord`, `invalidateData`, `hasExternalData`, collection-sample wiring).
+|`risk/datasource/` |6 |SPI surface: `DataSource<E>`, `MappedDataSource<E,T>`, `DataSourceManager`, `DataSourceRecord`, `DataSourceSubject`, `DataUnavailableException`, `MappedDataSource`.
+|`risk/datasource/impl/` |2 |`DataSourceManagerImpl` (the cache + dispatcher) and `DataSourceRecordImpl`. Rarely subclassed — the SPI is stable.
+|`risk/entity/` |2 |`SubjectExternalData` JPA entity + its repository. `@HideInDocs` and `@NotTrackable` — this is a framework-internal table.
+
+3+^|**Admin surface**
+
+|`risk/action/` |1 |`AbstractQueryDataSourceAction` — the page action that calls `DataSourceManager.getData(..., LoadingMode.QUERY)`. Subclass per entity type.
+|`risk/tab/` |1 |`EntityExternalDataTabController` — abstract `EntityTabController<UUID, E>`; lists records, streams raw content, invalidates, adds to / removes from the sample collection.
+
+3+^|**Scripting core**
+
+|`risk/scripting/` |4 |The SPI: `ScriptManager`, `ScriptEngine`, `Script`, `ScriptException`.
+|`risk/scripting/impl/` |1 |`ScriptManagerImpl` — discovers all `ScriptEngine` beans at startup and dispatches by name.
+|`risk/scripting/context/` |2 |Cross-engine helpers: `JsonPathConfigurator` registers `jsonPath(...)` as a function/binding in SpEL, JavaScript, and Python. `XPathConfigurator` does the same for `xPath(...)` / `xPathWithNS(...)`.
+
+3+^|**Scripting engines**
+
+|`risk/scripting/polyglot/` |4 |`AbstractPolyglotEngine` + `PolyglotScript` + `PolyglotScriptEngineConfigurator` + `PolyglotScriptEngineHelper`. The GraalVM base — reused by JS and Python.
+|`risk/scripting/javascript/` |1 |`JSScriptEngine` — `latest` ECMAScript, `nashorn-compat=true`, `temporal=true`. Bean name `"javascript"`.
+|`risk/scripting/python/` |1 |`PythonScriptEngine` — delegates to the GraalPy runtime. Bean name `"python"`.
+|`risk/scripting/spel/` |3 |`SpelScriptEngine` + `SpelScript` + `SpelScriptEngineConfigurator`. Spring Expression Language — fastest, most limited. Bean name `"spel"`.
+
+3+^|**Expressions (admin-configurable scripts in entities/forms)**
+
+|`risk/scripting/expression/` |0 |(package-info only)
+|`risk/scripting/expression/entity/` |1 |`Expression` — `@Embeddable` holding `{engineName, expression}`. Embed in any JPA entity that needs a user-editable rule.
+|`risk/scripting/expression/form/` |2 |`ExpressionForm` + `ExpressionFormMapper` (MapStruct). Form-layer twin of the entity.
+|`risk/scripting/expression/validation/` |2 |`@Expression` constraint annotation + `ExpressionValidator` — compiles the script via `ScriptManager.compile(...)` at bean-validation time. Saves-with-invalid-script is impossible.
+
+3+^|**Provider: Experian (UK credit bureau, REST/JSON)**
+
+|`risk/impl/experian/` |3 |`ExperianDataSource<E>` (`MappedDataSource<E, Output>`), `ExperianApi` (RestTemplate base), `ExperianOAuthService` (`@ConditionalOnProperty("experian.api.clientId")` — absent config falls back to classpath test files).
+|`risk/impl/experian/json/` |253 |Jackson DTOs for the Experian response schema — `Applicant`, `Bureau`, `CAIS` (shared credit), `CAPS` (previous searches), `Delphi` score blocks, `Fraud` indicators, `Residence`, etc. Almost entirely generated.
+
+3+^|**Provider: Clarity (US sub-prime bureau, REST/XML)**
+
+|`risk/impl/clarity/` |1 |`AbstractClarityDataSource<E, T extends InquiryResponse>` — JAXB marshalling, posts an `Inquiry` XML envelope with username/password, unmarshals to a typed `InquiryResponse`.
+|`risk/impl/clarity/xml/` |0 |(package-info only)
+|`risk/impl/clarity/xml/inquiry/` |38 |`Inquiry`, `InquiryResponse`, `InquiryPurposeType`, fraud/income/housing/payment enums, XML adapters.
+|`risk/impl/clarity/xml/inquiry/attributes/` |67 |`Clear*` attribute pack — `C48Inquiries`, `CC1AmountOfLoansLatePayment`, … — the pre-computed summary vectors Clarity ships.
+|`risk/impl/clarity/xml/inquiry/creditproduct/` |4 |`ClearCreditRiskModel`, `ClearAutoRiskModel` — product-specific risk-score envelopes.
+|`risk/impl/clarity/xml/inquiry/fraudinsight/` |8 |`ClearFraudInsight*` — standalone fraud-only call structure.
+
+3+^|**Provider: Plaid (US open banking, REST/JSON)**
+
+|`risk/impl/plaid/` |3 |`BasePlaidApiProdImpl` (headers: `PLAID-CLIENT-ID`, `PLAID-SECRET`), `PlaidItemSubject` (gives `getPlaidAccessToken()`), `PlaidUserSubject`.
+|`risk/impl/plaid/accountsbalance/` |4 |`AccountsBalanceDataSource` + `Api` interface + dev/prod impls. Bean name `"plaid-accounts-balance"`.
+|`risk/impl/plaid/creditbankincome/` |4 |Plaid Credit Bank Income product. Bean name `"plaid-credit-bank-income"`.
+|`risk/impl/plaid/creditsessions/` |4 |Plaid Credit Sessions (short-lived user flows). Bean name `"plaid-credit-sessions"`.
+|`risk/impl/plaid/liabilities/` |4 |Plaid Liabilities (loan account metadata). Bean name `"plaid-liabilities"`.
+
+3+^|**Provider: Tink (EU open banking, REST/JSON)**
+
+|`risk/impl/tink/` |3 |`TinkDataSource` (`@Service("tink")`, `@ConditionalOnBean(TinkApi.class)`), `TinkApi`, `TinkDataSourceSubject`. Subject contract: `getTinkReportId()` + `getTinkReportValidTo()` — Tink pre-generates reports; the SDK just fetches by id.
+|`risk/impl/tink/json/` |20 |`Response`, `Account`, `Transaction`, `UserInfo`, `Party`, etc.
+
+3+^|**Provider: Truelayer (EU open banking, REST/JSON)**
+
+|`risk/impl/truelayer/` |3 |`BaseTruelayerDataSource<S, R>` (`ResolvableType`-based generic type resolution → caller doesn't pass `getType()`), `BaseTruelayerApiProdImpl`, `TruelayerSubject` (`getTruelayerRefreshToken()`).
+|`risk/impl/truelayer/accountbalance/` |4 |Account balance snapshot.
+|`risk/impl/truelayer/accounts/` |4 |Account list + metadata.
+|`risk/impl/truelayer/cardbalance/` |4 |Card balance snapshot.
+|`risk/impl/truelayer/cards/` |4 |Card list + metadata.
+|`risk/impl/truelayer/transactionspending/` |4 |Pending transactions (authorised, unsettled).
+|`risk/impl/truelayer/json/` |13 |Shared Truelayer DTOs (response envelope, error, pagination).
+|`risk/impl/truelayer/json/util/` |1 |`TruelayerJsonUtils` — the shared `ObjectMapper` with custom modules.
+
+3+^|**Provider: Ntropy (transaction enrichment, REST/JSON)**
+
+|`risk/impl/ntropy/` |3 |`BaseNtropyDataSource<R>` (generic response type), `NtropyApi`, `NtropySubject` (`getAccountHolderId()`).
+|`risk/impl/ntropy/accountholder/` |4 |Account holder enrichment (demographics from transaction patterns).
+|`risk/impl/ntropy/bankstatements/` |4 |Bank statement ingestion.
+|`risk/impl/ntropy/bankstatementstransactions/` |4 |Per-transaction categorisation over an ingested statement.
+|`risk/impl/ntropy/json/` |16 |Ntropy DTOs — category hierarchies, merchant normalisation, amount signs.
+|`risk/impl/ntropy/json/util/` |1 |`NtropyJsonUtils` — shared `ObjectMapper`.
+
+3+^|**Provider: Marketcheck (US auto pricing, REST/JSON)**
+
+|`risk/impl/marketcheck/` |3 |`MarketcheckDataSource` (shared `ObjectMapper`), `MarketcheckApi`, `MarketcheckCarSubject` (`getVin()`, `getMiles()`).
+|`risk/impl/marketcheck/carhistory/` |4 |Vehicle history (accidents, owners, title).
+|`risk/impl/marketcheck/carhistory/json/` |1 |Shared history DTO.
+|`risk/impl/marketcheck/usedcarprice/` |4 |Used-car price estimator (collateral valuation for auto loans).
+|`risk/impl/marketcheck/usedcarprice/json/` |3 |Price point DTOs.
+
+3+^|**Shared provider-side scaffolding**
+
+|`risk/impl/` (top level) |2 |`AccessToken` (generic OAuth `client_credentials` / `password` body — used by Experian, Plaid, Truelayer, Tink), `DateXmlAdapter` (JAXB `xs:date` ↔ `LocalDate`).
+|===
+
+== Architecture Overview
+
+[source]
+----
+            ┌────────────────────────────────────────────────────┐
+            │  Caller (checker, offer rule, BPMN task, UI tab)   │
+            └──────────────────────┬─────────────────────────────┘
+                                   │ getDataSourceRecord(subject, "experian")
+                                   ▼
+            ┌────────────────────────────────────────────────────┐
+            │  ExternalDataService  (thin facade)                │
+            │  ─ getExternalData(subject)  → list of records     │
+            │  ─ getDataSourceRecord(subject, name) → one record │
+            │  ─ invalidateData / addToCollection                │
+            └──────────────────────┬─────────────────────────────┘
+                                   │
+                                   ▼
+            ┌────────────────────────────────────────────────────┐
+            │  DataSourceManager (DataSourceManagerImpl)         │
+            │  · Validates subject type ↔ data source generic    │
+            │  · Reads SubjectExternalData (owner_id, type)      │
+            │  · Branches on LoadingMode + lifespan + primaryId  │
+            │  · On miss/force: dataSource.getData(subject)      │
+            │                   → gzip → DocumentStorage         │
+            │                   → new SubjectExternalData row    │
+            └──────────────────────┬─────────────────────────────┘
+                                   │
+           ┌───────────────────────┼────────────────────────┐
+           │                       │                        │
+           ▼                       ▼                        ▼
+  DataSource<Borrower>    DataSource<PlaidItemSubject>   DataSource<...>
+      "experian"               "plaid-liabilities"           "github"
+         │                          │                          │
+         └─► RestTemplate ────────► (vendor API)  ◄──────── RestTemplate
+                                        │
+                                        │  raw bytes + MIME
+                                        ▼
+                             SubjectExternalData
+                                ownerId ─► UUID (the subject)
+                                type    ─► data source bean name
+                                document ─► gzipped Document
+                                valid   ─► true (exactly one per pair)
+                                primaryId ─► external correlation id
+                                              (SSN, VIN, tax id)
+                                              used as a cache key
+
+            ─── parallel path: scripting / expressions ───
+
+            ┌────────────────────────────────────────────────────┐
+            │  ScriptManager (ScriptManagerImpl)                 │
+            │  ─ compile(engine, source) → Script                │
+            │  ─ compile(Expression) → Script                    │
+            └──────────────────────┬─────────────────────────────┘
+                                   │
+           ┌───────────────────────┼───────────────────────┐
+           │                       │                       │
+           ▼                       ▼                       ▼
+    SpelScriptEngine       JSScriptEngine           PythonScriptEngine
+      (Spring SpEL)      (GraalVM Polyglot)         (GraalVM Polyglot)
+           │                       │                       │
+           └──────── global bindings ──────────────────────┘
+                        ▲        ▲
+                        │        │
+             JsonPathConfigurator   XPathConfigurator
+              (registers "jsonPath")  (registers "xPath" / "xPathWithNS")
+----
+
+The two halves are independent — scripting doesn't know what a `DataSourceRecord` is. They meet at the consumer layer: a checker, offer rule, or BPMN script task is handed both `subject` and a compiled `Script`, it calls `ExternalDataService.getDataSourceRecord(subject, "experian")`, parses the record via `MappedDataSource.parseRecord(...)`, and passes the parsed object into the script's `bindings`.
+
+== Core Subsystems — Deep Dive
+
+Eight subpackages earn their own section below. The selection criteria: (1) every public SPI interface lives here, (2) the admin tab / action pipeline routes through here, (3) these are the only subpackages a customer project extends directly (the provider DTOs are just deserialization targets).
+
+=== 1. `risk/datasource/` — the SPI
+
+Six files, zero optional. A customer project implementing a new vendor hits exactly this surface.
+
+[source,java]
+----
+public interface DataSource<E> {
+    default Period lifespan() { return Period.ZERO; }   // <1>
+    Content getData(E subject) throws Exception;        // <2>
+
+    class Content {
+        private final byte[] body;
+        private final String mime;
+        /* ... */
+    }
+}
+----
+<1> `Period.ZERO` = unlimited. Any non-zero period gets compared against `SubjectExternalData.getRequestedAt()` + `lifespan` — past that instant, the next `QUERY` mode call triggers a refresh.
+<2> Throws `Exception` on purpose. Checked exceptions (`IOException`), unchecked ones (`DataUnavailableException`), and vendor-library custom exceptions all flow through; `DataSourceManagerImpl.queryDataSource(...)` narrows to the three canonical failures (`IOException`, `DataUnavailableException`, `ExternalServiceUnavailableException`) and wraps anything else.
+
+`MappedDataSource<E, T>` extends `DataSource<E>` with parsing:
+
+[source,java]
+----
+public interface MappedDataSource<E, T> extends DataSource<E> {
+    Class<T> getType();
+    T parseRecord(Content data) throws IOException;
+}
+----
+
+Every vendor integration in `impl/*` implements `MappedDataSource`. Raw `DataSource` implementations exist (Plaid variants, for example) when the caller only wants to stream bytes (to a document template, to a UI preview) without incurring a parse.
+
+`DataSourceSubject` is the marker every `DataSource` generic bound narrows to:
+
+[source,java]
+----
+public interface DataSourceSubject extends Persistable<UUID> {
+    String getPrimaryId();
+}
+----
+
+`getPrimaryId()` is the external correlation id — SSN for credit bureaus, VIN for Marketcheck, application-number for Experian UK. The cache is keyed on `(ownerId, type, valid=true)` but validity also checks that `primaryId` hasn't changed — if the borrower corrects their SSN, the next `QUERY` will refetch rather than serve the stale bureau pull.
+
+`DataSourceRecord` is the read model:
+
+[source,java]
+----
+public interface DataSourceRecord {
+    UUID getKey();
+    String getDataSourceName();
+    Instant getLoadDate();
+    boolean isActual();
+    DocumentResource getRawData() throws IOException;
+    Object getData() throws IOException;   // returns T when MappedDataSource
+}
+----
+
+`isActual()` = cache row alive AND within `lifespan`. `getData()` runs `parseRecord(...)` on first call, not on record construction — so a tab listing 20 records doesn't parse 20 vendor payloads.
+
+`DataUnavailableException` is the canonical "not a bug, just no answer" exception. `AbstractQueryDataSourceAction` converts it into a `WARNING` alert; checker code treats it as "data source skipped, fall through to the next evidence source."
+
+=== 2. `risk/datasource/impl/` — `DataSourceManagerImpl`
+
+The single most load-bearing class in the module. Everything about caching, validity, and type safety lives here:
+
+[source,java]
+----
+@Service
+public class DataSourceManagerImpl implements DataSourceManager {
+
+    @Autowired(required = false)
+    private Map<String, DataSource> dataSources;     // <1>
+
+    private Map<String, Class<?>> dataSourceSubjectClasses;   // <2>
+
+    @PostConstruct
+    private void init() {
+        dataSources = dataSources == null ? Map.of() : Map.copyOf(dataSources);
+        dataSourceSubjectClasses = dataSources.entrySet().stream()
+            .collect(Collectors.toMap(Map.Entry::getKey,
+                e -> ResolvableType.forClass(DataSource.class, e.getValue().getClass())
+                    .getGeneric(0).resolve()));   // <3>
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public <E extends DataSourceSubject> Optional<DataSourceRecord> getData(
+            E subject, String dataSourceName, LoadingMode mode) throws IOException {
+        Class<?> aClass = EntityUtils.getClassWithoutInitializingProxy(subject);
+        Assert.isTrue(dataSources.containsKey(dataSourceName), /* ... */);   // <4>
+        Assert.isTrue(dataSourceSubjectClasses.get(dataSourceName).isAssignableFrom(aClass),
+            "Datasource \"" + dataSourceName + "\" doesn't support subject {" + aClass + "}");
+
+        SubjectExternalData existing = dataRepository
+            .findByOwnerIdAndTypeAndValidTrue(subject.getId(), dataSourceName).orElse(null);
+
+        if (mode != LoadingMode.READ && (mode == LoadingMode.FORCE
+                || !isValid(existing, subject.getPrimaryId())
+                || !isAlive(existing, dataSource))) {
+            if (existing != null) existing.setValid(false);       // <5>
+            Content content = queryDataSource(subject, dataSource);
+            existing = saveRecord(existing, subject, dataSourceName, content);
+        }
+        /* wrap + return */
+    }
+}
+----
+<1> `@Autowired(required = false) Map<String, DataSource>` — every bean of type `DataSource` across all modules lands here keyed by bean name. That bean name is the `dataSourceName` the caller passes. Convention: kebab-case, namespaced by vendor (`"plaid-liabilities"`, not `"liabilities"`).
+<2> A precomputed registry: bean name → subject class. Used for the `isAssignableFrom` check.
+<3> **This is the most important line in the module.** `ResolvableType.forClass(DataSource.class, e.getValue().getClass()).getGeneric(0).resolve()` extracts the actual `E` parameter from each `DataSource<E>` implementation. No runtime reflection guesswork — Spring's `ResolvableType` walks the generic chain. An incorrectly typed `DataSource<Object>` will resolve to `null` and break at first call.
+<4> Two asserts, both `IllegalArgumentException`: unknown name, or wrong subject. The wrong-subject case is the one most often hit in development — someone passes an `Application` to a data source generic'd on `Participant`. Fail fast, fail loud.
+<5> The old row is kept (`valid=false`) — never deleted. Audit requirements demand "what did we see on 2024-06-12?" answerable months later.
+
+`isValid` + `isAlive` are two separate checks:
+
+[source,java]
+----
+private boolean isValid(SubjectExternalData data, String primaryId) {
+    return data != null && data.isValid() && primaryId.equals(data.getPrimaryId());
+}
+
+private boolean isAlive(SubjectExternalData d, DataSource<E> ds) {
+    return ds.lifespan().isZero()
+        || d.getRequestedAt().plus(ds.lifespan()).isBefore(Instant.now());
+}
+----
+
+`isValid` catches "subject's `primaryId` changed" — e.g. the participant corrected their SSN, we need a new pull. `isAlive` catches "data too old for this source" — credit bureau data expires after 30 days per regulatory convention; the `lifespan()` on the `DataSource` declares how old is too old.
+
+=== 3. `risk/entity/` — `SubjectExternalData`
+
+Four fields carry the whole cache. Read this entity once; you'll never touch it again.
+
+[source,java]
+----
+@Entity @HideInDocs @NotTrackable
+public class SubjectExternalData extends UUIDPersistable {
+    @Column(nullable = false)  private UUID ownerId;           // <1>
+    @Column(nullable = false)  private Instant requestedAt;
+    @Column(name = "data_type", nullable = false) private String type;
+    @OneToOne(fetch = FetchType.EAGER) @Fetch(FetchMode.JOIN)
+    @JoinColumn(name = "document_id", nullable = false)
+    private Document document;                                 // <2>
+    @Column(name = "social") private String primaryId;         // <3>
+    @Column(nullable = false) private boolean valid = true;
+}
+----
+<1> `ownerId` is the subject's UUID. Not a foreign key — intentionally. The risk module doesn't know anything about `Participant` vs `Application` vs `Asset`; ownership is by UUID only.
+<2> `@OneToOne` + `FetchMode.JOIN` — the tab listing renders the file name and MIME type, which live on `Document`. N+1 avoidance.
+<3> Column is literally named `social`. Yes, originally SSN-shaped. Now holds any external primary id. Rename considered, never executed — would break every audit query.
+
+`@HideInDocs` hides it from the generated docs module (<<data-model>>). `@NotTrackable` disables the cross-entity reload/tracking system (<<reload-infrastructure>>) — the risk module is an implementation detail, not part of the domain model.
+
+The repository is three methods, all derived-name queries:
+
+[source,java]
+----
+boolean existsByOwnerId(UUID ownerId);
+List<SubjectExternalData> findAllByOwnerId(UUID ownerId);
+Optional<SubjectExternalData> findByOwnerIdAndTypeAndValidTrue(UUID ownerId, String type);
+----
+
+The third one is the cache lookup — constrained by `valid=true` so invalidated rows are invisible to everything except audit reports.
+
+=== 4. `risk/scripting/` — the engine SPI
+
+Three interfaces. Every customer-configured rule in the entire SDK funnels through them.
+
+[source,java]
+----
+public interface ScriptEngine {
+    String getName();                           // "javascript", "python", "spel"
+    Script compile(String script) throws ScriptException;
+}
+
+public interface Script extends AutoCloseable {
+    Object eval(Map<String, ?> bindings) throws ScriptException;
+    <T> T eval(Map<String, ?> bindings, Class<T> targetClass) throws ScriptException;
+    @Override void close() throws ScriptException;
+}
+
+public interface ScriptManager {
+    Collection<String> getEngineNames();
+    Script compile(String engine, String script) throws ScriptException;
+    Script compile(Expression expression) throws ScriptException;   // <1>
+}
+----
+<1> The `Expression` overload is the admin-path call — used when a script is coming out of `@Embeddable Expression` (see §6).
+
+`ScriptManagerImpl` is 20 lines: it autowires `List<ScriptEngine>`, sorts into a `TreeMap` by name, dispatches. Engines register themselves with `@Service` — that's it.
+
+`Script extends AutoCloseable` is non-obvious. GraalVM `Context` objects hold native memory; not closing them leaks. Callers **must** use `try (Script s = manager.compile(...))`. `SpelScript.close()` is a no-op; `PolyglotScript.close()` releases the underlying `Context`.
+
+=== 5. `risk/scripting/polyglot/` + `javascript/` + `python/` — GraalVM engines
+
+`AbstractPolyglotEngine` is 100 lines that both `JSScriptEngine` and `PythonScriptEngine` extend with about 15 lines each:
+
+[source,java]
+----
+public abstract class AbstractPolyglotEngine implements ScriptEngine {
+
+    @Value("${application.timezone:UTC}") private String timezone;
+    private final SimpleBindings globalBindings = new SimpleBindings();
+
+    @Autowired(required = false)
+    public void setConfigurators(List<PolyglotScriptEngineConfigurator> configurators) {
+        if (configurators != null)
+            configurators.forEach(c -> c.configContext(this.globalBindings));
+    }
+
+    protected abstract String getLanguage();         // "js" or "python"
+    protected abstract Context.Builder contextBuilder();
+
+    @Override
+    public synchronized Script compile(String script) throws ScriptException {
+        Context context = null;
+        try {
+            context = createContext();
+            for (Map.Entry<String, Object> entry : globalBindings.entrySet()) {
+                context.getBindings(getLanguage()).putMember(entry.getKey(), entry.getValue());
+            }
+            Source source = Source.create(getLanguage(), script);
+            context.parse(source);
+            return new PolyglotScript(context, source);
+        } catch (PolyglotException e) {
+            if (context != null) context.close();
+            throw convert(e);
+        }
+    }
+}
+----
+
+Two extension points:
+
+1. **`PolyglotScriptEngineConfigurator`** — register global bindings (functions, helpers) that appear as identifiers in every script. `JsonPathConfigurator` and `XPathConfigurator` implement both this and the SpEL variant, so `jsonPath(doc, "$.applicant.name")` works identically in JS, Python, and SpEL.
+2. **`contextBuilder()`** — engine-specific options. `JSScriptEngine` enables `nashorn-compat` (legacy `java.lang` access), ECMAScript `latest`, and `temporal` (Temporal API proposal). `PythonScriptEngine` runs pristine GraalPy.
+
+`PolyglotScript.eval()` injects the caller's bindings on every evaluation (not compile-time — bindings change per call):
+
+[source,java]
+----
+public <T> T eval(Map<String, ?> bindings, Class<T> targetClass) throws ScriptException {
+    bindings.forEach((k, v) -> context.getBindings(source.getLanguage()).putMember(k, v));
+    return context.eval(source).as(targetClass);
+}
+----
+
+`PolyglotScriptEngineHelper` is the type-coercion utility script authors usually don't realise they need:
+
+[source,java]
+----
+public static LocalDate toLocalDate(Value v) { /* isDate / isInstant / isString / isHostObject */ }
+public static BigDecimal toBigDecimal(Value v) { /* isNumber / isString / isHostObject(BigDecimal|Number) */ }
+----
+
+GraalVM `Value` is a polymorphic wrapper — a `Value.isNumber()` is `true` for Python `int`, Python `float`, JS `Number`, Java `BigDecimal`, … — the helpers paper over that.
+
+=== 6. `risk/scripting/spel/` — Spring Expression Language
+
+`SpelScriptEngine` is 50 lines. Important because **SpEL is the default for admin forms** — smallest dependency footprint, safest sandbox, the syntax users already know from `@PreAuthorize` and `@Value`.
+
+[source,java]
+----
+@Service
+public class SpelScriptEngine implements ScriptEngine {
+    public static final String NAME = "spel";
+
+    @Autowired(required = false)
+    private List<SpelScriptEngineConfigurator> configurators;
+
+    private final ExpressionParser parser = new SpelExpressionParser();
+
+    @Override
+    public Script compile(String script) throws ScriptException {
+        Expression expression;
+        try {
+            expression = parser.parseExpression(script);
+        } catch (ParseException e) {
+            throw convert(e);
+        }
+        StandardEvaluationContext context = new StandardEvaluationContext();
+        if (configurators != null) configurators.forEach(c -> c.configContext(context));
+        context.addPropertyAccessor(new MapAccessor());    // <1>
+        return new SpelScript(expression, context);
+    }
+}
+----
+<1> `MapAccessor` so that `bindings['key']` and `bindings.key` both work — same author experience whether the binding is an object or a map.
+
+`SpelScriptEngine.convert(ExpressionException)` centralizes the awful SpEL error format into `ScriptException(fileName, lineNumber, columnNumber, message)` so form validation can highlight the offending character.
+
+=== 7. `risk/scripting/expression/*` — persistable, validated scripts
+
+Three packages that turn a `String script` stored in a database column into a compile-checked domain object.
+
+[source,java]
+----
+@Embeddable @HideInDocs
+public final class Expression {
+    @Column(name = "expression", nullable = false, columnDefinition = TEXT)
+    private String expression;
+
+    @Column(name = "engine_name", nullable = false)
+    private String engineName;
+    /* getters + setters */
+}
+----
+
+Embed in any entity that wants a user-editable rule (offer eligibility, feature rule, BPMN precondition). Two columns; both non-null. Never versioned on the entity — if you need history, audit the wrapping entity.
+
+The form twin:
+
+[source,java]
+----
+@Expression    // <-- the validator annotation
+public final class ExpressionForm {
+    @NotBlank private String expression;
+    @NotBlank private String engineName;
+    /* getters + setters + equals + hashCode */
+}
+----
+
+And the `@Expression` constraint:
+
+[source,java]
+----
+@Component
+public final class ExpressionValidator implements ConstraintValidator<Expression, ExpressionForm> {
+
+    @Autowired private ScriptManager scriptManager;
+    @Autowired private ExpressionFormMapper expressionFormMapper;
+
+    @Override
+    public boolean isValid(ExpressionForm form, ConstraintValidatorContext context) {
+        if (StringUtils.hasText(form.getExpression()) && StringUtils.hasText(form.getEngineName())) {
+            try (Script script = scriptManager.compile(expressionFormMapper.createEntity(form))) {
+                return true;     // <1>
+            } catch (ScriptException e) {
+                String message = HtmlUtils.htmlEscape(e.getMessage()).replace("\n", "<br/>");
+                context.disableDefaultConstraintViolation();
+                context.buildConstraintViolationWithTemplate(message).addConstraintViolation();
+                return false;
+            }
+        }
+        return true;
+    }
+}
+----
+<1> Compile-and-discard — we're proving the script parses, not running it. `try (Script)` ensures GraalVM contexts don't leak during form rendering.
+
+This is the single most valuable pattern in the module. Admin UI saves a new rule → the servlet validator calls `ScriptManager.compile(...)` before the row hits the database. Bad syntax? Rendered as a red error under the textarea, with the error's `ScriptException.getMessage()` HTML-escaped. No runtime surprise at 3 AM when the rule first executes.
+
+=== 8. `risk/impl/*` — the provider integrations
+
+All seven providers converge on the same five-file pattern — a customer project adding an eighth provider follows it:
+
+[cols="1,3", options="header"]
+|===
+|File |Role
+
+|`*Subject.java` |Marker interface the caller's entity must implement. Declares the vendor-specific correlation fields (`getPlaidAccessToken()`, `getTinkReportId()`, `getVin()`). Multiple entities can implement the same subject — `Borrower` and `Participant` both `implements PlaidItemSubject`, both reachable by the same `DataSource<PlaidItemSubject>` bean.
+
+|`*Api.java` |Interface (sometimes: base class with `RestTemplate` pre-configured). One method per endpoint the data sources need. Allows a dev-mode impl that reads from the classpath and a prod-mode impl that hits the vendor.
+
+|`*ApiProdImpl.java` |Real vendor call. Uses `RestTemplate` with `LogBodyInterceptor` (from `ground`) for audit logs. Credentials from `@Value` properties. `@ConditionalOnProperty(...)` ensures the bean only exists in environments configured for it.
+
+|`*ApiDevImpl.java` |Classpath stub — reads from `src/main/resources/fixtures/<vendor>/...`. Lets integration tests and QA environments run without calling the vendor.
+
+|`*DataSource.java` |Thin `DataSource<Subject>` / `MappedDataSource<Subject, Response>` that delegates to `*Api`. The only file that registers the bean name (via `@Service("plaid-liabilities")`) and implements the `getData(subject)` → `Content` contract.
+|===
+
+Experian is the odd one out — one big `ExperianDataSource<E>` per application flow, subclassed per subject type (the subclass supplies `fillData(subject)` — mapping application fields into the Experian request envelope). See `impl/experian/ExperianDataSource.java` for the template.
+
+Clarity uses JAXB instead of Jackson, `@PostConstruct` builds the `JAXBContext` from `Inquiry.class` + the parameterized response class (via `ResolvableType` — same trick as Truelayer).
+
+Truelayer + Ntropy use `ResolvableType.forClass(BaseXxxDataSource.class, getClass()).getGeneric(1).resolve()` to auto-derive the response class — so subclasses just write `class AccountsBalanceDataSource extends BaseTruelayerDataSource<TruelayerSubject, AccountsBalanceResponse>` and `getType()` is done.
+
+The massive file counts in `impl/experian/json/` (253), `impl/clarity/xml/inquiry/attributes/` (67), and `impl/clarity/xml/inquiry/` (38) are **pure data transfer objects** — Jackson or JAXB bindings for the vendor's wire format. They're generated from OpenAPI / XSD and maintained by vendor-API version bumps; application code rarely touches more than a handful.
+
+== Integration Points
+
+The risk subsystem sits at the junction of every downstream decision module. Everything connects here:
+
+[source]
+----
+                    ┌────────────────────────────────────────┐
+                    │         DataSourceSubject              │
+                    │     (Borrower, Application, …)         │
+                    └────┬──────────┬──────────┬─────────────┘
+                         │          │          │
+                         │          │          │  implements
+                         ▼          ▼          ▼
+                  PlaidItemSubject  TinkDataSourceSubject  NtropySubject  ...
+                         │          │          │
+                         └────┬─────┴──────────┘
+                              │    (subject-type generic binding)
+                              ▼
+                    ┌────────────────────────────┐
+                    │    DataSourceManager       │
+                    └────┬────────┬───────┬──────┘
+                         │        │       │
+           ┌─────────────┘        │       └───────────────────────┐
+           ▼                      ▼                               ▼
+ ┌─────────────────┐   ┌──────────────────────┐       ┌─────────────────────┐
+ │ Checker         │   │  Offer rule          │       │ BPMN script task    │
+ │ (validation /   │   │  (scoring feeds      │       │ (Decision process)  │
+ │  signal)        │   │   eligibility)       │       │                     │
+ │ see <<checkers>>│   │ see <<offer-engine>> │       │ see                 │
+ │                 │   │                      │       │ <<flowable-internals│
+ └───────┬─────────┘   └────────┬─────────────┘       │      ,decision ctx>>│
+         │                      │                     └────┬────────────────┘
+         │                      │                          │
+         │                      ▼                          ▼
+         │              ┌──────────────┐            DecisionFact / DecisionFactValue
+         │              │ FeatureStore │                (admin-described outcomes)
+         │              │ (risk        │
+         │              │  features)   │
+         │              │ see          │
+         │              │ <<feature-   │
+         │              │  service>>   │
+         │              └──────────────┘
+         ▼
+   ProcessExecution / HasPendingDecisions
+     (pending decisions on the launchpad, see <<launchpad>>)
+
+
+           ─── scripting half of the subsystem ───
+
+  Admin UI (form)   →    Expression   →    ExpressionValidator   →   ScriptManager.compile
+                                                         (runtime)            │
+                                                                              ▼
+  Entity storage  (@Embeddable Expression, engine+source)  ←  persisted only if valid
+                                                                              │
+                                                                              ▼
+       BPMN process variable / checker rule / offer condition uses Script.eval(bindings)
+----
+
+**Three concrete integration edges:**
+
+1. **Offer engine** (<<offer-engine>>) — scoring feeds offers. An offer rule resolves `ExternalDataService.getDataSourceRecord(borrower, "experian")`, parses to `Output`, extracts credit score, compares to a `MappedCondition` threshold. The risk subsystem doesn't know an offer exists; the offer rule imports `ExternalDataService` + the Experian DTOs it cares about. No circular dependency.
+2. **Feature service** (<<feature-service>>) — risk features. Risk data lands in the feature store as computed features (`borrower.credit_score`, `applicant.income_band`). A feature provider reads the parsed risk record, emits typed features, and the rest of the pipeline branches on features — not on raw provider output. This decouples the consumer from vendor-specific schemas.
+3. **Decision context** (<<flowable-internals>>) — BPMN tasks. A Flowable script task receives the evaluated subject as a process variable; the task body calls `externalDataService.getDataSourceRecord(subject, ...)`, then emits a `DecisionFact` via `DecisionFactValue`. The `ScriptManager` / `@Expression` pipeline is how admin-configured gateway conditions are evaluated — the expression body lives in a `FixedDecisionFact` or equivalent configuration row and runs per execution.
+
+Two less obvious edges:
+
+- **Document templates** (<<document-templates>>) — the "External Data" tab can "add to collection," meaning the current `SubjectExternalData.document` is copied into `DocumentResponseSampleManager`. The response sample collection becomes the training corpus for document-based features (OCR, classification). This is the only write path from the risk subsystem into the storage subsystem beyond the cache itself.
+- **Entity actions** (<<entity-actions>>) — `AbstractQueryDataSourceAction` implements `EntityActionController` so every entity that wants a manual "refresh data" button just subclasses it with an `isAvailable(entity, user)` predicate. Role-gated via `getRole()` from the tab (`_INVALIDATE`, `_COLLECTION` suffixes).
+
+== Advanced Patterns
+
+=== Pattern 1 — `QUERY` vs `FORCE` vs `READ` triage
+
+Choose mode based on who's calling:
+
+- **`READ`** — UI tabs, dashboards, feature recomputation on schedule. Never calls the vendor. Answers "what did we get last time?" A 10-record listing is 10 `READ` calls that never touch the network.
+- **`QUERY`** — The default for checkers, offer rules, BPMN script tasks. Cache if fresh, otherwise fetch. `lifespan()` is the boundary. Most consumers want `QUERY`.
+- **`FORCE`** — Only operator-triggered. The "query now" button in the tab, a retry after a failed attempt. Always calls the vendor, always charges a cost. Gate behind `_FORCE` or equivalent role.
+
+If a checker calls `FORCE` in a hot path, you've spent real money per request. If a checker calls `READ` and gets empty, you've silently skipped the signal. The only always-correct default for automated callers is `QUERY`.
+
+=== Pattern 2 — `primaryId` as a stealth cache key
+
+`SubjectExternalData.primaryId` is what makes "correct the SSN, next call refetches" work without any cache-bust signaling. The contract:
+
+- `DataSourceSubject.getPrimaryId()` returns the vendor-facing identity (SSN, VIN, tax id). Not the subject UUID — the UUID never changes.
+- Stored with the cached row.
+- Compared to the current `subject.getPrimaryId()` on every `getData()`. Mismatch → the row is invalid.
+
+Consequence: correctness of the cache depends on `getPrimaryId()` being both **stable for the same entity** and **sensitive to every field that affects the external query**. If the vendor's reply depends on address + SSN, `getPrimaryId()` should include both (concatenated, hashed, whatever) — otherwise an address change leaves stale bureau data served.
+
+=== Pattern 3 — dev/prod API switching without profiles
+
+All the `impl/*` provider stacks ship a `*ApiDevImpl` + `*ApiProdImpl` pair. Observing them, the `*ApiProdImpl` is almost always `@ConditionalOnProperty("<vendor>.api.clientId")` (or similar) — in environments where credentials aren't configured, the prod bean doesn't exist; Spring falls back to the dev stub.
+
+This lets a PR reviewer run `./mvnw spring-boot:run` with no config changes and exercise the full rule pipeline using fixtures on the classpath — never hitting the vendor. Setting `experian.api.clientId` in production flips the same beans to real calls. **No profiles, no feature flags** — just conditional beans wired to config keys.
+
+When writing a new provider, follow the pattern: `@ConditionalOnProperty` on the prod bean, a dev bean as default. Then configure one property to swap.
+
+=== Pattern 4 — `@Expression` for admin-configurable rules
+
+The "safest" way to accept user-authored rules is:
+
+[source,java]
+----
+@Entity
+public class OfferEligibilityRule {
+
+    @Valid                       // <-- propagate @Expression validation from the form
+    @Embedded
+    private Expression condition;
+
+    @Column private String description;
+}
+
+// form-side
+public class OfferEligibilityRuleForm {
+    @Valid
+    private ExpressionForm condition;   // @Expression already on the class
+    // ...
+}
+----
+
+The `@Expression` validator refuses to persist a rule whose body doesn't compile. Combined with `ScriptManagerImpl.compile(Expression)`, runtime evaluation never sees a syntax error — only semantic / runtime failures (null bindings, type mismatches) remain. Log those with the `ScriptException.getScriptExceptionDetails()` helper for the line:column hint.
+
+=== Pattern 5 — cross-engine helpers via dual-interface configurators
+
+`JsonPathConfigurator` and `XPathConfigurator` each implement **both** `PolyglotScriptEngineConfigurator` and `SpelScriptEngineConfigurator`:
+
+[source,java]
+----
+@Component
+public class JsonPathConfigurator
+    implements PolyglotScriptEngineConfigurator, SpelScriptEngineConfigurator {
+
+    @Override public void configContext(StandardEvaluationContext context) {
+        context.registerFunction("jsonPath", jsonPathMethod);
+    }
+
+    @Override public void configContext(SimpleBindings globalBindings) {
+        globalBindings.put("jsonPath", jsonPath);
+    }
+}
+----
+
+Net effect: a rule author writes `jsonPath(doc, "$.applicant.name")` in SpEL, JavaScript, or Python — same call, same semantics. Follow this pattern when adding cross-engine utilities (e.g. a `formatCurrency(amount, locale)` you want available everywhere).
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Name data source beans with the vendor as a prefix** (`plaid-liabilities`, `truelayer-accounts`) — `DataSourceManagerImpl` lists them to admins via `getAvailable(class)`, and the vendor prefix keeps the admin tab readable
+* {ok} **Implement `DataSourceSubject` at the smallest entity that carries the correlation id** — not at a domain-root aggregate. Multiple entities can implement the same subject interface; keep the contract narrow
+* {ok} **Set `lifespan()` on every credit-bureau data source** to the vendor's allowed age — typical: 30 or 90 days. Forgetting it means every `QUERY` hits the vendor, costing money
+* {ok} **Use `try (Script s = manager.compile(...))`** — `PolyglotScript` holds a GraalVM `Context`; forgetting `.close()` leaks native memory proportional to script count
+* {ok} **Embed `Expression` in entities that hold admin-editable rules** plus `@Valid` on the owning form; the bean-validator compile-check prevents bad rules reaching production
+* {ok} **Subclass `EntityExternalDataTabController` for every `DataSourceSubject` entity type** — one line per entity; the tab auto-populates from `DataSourceManager.getAvailable(clazz)` so new data sources appear without UI changes
+* {ok} **Gate `LoadingMode.FORCE` behind a dedicated role** (`*_INVALIDATE`) — refresh is a billable action for bureau calls
+* {ok} **Use `DataUnavailableException` for "vendor said no"**, reserve `IOException` / `ExternalServiceUnavailableException` for transport failures — `AbstractQueryDataSourceAction` already branches on them
+* {ok} **Pair `*ApiDevImpl` with `*ApiProdImpl`** for every provider — tests and demo environments run without vendor credentials
+* {ok} **Use `ResolvableType` in a base class** (`BaseTruelayerDataSource`, `BaseNtropyDataSource`) to infer `getType()` once instead of repeating it per subclass
+* {ok} **Make cross-engine helpers dual-interface configurators** (implement both `PolyglotScriptEngineConfigurator` and `SpelScriptEngineConfigurator`) so rule authors get the same vocabulary in every engine
+* {ok} **Declare `getPrimaryId()` sensitive to every field that affects the query** — concatenate SSN + DOB + address hash if the vendor response depends on all three; correctness of the cache depends on this
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Calling `dataSourceManager.getData(..., FORCE)` from a scheduled job** — a cron that hits Experian every hour for every active borrower is a reliable way to exhaust the vendor budget before lunch. Use `QUERY` and tune `lifespan()`
+* {bad} **Parsing `DataSourceRecord.getRawData()` by hand** — `MappedDataSource.parseRecord()` is already wired. Calling `getRawData()` yourself skips the cached-parse semantics and will re-parse on every access
+* {bad} **Storing raw vendor responses in a business entity** — the `SubjectExternalData.document` IS the storage. Never copy the JSON into an application column; duplicate truth, impossible to invalidate
+* {bad} **Writing a `DataSource<Object>` or `DataSource<DataSourceSubject>`** — `ResolvableType.getGeneric(0).resolve()` returns the erased type, meaning `DataSourceManagerImpl`'s `isAssignableFrom` check admits any entity. You've bypassed type safety
+* {bad} **Registering a `ScriptEngine` bean named the same as an existing engine** — `Collectors.toMap(...)` with the default merger throws `IllegalStateException`; the app won't start, but the error message is opaque ("Duplicate key javascript")
+* {bad} **Instantiating `ScriptEngine` directly** — GraalVM engines cache parsed sources across compiles; bypassing the Spring-managed singleton creates per-call contexts and nukes performance
+* {bad} **Calling `SpelScript.close()` expecting resource release** — SpEL has nothing to close. If you need deterministic cleanup, you're probably compiling the wrong engine
+* {bad} **Running user-authored JS/Python scripts with `HostAccess.ALL`** — `AbstractPolyglotEngine.createContext()` does exactly this by default; that's fine for admin-authored rules but dangerous if ever exposed to unauthenticated input. There is no "sandbox mode" currently
+* {bad} **Mutating `SubjectExternalData` rows in place** — `valid` is the only setter. Changing `document`, `requestedAt`, or `primaryId` on an existing row breaks the audit trail and the primary-id cache invariant
+* {bad} **Calling `ScriptManager.compile()` on every evaluation** — compilation is the expensive step. Cache compiled `Script` instances keyed by `(engineName, source)` hash if the same expression runs hot
+* {bad} **Using `FORCE` to "fix" a data quality issue** — if the vendor's response is wrong, a force refresh returns the same wrong data. Fix the inputs (`getPrimaryId()` components, request payload in `fillData`), then `QUERY`
+* {bad} **Assuming `DataSourceManager.getAllAvailable()` lists only supported sources for a specific entity** — it returns _every_ bean. Use `getAvailable(Class)` for a filtered list
+* {bad} **Implementing `DataSource` without `@Service(NAME)`** — the bean name IS the data source name. Spring's default bean naming (camelCase of the class) is rarely what you want; always explicit the `@Service("vendor-product")` name
+* {bad} **Storing a compiled `Script` as a `@Bean`** — `Script` is per-compilation, not global. A `@Bean` `Script` compiled at startup holds a single `Context` that's not thread-safe if multiple requests hit `eval()` concurrently
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every `DataSourceSubject` implementation returns a stable UUID `getId()` and a vendor-query-sensitive `getPrimaryId()`
+* {todo} Every `DataSource` bean has an explicit `@Service("vendor-product")` name following the kebab-case vendor-prefixed convention
+* {todo} Every `DataSource` that calls a billable vendor endpoint sets `lifespan()` to the vendor's allowed max age (30–90 days typical)
+* {todo} Every provider has a `*ApiProdImpl` with `@ConditionalOnProperty("<vendor>.api.clientId")` and a `*ApiDevImpl` default — CI and local dev run without credentials
+* {todo} Every admin-editable rule field embeds `Expression` (entity) + `@Valid ExpressionForm` (form); `@Expression` validation compile-checks scripts before persistence
+* {todo} GraalVM context classes are properly `try`-with-resources closed in every `compile(...).eval(...)` path
+* {todo} `EntityExternalDataTabController` is subclassed for every `DataSourceSubject` entity, with `_INVALIDATE` + `_COLLECTION` roles granted only to operators
+* {todo} `AbstractQueryDataSourceAction` is subclassed per entity with a conservative `isAvailable(entity, user)` predicate — refresh is not always legal (regulatory age, pending appeals, etc.)
+* {todo} `LoadingMode.FORCE` is never reachable from automated code paths — only from UI actions under a dedicated role
+* {todo} `DataUnavailableException` from `getData()` is handled by checkers as "signal absent," not treated as a failure
+* {todo} Scheduled jobs that read risk data use `LoadingMode.READ` only; fresh pulls happen on UI action or inside an orchestrated BPMN run
+* {todo} `SubjectExternalData` rows with `valid=false` are retained indefinitely (audit) — never purge without a compliance-approved retention policy
+* {todo} Response documents are gzipped (`DocumentResource.gzip(...)`) — `DataSourceManagerImpl.saveData(...)` does this by default, but any custom `DataSource` that bypasses it must too
+* {todo} Script engines register their namespaces via configurators; `jsonPath` / `xPath` are available in all three engines without per-rule imports
+* {todo} Rule authors have a documented set of bindings (`subject`, `record`, provider-specific parsed objects) — bindings are the contract, not the script body
+* {todo} Vendor response DTOs are deserialized with `FAIL_ON_UNKNOWN_PROPERTIES=false` and `READ_UNKNOWN_ENUM_VALUES_AS_NULL=true` — a vendor adding a new enum value shouldn't brick the pipeline
+* {todo} `@Embedded Expression` columns use `columnDefinition = TEXT` (or equivalent) — `VARCHAR(255)` truncates non-trivial rules silently
+* {todo} The application wires exactly one `ScriptManager` bean and one engine bean per language; duplicate-name engines fail-fast at startup
+
+---
+
+**Related:** <<offer-engine>>, <<feature-service>>, <<flowable-internals>>, <<checkers>>, <<launchpad>>, <<entity-actions>>, <<document-templates>>, <<storage>>, <<data-model>>, <<reload-infrastructure>>, <<credit-product>>, <<reference-data>>
+
+**Next:** <<offer-engine>>, <<feature-service>>, <<flowable-internals>>

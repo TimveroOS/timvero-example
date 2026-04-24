@@ -1,0 +1,722 @@
+[[feature-service]]
+= Feature Service — scoring & decision data
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The feature subsystem (`com.timvero.loan.feature`) is the data layer that turns raw data-source responses and entity state into **named, typed scoring inputs** consumed by the external BPMN decision engine. A "feature" is one strongly-typed value (credit-score, monthly-income, employment-status, days-since-last-default) attached to a `FeaturedSubject` — the Participant, Application, Asset, etc. the engine scores. For the engine-facing REST contract that reads features during a run, see <<flowable-external-api>>; for the `ProcessExecution` / `DecisionFact` domain model that stores the run's output, see <<flowable-internals>>.
+
+Everything outside this module — data-source connectors, the engine, the admin UI — reads and writes features through `FeatureService`. Mappings are **configurable at runtime** (script expression per field), so adding a new feature never requires a code change — only a new `DataSourceFieldMapping` row.
+
+== What You Need to Know
+
+The module has **six subpackages** that line up one-to-one with concern boundaries — understand the top three before touching anything else:
+
+[cols="1,1,3", options="header"]
+|===
+|Package |Type |Purpose
+
+|`entity`
+|Core
+|`Feature` (immutable row per extracted value), `DataSourceFieldMapping` (configurable script per field, versioned), `FeatureDataType` (polymorphic `rawContent` codec), `FeaturedSubject` marker, two repositories.
+
+|`service`
+|Core
+|`FeatureService` — single public entry point. Dispatches to one of two `FeatureBindingExtractor` implementations: `DataSourceFeatureExtractor` (external API response → features) or `EntityFeatureExtractor` (in-memory entity graph → features). `FeatureResolvingException` is the caller-facing failure type.
+
+|`service.group`
+|Core
+|`FeatureExtractorGroup` (CustomEnum: `CREDIT_BUREAU`, `PSD2`, `ACCOUNTING_SYSTEMS`, `OPEN_BANKING_SYSTEMS`, `OTHERS`), `FeatureExtractorGroupService`, config-driven grouping of data-source names for the settings UI.
+
+|`controller`
+|Admin UI
+|`FieldMappingController` — `/features-store` — CRUD on mapping sets, one page per data source, guarded by `Permission.FEATURE_STORE_MODIFY`.
+
+|`form`
+|Admin UI
+|`FieldMappingForm`, `FieldMappingSetForm`, `FieldMappingSetFormService`, `FieldMappingSetFormValidator`, `FieldMappingMapper`. Thymeleaf-bound form objects, MapStruct entity↔form mapping, duplicate-field-name validation.
+
+|`export`
+|Import/export
+|`FeatureMappingExporter` (`@Order(4000)` bean implementing `EntityExporter`), `FeatureMappingExportData` DTO, `FeatureMappingToDtoMapper`. Mappings ship with the project's export bundle so configuration moves between environments.
+|===
+
+Key characteristics:
+
+- **Features are immutable** — `Feature` is `@Immutable` and has no setters. Re-extracting the same field on the same record writes a *new* row only when `mappingVersion` has changed.
+- **Script-driven** — every mapping owns an `Expression` (engine name + source). `FeatureService` compiles the script through `ScriptManager` and evaluates it against a binding map built by the extractor.
+- **Two cache layers** — `exhaustive=false` skips re-running the extractor if a `Feature` row already exists for the `(ownerId, dataSourceName, recordKey, mapping, version)` tuple. `DataSourceFeatureExtractor` additionally honors the DataSource `LoadingMode.READ` vs `QUERY` distinction (<<datasource-integration>>).
+- **`FeatureResolvingException` is the only checked failure** — callers (`ExternalDataProviderController`, `ProcessEntityFeatureService`) branch on it to emit HTTP 550 or persist an `ExceptionEntity` on the run.
+- **Exceptions surface as features** — a script compile or eval failure produces a `Feature` with `dataType = EXCEPTION` and the exception details as content. The engine sees the error inline with the other values instead of the whole pull failing.
+
+== Architecture Overview
+
+[source]
+----
+                                ┌────────────────────────────────────────┐
+                                │  External BPMN engine (Flowable etc.)  │
+                                └───────────────┬────────────────────────┘
+                                                │ GET /external-data/
+                                                │   get-data/{procId}/{dataSource}
+                                                ▼
+                              ┌─────────────────────────────────────────┐
+                              │  ExternalDataProviderController         │   <<flowable-external-api>>
+                              │  → ProcessEntityFeatureService          │
+                              │     .getFeatures(procId, dataSource)    │
+                              └───────────────┬─────────────────────────┘
+                                              │
+                                              ▼
+                              ┌─────────────────────────────────────────┐
+                              │  FeatureService.getFeatures(            │
+                              │      subject, dataSourceName, eager)    │
+                              └───────────────┬─────────────────────────┘
+                                              │
+                                              │  1. look up extractor by DS name
+                                              │  2. extractor.getBindings(...)
+                                              │     → FeatureBundingRecord
+                                              │  3. load active mappingSet
+                                              │  4. for each mapping not in cache:
+                                              │       compile + eval script
+                                              │       wrap in Feature
+                                              │       save row
+                                              ▼
+                     ┌──────────────────────────────────────────────────────┐
+                     │        FeatureBindingExtractor (interface)           │
+                     ├──────────────────────────┬───────────────────────────┤
+                     │ DataSourceFeatureExtractor │ EntityFeatureExtractor  │
+                     │ ─ delegates to             │ ─ routes to named       │
+                     │   DataSourceManager.getData│   EntityFeatureSource<E>│
+                     │ ─ bindings built by        │   bean                  │
+                     │   DefaultFeatureBindingRec │ ─ bindings = whatever   │
+                     │ ─ recordKey = external pull│   the bean returns      │
+                     │   key (fresh per fetch)    │ ─ recordKey = subject   │
+                     │                            │   id (stable)           │
+                     └──────────────────────────┴─────────────────────────┘
+                                              │
+                                              ▼
+                              ┌─────────────────────────────────────────┐
+                              │  feature table (Hibernate @Immutable)   │
+                              │  (ownerId, dataSourceName, recordKey,   │
+                              │   mapping_id, mappingVersion, rawContent│
+                              │   , dataType, createdAt)                │
+                              └─────────────────────────────────────────┘
+----
+
+Two dispatch paths with one storage model — `Feature` rows are the common product. The **only** difference between "I pulled credit bureau XML" and "I mapped a field off the `Participant` entity" is which extractor produced the binding map.
+
+== Entity Layer — `feature.entity`
+
+=== Feature — the storage row
+
+[source,java]
+----
+@Entity
+@Table(name = "feature")
+@HideInDocs
+@Immutable
+public class Feature extends UUIDPersistable {
+    private UUID ownerId;           // FeaturedSubject.id (Participant, Application, ...)
+    private Instant createdAt;
+    private UUID recordKey;         // the pull/request this feature was extracted from
+    private String dataSourceName;
+    private String name;            // mapping.fieldName
+    @Enumerated(EnumType.STRING)
+    private FeatureDataType dataType;
+    @Column(length = 4000)
+    private String rawContent;      // serialize(computed object)
+
+    @ManyToOne @JoinColumn(name = "mapping_id", nullable = false)
+    private DataSourceFieldMapping mapping;
+    private long mappingVersion;    // snapshot of mapping.version at extract time
+
+    @Transient
+    public Object getContent() { return dataType.parse(rawContent); }
+}
+----
+
+Four identifiers ride along with every row:
+
+- **`ownerId`** — the subject. Indexed via `findAllByOwnerId` / `countByOwnerId`.
+- **`dataSourceName`** — scopes the row inside the subject.
+- **`recordKey`** — the **pull** identity. For DataSources this is `DataSourceRecord.getKey()` (new UUID per fetch); for entity sources it's the subject id. Two pulls → two `recordKey`s → two parallel sets of rows.
+- **`mapping` + `mappingVersion`** — pin the feature to the exact mapping revision. Edit a script, save → `version` bumps, the next `getFeatures()` recomputes that field only; other fields stay cached.
+
+`@Immutable` disables dirty checking — Hibernate never emits an `UPDATE`. A re-extract produces a new row; stale rows are kept (audit trail).
+
+=== FeatureDataType — polymorphic codec
+
+[source,java]
+----
+public enum FeatureDataType {
+    NULL(x -> null, Function.identity()),
+    STRING    (Object::toString, Function.identity(),   String.class),
+    BOOLEAN   (Object::toString, Boolean::valueOf,      Boolean.class),
+    INTEGER   (Object::toString, Integer::valueOf,      Byte.class, Short.class, Integer.class),
+    LONG      (Object::toString, Long::valueOf,         Long.class),
+    BIG_INTEGER(Object::toString, BigInteger::new,      BigInteger.class),
+    FLOAT     (Object::toString, Float::valueOf,        Float.class),
+    DOUBLE    (Object::toString, Double::valueOf,       Double.class),
+    BIG_DECIMAL(bd -> ((BigDecimal) bd).toPlainString(), BigDecimal::new, BigDecimal.class),
+    EXCEPTION (Object::toString, Function.identity(),   String.class);
+
+    public static FeatureDataType resolveDataType(Object data) { /* class lookup */ }
+    public Object parse(String s)   { return s != null ? parse.apply(s) : null; }
+    public String serialize(Object) { return serialize.apply(data); }
+}
+----
+
+`FeatureDataType` is shared with `TypedValue` in `flowable-internals` — one codec stores both `Feature.rawContent` and `ProcessExecution` variables. Practical consequences:
+
+- **No date / datetime type.** A script returning `LocalDate` fails `resolveDataType`. Return ISO strings or numeric offsets.
+- **No collections or objects.** A list falls off the class-lookup table. Flatten in the script, one feature per scalar.
+- **`EXCEPTION` is special.** `FeatureService.mapException()` stores `ScriptException.getScriptExceptionDetails()` as content; BPMN branches on `dataType == EXCEPTION`.
+
+The `4000`-char `rawContent` column is the hard upper bound per feature. Larger payloads belong in <<storage>>.
+
+=== DataSourceFieldMapping — the configurable script
+
+[source,java]
+----
+@Entity
+@Table(name = "field_mapping")
+@Audited
+public class DataSourceFieldMapping extends UndeletableEntity<Long> {
+
+    @Version
+    private long version;                    // bumped on every edit
+    @Column(nullable = false, updatable = false, unique = true)
+    private UUID exportId;                   // stable cross-environment key
+    private String dataSourceName;
+    private String fieldName;                // becomes Feature.name
+    private String description;
+    @Embedded
+    private Expression expression;           // { engineName, source }
+    private String metadata;                 // free-form (UI hints, tags)
+}
+----
+
+Three behaviors to internalize:
+
+- **`UndeletableEntity` + soft delete.** UI deletion flips `active=false`. `getMappingSet(dsn)` filters on `active = true`; historical `Feature` rows still reference soft-deleted mappings via `mapping_id`.
+- **`@Audited` (Envers).** Every edit leaves a revision row — see <<audit-module-sdk-reference-internals>>. Any decisioning logic that shifted after a change is traceable to the exact mapping revision.
+- **`exportId`** — stable cross-environment key, used by the export layer instead of the auto-incremented `id`.
+
+=== FeaturedSubject — the marker
+
+`public interface FeaturedSubject extends DataSourceSubject {}` — empty marker. Any entity implementing it is a valid owner for features; `Participant`, `Application`, and other process roots extend it via `ProcessEntity` (<<flowable-internals>>). See <<entity-module-sdk-reference-hierarchy>> for where `FeaturedSubject` sits in the class hierarchy, and <<datasource-integration>> for the parent `DataSourceSubject` contract.
+
+=== Repositories
+
+[source,java]
+----
+public interface FeatureRepository extends JpaRepository<Feature, UUID>, JpaSpecificationExecutor<Feature> {
+
+    int countByOwnerId(UUID ownerId);
+    List<Feature> findAllByOwnerId(UUID ownerId);
+    List<Feature> findAllByOwnerIdAndDataSourceNameAndRecordKey(
+        UUID ownerId, String dataSourceName, UUID recordKey);
+}
+
+public interface FieldMappingRepository extends JpaRepository<DataSourceFieldMapping, Long> {
+    List<DataSourceFieldMapping> getMappingSet(String dataSourceName);       // active only
+    Optional<DataSourceFieldMapping> getFieldMapping(String dsn, String fn); // active only
+    List<UUID> getExportIds();
+    DataSourceFieldMapping getByExportId(UUID exportId);
+}
+----
+
+`countByOwnerId` is the tab visibility check used by `AbstractFeaturesTab` (see <<flowable-internals>>). `findAllByOwnerIdAndDataSourceNameAndRecordKey` is the cache lookup `FeatureService` runs before re-executing scripts.
+
+== Service Layer — `feature.service`
+
+=== FeatureService — the public entry point
+
+[source,java]
+----
+@Service
+public class FeatureService {
+
+    @Autowired private ScriptManager scriptManager;
+    @Autowired private FieldMappingRepository mappingSetRepository;
+    @Autowired private FeatureRepository featureRepository;
+    @Autowired private List<FeatureBindingExtractor> featureOperations;
+
+    private Map<String, FeatureBindingExtractor> extractorsMap;
+
+    @PostConstruct
+    public void init() {
+        extractorsMap = featureOperations.stream()
+            .flatMap(e -> e.getAvailableDataSources().stream().map(n -> Pair.of(n, e)))
+            .collect(Collectors.toMap(Pair::getFirst, Pair::getSecond));
+    }
+
+    public Set<String> getAllAvailableDataSources() { return extractorsMap.keySet(); }
+
+    @Transactional
+    public <E extends FeaturedSubject> Collection<Feature> getFeatures(
+            E subject, String dataSourceName, boolean exhaustive)
+            throws FeatureResolvingException {
+        /* dispatch → cache check → compile/eval/save */
+    }
+}
+----
+
+One service, two public methods. Admin UI, external API, and the metric covenant module all route through it. The extractor map is built once at `@PostConstruct` by flattening each extractor's `getAvailableDataSources()` into a name→extractor map; collisions are silent (last-write-wins) — see Anti-Patterns.
+
+=== The `getFeatures()` state machine
+
+Four steps: route (pick extractor from the `@PostConstruct` map), pull (call `extractor.getBindings(subject, dsn, exhaustive)` — `null` means the data source has no record yet, return empty), cache check (`findAllByOwnerIdAndDataSourceNameAndRecordKey` → split active mappings into "cache hits" vs `unmapped`), and compile/eval/save — only for misses. Each unmapped mapping runs `scriptManager.compile(expression)` against `bundingRecord.getBindings()`; a `ScriptException` produces an `EXCEPTION` feature instead of aborting the batch.
+
+Three invariants:
+
+- **Cache hit requires both same `mapping.id` and same `mappingVersion`.** A script edit bumps version → recomputes *that* field only. The query key is `(ownerId, dataSourceName, recordKey)` — a change in any yields a full recompute.
+- **Bindings are lazy.** `bundingRecord.getBindings()` runs only after at least one cache miss. Fully-cached calls don't even parse the DataSource response.
+- **Script errors don't poison the pull.** Each `ScriptException` becomes one `EXCEPTION` feature; other fields still evaluate and the error is persistent for the engine to branch on.
+
+=== unwrapContent — JsonNode flattening
+
+[source,java]
+----
+protected Object unwrapContent(Object content) {
+    if (content instanceof JsonNode node) {
+        return switch (node.getNodeType()) {
+            case NULL    -> null;
+            case BOOLEAN -> node.booleanValue();
+            case STRING  -> node.asText();
+            case NUMBER  -> node.numberValue();
+            default      -> throw new RuntimeException("Unexpected node type " + node.getNodeType());
+        };
+    }
+    return content;
+}
+----
+
+Scripts against JSON responses often return `JsonNode` (GraalJS preserves the wrapper). `FeatureService` unwraps the four scalar node types before calling `resolveDataType`. `ARRAY` and `OBJECT` nodes throw — flatten in the script.
+
+=== FeatureBindingExtractor — the dispatch contract
+
+[source,java]
+----
+public interface FeatureBindingExtractor {
+
+    Set<String> getAvailableDataSources();
+
+    FeatureBundingRecord getBindings(DataSourceSubject subject, String dsn, boolean exhaustive)
+        throws IOException;
+
+    interface FeatureBundingRecord {
+        UUID getRecordKey();                       // cache discriminator
+        Map<String, ?> getBindings() throws IOException;  // script input
+    }
+}
+----
+
+Two concrete implementations ship; both are Spring `@Service`s auto-collected into `FeatureService`'s injected `List<FeatureBindingExtractor>`.
+
+=== DataSourceFeatureExtractor — external-pull bridge
+
+[source,java]
+----
+@Service
+public class DataSourceFeatureExtractor implements FeatureBindingExtractor {
+
+    @Autowired private DataSourceManager dataSourceManager;
+
+    @Override
+    public Set<String> getAvailableDataSources() {
+        return dataSourceManager.getAllAvailable();
+    }
+
+    @Override
+    public DataSourceFeatureBundingRecord getBindings(
+            DataSourceSubject subject, String dsn, boolean eager) throws IOException {
+
+        LoadingMode mode = eager ? LoadingMode.QUERY : LoadingMode.READ;
+        DataSourceRecord record = dataSourceManager.getData(subject, dsn, mode).orElse(null);
+        return record == null ? null : new DataSourceFeatureBundingRecord(record, subject);
+    }
+}
+----
+
+Any `DataSource<E>` registered with `DataSourceManager` (<<datasource-integration>>) becomes feature-extractable for free. The `exhaustive` flag maps to `LoadingMode.QUERY` (fresh pull, REAL-mode) vs `LoadingMode.READ` (latest persisted record, TEST-mode — see <<flowable-internals>>). `recordKey = record.getKey()` — a new UUID per physical pull, which is why re-querying a bureau yields a fresh feature set even without mapping changes.
+
+=== EntityFeatureExtractor — in-process source
+
+[source,java]
+----
+@Service
+@ConditionalOnBean(EntityFeatureSource.class)
+public class EntityFeatureExtractor implements FeatureBindingExtractor {
+
+    @Autowired(required = false)
+    private Map<String, EntityFeatureSource<?>> sources = Collections.emptyMap();
+
+    @Override
+    public Set<String> getAvailableDataSources() { return sources.keySet(); }
+
+    @Override
+    public EntityFeatureBundingRecord getBindings(DataSourceSubject subject, String dsn, boolean eager) {
+        EntityFeatureSource<DataSourceSubject> source = (EntityFeatureSource<DataSourceSubject>) sources.get(dsn);
+        if (source == null) throw new RuntimeException("EntityFeatureSource not found: " + dsn);
+        return new EntityFeatureBundingRecord(subject.getId(), source.getBindings(subject));
+    }
+}
+----
+
+No external I/O — this extractor reads directly off the entity graph. Its data sources are named `EntityFeatureSource<E>` beans:
+
+[source,java]
+----
+public interface EntityFeatureSource<E extends DataSourceSubject> {
+    Map<String, ?> getBindings(E subject);
+}
+----
+
+The `@Component(name)` qualifier is the data-source name. Example from the reference project:
+
+[source,java]
+----
+@Component(ParticipantFeatureSource.APPLICATION_DATA_SOURCE_NAME)
+public class ParticipantFeatureSource implements EntityFeatureSource<Participant> {
+
+    public static final String APPLICATION_DATA_SOURCE_NAME = "applicationDataSource";
+
+    @Override
+    public Map<String, ?> getBindings(Participant participant) {
+        Map<String, Object> bindings = new HashMap<>();
+        bindings.put("participant", EntityUtils.initializeAndUnproxy(participant));
+        bindings.put("application", EntityUtils.initializeAndUnproxy(participant.getApplication()));
+
+        Client client = EntityUtils.initializeAndUnproxy(participant.getClient());
+        if (client != null) {
+            bindings.put("client", client);
+        }
+        return bindings;
+    }
+}
+----
+
+Three conventions on display:
+
+- **Data-source name = bean name** (`@Component("applicationDataSource")`). The string bleeds into the DB, UI, and properties — pick once.
+- **`EntityUtils.initializeAndUnproxy`** — scripts see POJOs, never Hibernate proxies. Skip this and `instanceof Application` silently returns `false`.
+- **`recordKey = subject.getId()`** — stable subject id + stable mapping versions → permanent cache hit. Recompute by bumping mapping `version` (any field edit does this).
+
+`@ConditionalOnBean(EntityFeatureSource.class)` — the extractor doesn't load in projects without an entity source.
+
+=== DefaultFeatureBindingRecord — the shared binding builder
+
+[source,java]
+----
+public static Map<String, ?> getBindings(
+        DocumentResource resource, Object converted, Instant requestedAt,
+        Object subject, String dataSourceName) throws IOException {
+
+    Map<String, Object> bindings = new HashMap<>();
+    bindings.put("subject",     subject);
+    bindings.put("requestedAt", requestedAt);
+    bindings.put("requestDate", requestedAt.atZone(ZoneId.systemDefault()).toLocalDate());
+    bindings.put(dataSourceName, DocumentParserUtils.parseResource(resource));
+
+    if (converted != null) {
+        bindings.put(dataSourceName + "_converted", converted);
+    }
+    bindings.put("response", new RecordProxyObject(resource, converted));
+    return bindings;
+}
+----
+
+Every script evaluated via `DataSourceFeatureExtractor` sees the same binding names: `subject`, `requestedAt` (`Instant`), `requestDate` (`LocalDate`), `<dataSourceName>` (parsed response — `JsonNode` / `Element` / etc.), `<dataSourceName>_converted` (typed POJO if the DataSource has a converter), and `response` — a `ProxyObject` exposing `{bytes, java, json, text}` for GraalJS scripts needing raw-byte access. `RecordProxyObject` implements `org.graalvm.polyglot.proxy.ProxyObject` specifically for GraalJS; non-Graal engines get only the first four bindings.
+
+=== FeatureResolvingException
+
+[source,java]
+----
+public class FeatureResolvingException extends Exception {
+    public FeatureResolvingException(String message, Throwable cause) { super(message, cause); }
+}
+----
+
+Thrown by `FeatureService.getFeatures()` in exactly two places: `extractor.getBindings(...)` wrapping a DataSource `IOException`, and `bundingRecord.getBindings()` on parse failure. Script compile/eval errors **do not** throw — they become `EXCEPTION` features (one malformed field shouldn't block the other twenty).
+
+Callers: `ExternalDataProviderController` maps to HTTP `550` (non-standard, distinguishes data-source-unavailable from 4xx/5xx — see <<flowable-external-api>>); `ProcessEntityFeatureService` persists the cause as an `ExceptionEntity` on the `ProcessExecution` before rethrowing.
+
+== Grouping Layer — `feature.service.group`
+
+The admin UI groups data-source names by category (credit bureaus, PSD2, etc.). That's the full job of this subpackage.
+
+`FeatureExtractorGroup` is a `CustomEnum` with five built-in values — `CREDIT_BUREAU`, `PSD2`, `ACCOUNTING_SYSTEMS`, `OPEN_BANKING_SYSTEMS`, `OTHERS`. `compareTo` pins `OTHERS` last; projects can add new categories by instantiating a new static field (no SDK recompile).
+
+`FeatureExtractorGroupConfiguration` is a `@ConfigurationProperties(prefix = "feature-extractor")` map — unmapped names fall through to `OTHERS`:
+
+[source,properties]
+----
+feature-extractor.groups.equifax=CREDIT_BUREAU
+feature-extractor.groups.experian=CREDIT_BUREAU
+feature-extractor.groups.tink=PSD2
+----
+
+`FeatureExtractorGroupService.getDataSources()` groups `featureService.getAllAvailableDataSources()` through this map; `FieldMappingController#list` feeds a `TreeMap<FeatureExtractorGroup, List<String>>` into the settings page for a stable, category-first listing.
+
+== Admin UI — `feature.controller` and `feature.form`
+
+=== FieldMappingController — `/features-store`
+
+[source,java]
+----
+@Controller
+@RequestMapping(FieldMappingController.PATH)            // "/features-store"
+@PreAuthorize("hasRole('" + Permission.FEATURE_STORE_MODIFY + "')")
+@MenuItem(order = 900_610, name = "fieldMapping", group = "setting")
+public class FieldMappingController {
+
+    @GetMapping                             String list(...)   // grouped listing
+    @GetMapping("/{dsn}/edit")              String action(...) // edit one set
+    @PostMapping(value = "/{dsn}/edit", ...)
+        @ResponseBody Redirect submit(...)                     // save
+}
+----
+
+Three routes, one permission, one menu entry under **Settings**. The list page renders `TreeMap<FeatureExtractorGroup, List<String>>` (see Grouping Layer); the edit page renders one `FieldMappingSetForm` per data source.
+
+=== Form assembly
+
+`FieldMappingSetFormService.getEditModel(dsn)` primes the edit page with `mappingSet` (the form, built from repo rows), `uploadableDocumentTypes` (JSON map from `DataSourceManager.getAllAvailable()` for the file-upload widget), `engineNames` (configured script engines from `ScriptManager`), and `samples` / `sampleNames` (matching `ResponseSample` records so the admin can preview a script against saved sample data).
+
+=== FieldMappingSetFormService.save — CRUD semantics
+
+[source,java]
+----
+@Transactional
+public void save(FieldMappingSetForm form) {
+    List<DataSourceFieldMapping> list = repository.getMappingSet(form.getDataSourceName());
+    for (FieldMappingForm mf : form.getMappings()) {
+        DataSourceFieldMapping m = (mf.getId() == null)
+            ? createNewMapping(form.getDataSourceName())
+            : list.stream().filter(x -> x.getId().equals(mf.getId())).findAny().orElseThrow();
+        list.remove(m);
+        mapper.toEntity(mf, m);
+        repository.save(m);
+    }
+    repository.deleteAll(list); // anything not in the form = soft delete (UndeletableEntity)
+}
+----
+
+Implicit delete — anything the form omits disappears from the active set (soft-delete via `UndeletableEntity`; rows remain in the DB for audit). A re-added mapping with the same name gets a *new* `id` and `version = 0`.
+
+The single domain rule enforced on submit — `FieldMappingSetFormValidator` — rejects duplicate `fieldName` entries within a set. `@NotEmpty` on `fieldName` handles the rest.
+
+== Export Layer — `feature.export`
+
+`FeatureMappingExporter` is an `@Order(4000)` `EntityExporter<FeatureMappingExportData>` — ships mappings in/out as part of the project's export bundle. The stable `exportId` (UUID assigned in `@PrePersist`) is the cross-environment key, so re-importing an existing mapping updates it instead of creating a duplicate. `FeatureMappingExportData` flattens the embedded `Expression` (`expression`, `engineName`) and the mapping's description/metadata; `FeatureMappingToDtoMapper` is a MapStruct interface with `@InheritInverseConfiguration` — one config, both directions.
+
+== Advanced Patterns
+
+=== Adding a new in-process feature source
+
+Drop in a single bean:
+
+[source,java]
+----
+@Component("loanHistoryDataSource")
+public class LoanHistoryFeatureSource implements EntityFeatureSource<Participant> {
+
+    @Autowired private LoanRepository loans;
+
+    @Override
+    public Map<String, ?> getBindings(Participant participant) {
+        List<Loan> history = loans.findAllByBorrowerId(participant.getClient().getId());
+        return Map.of(
+            "participant", EntityUtils.initializeAndUnproxy(participant),
+            "loans",       history,
+            "defaultCount", history.stream().filter(Loan::isDefaulted).count());
+    }
+}
+----
+
+`FeatureService.init()` picks it up. The data-source name appears in the admin UI; admins write scripts against `participant`, `loans`, `defaultCount`. No SDK changes.
+
+=== Forcing a recompute without editing a script
+
+Two approaches: re-save any field in the mapping set (`@Version` increments → next `getFeatures()` recomputes that field), or call `DataSourceManager.invalidateData(subject, dsn)` (the next `LoadingMode.QUERY` produces a new `recordKey`, missing the cache on every field). There is no "recompute feature by id" API — features are immutable and the cache key is `(ownerId, dsn, recordKey, mapping, version)` by design.
+
+=== Computed features — scripts over scripts
+
+Scripts see only the bindings the extractor built. To chain — feature A depends on feature B — compute B in Java inside the `EntityFeatureSource` and expose it as a pre-computed binding:
+
+[source,java]
+----
+@Override
+public Map<String, ?> getBindings(Participant p) {
+    BigDecimal ratio = p.getMonthlyIncome().divide(
+        p.getMonthlyObligations().max(BigDecimal.ONE), 4, HALF_UP);
+    return Map.of("participant", p, "incomeToObligationRatio", ratio);
+}
+----
+
+Avoid cross-data-source lookups inside a script — they break the cache invariant (`recordKey` is per-pull, so the cache can't know the script read a second source).
+
+=== Wrapping expected failures as sentinel features
+
+If a business rule treats some values as "expected failures" (bureau returns `NO_HIT`), collapse them into a sentinel scalar instead of letting them become `EXCEPTION`:
+
+[source,java]
+----
+// GraalJS mapping expression
+try { credit.score; }
+catch (e) { e.name === 'NoHitException' ? -1 : (function(){ throw e; })(); }
+----
+
+Result: an `INTEGER` feature with `-1` for no-hit, `EXCEPTION` only for the unexpected. BPMN gateways branch on the scalar instead of pattern-matching exception messages.
+
+== Response Samples — `loan.response_sample`
+
+Response samples are **stored copies of raw data-source responses** — a credit-bureau XML, a PSD2 JSON payload, an accounting-system CSV — uploaded once by an operator and replayed against any script/data-source combination without touching the live endpoint. They are the testing surface for mappings: an admin edits a `DataSourceFieldMapping` expression in `/features-store`, picks a saved sample for the same `dataSourceName`, and previews what the script produces — no live pull, no quota cost, no credential dance. In runtime they also feed the TEST-mode path of <<datasource-integration>> so a whole BPMN run can be replayed off recorded data.
+
+Three subpackages under `com.timvero.loan.response_sample`: `entity` (storage), `service` (dispatch + execution), `controller` (upload + preview REST). `DataSource` integrations stay completely unaware of samples — the subsystem is orthogonal and additive.
+
+=== Entity Layer
+
+`ResponseSample` is a `@HideInDocs` `BaseEntity<Long>` with `JOINED` inheritance on `response_sample_type` — a `CustomEnum` currently shipping one value (`DOCUMENT`). The only concrete subclass is `DocumentResponseSample`, joining a `Document` (from <<storage>>) by a unique `document_id` — each stored document belongs to exactly one sample. The `dataType` column holds the target data-source name (e.g. `equifax`), not a Java type; that string is what binds the sample to a mapping set in the admin UI.
+
+[source,java]
+----
+@Entity @Table(name = "response_sample")
+@Inheritance(strategy = InheritanceType.JOINED)
+@DiscriminatorColumn(name = "response_sample_type")
+public abstract class ResponseSample extends BaseEntity<Long> implements NamedEntity {
+    private String dataType;                          // = DataSource name
+    public ResponseSampleType getResponseSampleType() { /* enum */ }
+    public MediaType getContentType()                 { return null; }  // overridden
+}
+----
+
+`DocumentResponseSample.getContentType()` reads through to the underlying `Document.getContentType()`; `getDisplayedName()` reads the filename. `getRequestedAt()` returns `document.getCreatedAt()` — the timestamp injected as `requestedAt` into the script bindings, so expressions involving "days since pull" compute the same way against a replay as against a live record.
+
+`ResponseSampleRepository` is a vanilla `JpaRepository + JpaSpecificationExecutor` — specification queries are used internally (see `getByDocumentId`), never exposed.
+
+=== Service Layer
+
+`ResponseSampleService` is the public front door. Three methods matter: `uploadSample(DocumentResource, type)`, `printSample(id)` (renders the raw response as text for the preview pane), and `evaluate(id, dataType, expression, engineName)` (compiles an arbitrary script against the sample's bindings and returns the result as a string). Dispatch to a typed `ResponseSampleManager<S>` happens via a polymorphic lookup on `ResponseSample.getResponseSampleType()` — adding a new sample kind means registering a `ResponseSampleManager` bean with a new `ResponseSampleType`, no core edits.
+
+[source,java]
+----
+public abstract class ResponseSampleManager<S extends ResponseSample> {
+
+    @Transactional
+    public String evaluate(Long id, String dataTypeName, String expr, String engine)
+            throws IOException, ScriptException {
+        S sample = loadSample(id);
+        Map<String, ?> bindings = getBindings(sample, dataTypeName);
+        try (Script script = scriptManager.compile(engine, expr)) {
+            return String.valueOf(script.eval(bindings));
+        }
+    }
+
+    public abstract Map<String, ?> getBindings(S sample, String dataTypeName) throws IOException;
+    public abstract String         print(S sample) throws IOException;
+    public abstract ResponseSampleType getSampleType();
+}
+----
+
+The generic `S extends ResponseSample` is resolved in `@PostConstruct` via `ResolvableType` to build a `JpaRepositorySupport<Long, S>` — each manager gets a typed repository handle without declaring one.
+
+`DocumentResponseSampleManager` is the shipped implementation:
+
+- **On upload** — calls `convertDataIfAvailable(type, resource)` first (tries to parse the payload through the matching `MappedDataSource` to fail fast on a malformed upload), then gzips the bytes (`DocumentResource.gzip`) and stores via `DocumentStorage` under the `responseSample` folder.
+- **On `getBindings`** — ungzips, runs the DataSource converter again (optional), and delegates to `DefaultFeatureBindingRecord.getBindings(resource, converted, requestedAt, null, dataType)`. That is the **same** binding builder `DataSourceFeatureExtractor` uses — `subject`, `requestedAt`, `requestDate`, the parsed payload under the data-source name, and `response` as a `RecordProxyObject`. A script that works in the preview runs identically in production.
+- **On deletion** — `removeDocument(UUID)` via a Specification on `DocumentResponseSample_.document → Document_.id`; `hasDocument(UUID)` is the existence check.
+
+`subject` is intentionally `null` in the preview bindings — samples have no associated `FeaturedSubject`. Scripts referring to `subject` will NPE in the preview even when they work live; it's a documentation tax, not a bug.
+
+=== Controller — `/response_sample`
+
+[source,java]
+----
+@RestController @RequestMapping("/response_sample")
+public class ResponseSampleController {
+
+    @GetMapping("/{id}/document-text")                                 // text preview
+    public String getTextDocument(@PathVariable Long id) { ... }
+
+    @PostMapping("/{id}/evaluate-expression")                          // run a script against a sample
+    public String evaluateExpressionDocument(
+        @PathVariable Long id,
+        @RequestParam(required = false) String dataType,
+        @RequestParam String expression,
+        @RequestParam String engineName) { ... }
+
+    @PostMapping("/upload/{dataSourceName}")                           // upload a new sample
+    public Long upload(@PathVariable String dataSourceName, @RequestParam MultipartFile file) { ... }
+
+    @ExceptionHandler(ScriptException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public String scriptException(ScriptException e) { return e.getLocalizedMessage(); }
+}
+----
+
+Three endpoints — view, evaluate, upload — plus a dedicated `ScriptException` handler that surfaces compile/eval errors as HTTP 400 with the `getLocalizedMessage()` as body. The admin UI wires these straight into the mapping editor: the `samples` / `sampleNames` pair `FieldMappingSetFormService` populates (see Admin UI — Form assembly above) is the driver of the "preview against…" dropdown; the `evaluate-expression` POST is what runs when the admin clicks "try".
+
+=== How samples tie to DataSource testing
+
+The subsystem is the missing half of <<datasource-integration>>'s TEST mode. A `MappedDataSource<E, R>` parses a `DataSource.Content` into a typed record; that same parser is what `DocumentResponseSampleManager.convertDataIfAvailable` invokes on upload and on every evaluation. Concretely:
+
+- **Uploading a malformed payload fails at upload time** — `DataUnavailableException` surfaces before any script ever runs, so the admin knows the sample is unusable on the same screen that took the file.
+- **A mapping preview runs the exact same binding graph as a production pull** — shared `DefaultFeatureBindingRecord.getBindings()` means `response.json`, `<dsn>_converted`, and `requestDate` all behave identically in preview and live.
+- **No `Feature` rows are written.** `evaluate` returns a raw `String.valueOf(script.eval(...))`; persisting the result would trip the `EXCEPTION`-feature machinery and pollute the production cache. Samples are a read-only scripting surface.
+
+A project wiring a new `DataSource` for free gets: its name in the mapping UI, its converter honored in the preview, and its raw payload storable as a reusable regression fixture. No extra code.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Name data sources by bean qualifier** — `@Component("applicationDataSource")`, then reference the same constant in every caller. The string bleeds into the DB (`Feature.dataSourceName`), admin UI, and `feature-extractor.groups.*` properties — a single source of truth prevents drift.
+* {ok} **Implement `FeaturedSubject` on every `ProcessEntity`** — the interface is intentionally empty; you pay nothing for implementing it, and it unlocks the whole extraction pipeline.
+* {ok} **Call `EntityUtils.initializeAndUnproxy` inside `getBindings`** — script engines evaluate against whatever object you hand them; Hibernate proxies turn `instanceof Application` into `false` for reasons that won't be obvious from the error message.
+* {ok} **Return scalars from scripts, flatten in Java** — `FeatureDataType` has no collection or object variant. A script returning a list throws; a Java extractor returning pre-flattened scalars works.
+* {ok} **Use the `response` ProxyObject for raw-byte access** — `response.bytes`, `response.json`, `response.text` are already wired through `DocumentResource` with correct charset handling; reimplementing this by hand in a script is where charset bugs start.
+* {ok} **Bump `mappingVersion` by editing through the admin UI** — `DataSourceFieldMapping` is `@Audited`; edits leave a clean Envers trail. Direct SQL updates skip the audit record and break <<audit-module-sdk-reference-internals>> queries.
+* {ok} **Categorize data sources via `feature-extractor.groups.*`** — defaults to `OTHERS`, but a well-curated `CREDIT_BUREAU` / `PSD2` split makes the admin settings page manageable once you pass ~10 data sources.
+* {ok} **Persist raw responses via DataSource, derive features via scripts** — never skip the DataSource layer to "save a hop". You lose the record cache, the lifespan policy (<<datasource-integration>>), and the ability to re-extract when the script changes.
+* {ok} **Read features in BPMN via the external API, not directly** — `ExternalDataProviderController` (<<flowable-external-api>>) handles `exhaustive` mode selection, exception mapping, and the 550-for-unavailable convention. Bespoke queries bypass all of this.
+* {ok} **Version control the mapping export** — the `FeatureMappingExporter` bundle is the source of truth; drifting prod from the exported state defeats environment parity.
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Two extractors claiming the same data-source name** — `FeatureService.init()` calls `Collectors.toMap` with no merger; a duplicate key throws at startup. More insidious: two `EntityFeatureSource` beans with the same `@Component` name trigger a Spring bean collision first, but adding a `DataSource` *and* an `EntityFeatureSource` with the same name silently resolves to the last-seen extractor with no warning.
+* {bad} **Returning `List`, `Map`, or custom POJOs from a mapping script** — `FeatureDataType.resolveDataType` throws `IllegalArgumentException("Unknown type …")`, which `FeatureService` catches and stores as an `EXCEPTION` feature — not a compile/eval failure surfaced to the admin. The feature quietly fails forever until someone opens the detail view.
+* {bad} **Returning `LocalDate` / `Instant` from a script** — no date types in `FeatureDataType`. Same failure mode as above; serialize with `.toString()` and parse downstream, or compute numeric offsets in the script.
+* {bad} **Mutating `Feature` instances or deleting rows** — the entity is `@Immutable` and the table is the audit trail for decisioning. Drop them only in TTL-based data retention jobs, never in application flow.
+* {bad} **Side effects inside `EntityFeatureSource.getBindings`** — runs inside the caller's transaction; writes may be flushed unpredictably and leave the extractor with an inconsistent view on retry.
+* {bad} **Skipping `initializeAndUnproxy` and calling `participant.getClient().getId()` lazily inside a script** — GraalJS's host-access path bypasses the persistence context; you get `LazyInitializationException` with a stack trace pointing inside the script engine, which is an exquisitely painful place to debug from.
+* {bad} **Using the DB `id` of a `DataSourceFieldMapping` across environments** — it's auto-increment and differs between dev/staging/prod. Always reference by `exportId` (stable) or `dataSourceName + fieldName` (business key).
+* {bad} **Wrapping every script `try/catch` to return `null` on error** — that's `FeatureDataType.NULL`, which is indistinguishable from "the source legitimately had no value". Let errors become `EXCEPTION` so the engine can branch on the distinction.
+* {bad} **Reading features by direct `FeatureRepository` query inside BPMN tasks** — bypasses `ProcessEntityFeatureService`, which means no `ExceptionEntity` on the execution, no REAL/TEST mode switch, and no cache warmup. Always go through the service layer.
+* {bad} **Treating `exhaustive=true` as free** — in REAL mode it triggers a live bureau pull per call. Batching features by data source (one call → all mappings) is built into `FeatureService`; do not re-call per field.
+* {bad} **Referencing `subject` in a script and expecting the sample preview to exercise it** — `DocumentResponseSampleManager.getBindings` passes `null` as the subject. The preview NPEs; live evaluation works. Either guard `subject != null` in the script or keep subject-dependent logic in Java inside an `EntityFeatureSource`.
+* {bad} **Uploading a sample under a data-source name with no matching `MappedDataSource` bean** — `convertDataIfAvailable` silently returns `null`, scripts relying on `<dsn>_converted` get `null` in the preview but a typed POJO in production. A broken sample that passes the preview is worse than one that fails at upload.
+* {bad} **Persisting the result of `/response_sample/{id}/evaluate-expression` as a real `Feature`** — the endpoint is a scripting sandbox, not an extraction path. Writing its output into the `feature` table bypasses the version/cache discriminators and poisons downstream cache lookups.
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every `FeaturedSubject` entity has `@Audited` on status-carrying fields so feature recomputes correlate to state changes in reports
+* {todo} Every mapping's script has been run against a stored `ResponseSample` for each data source before promotion to prod
+* {todo} `feature-extractor.groups.*` in `application.properties` covers every data source used in REAL mode — leaving them in `OTHERS` signals missing operator documentation
+* {todo} `Permission.FEATURE_STORE_MODIFY` is granted only to the risk/decisioning admin role; production operators can view but not edit
+* {todo} The export bundle produced by `FeatureMappingExporter` is checked into source control (or a migration artifact repo) and is the single source of truth for mappings
+* {todo} `feature` table retention is defined — immutable rows grow unbounded; an archive policy keyed on `ownerId` + `createdAt` is in place before any single application accumulates > 100k feature rows
+* {todo} `DataSourceFieldMapping.version` deltas in audit history are reviewed by a second pair of eyes whenever a production mapping changes — risk expressions are decision-critical code
+* {todo} The BPMN process handles HTTP `550` responses from `ExternalDataProviderController` as "retry later" rather than "fail run" (see <<flowable-external-api>>)
+* {todo} Every `EntityFeatureSource` bean has an integration test that loads its subject with `@Transactional`, calls `getBindings`, and verifies no `LazyInitializationException` for every mapping the risk team ships
+* {todo} Scripts relying on the `response` ProxyObject declare GraalJS as their `engineName` explicitly — non-Graal engines don't expose it
+* {todo} `DataSourceManager.invalidateData` is the only mechanism used to force a bureau re-pull; no direct `DELETE FROM feature` in operational runbooks
+* {todo} The admin UI at `/features-store` is reachable in production (not only dev) — a setting disabled here disables recoverability from bad mappings
+* {todo} Every production data source has at least one `ResponseSample` uploaded covering the "happy path" and one covering each branch the risk team's scripts explicitly handle (no-hit, empty response, rate-limited fallback) — the sample library is the regression harness for mapping changes
+* {todo} `DocumentStorage` retention on the `responseSample` folder is separate from the main document retention policy — samples are test fixtures, not customer artifacts, and should not roll out of storage with application documents
+* {todo} `POST /response_sample/upload/{dataSourceName}` is guarded by the same role as `Permission.FEATURE_STORE_MODIFY` — a user who can replay arbitrary payloads against mapping scripts has effective read access to the decisioning surface
+
+---
+
+**Related:** <<flowable-internals>>, <<flowable-external-api>>, <<workflow-integration>>, <<datasource-integration>>, <<audit-module-sdk-reference-internals>>, <<entity-module-sdk-reference-hierarchy>>
+
+**Next:** <<flowable-external-api>> — the REST contract the BPMN engine uses to read features produced by this subsystem.

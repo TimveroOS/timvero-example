@@ -1,0 +1,778 @@
+[[audit-module]]
+[[audit-module-sdk-reference-internals]]
+= Audit Module — SDK reference & internals
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+:templatedir: ../../main/resources/templates
+
+The audit module (`com.timvero.base.audit`) is the SDK layer that powers entity history tracking: it wraps Hibernate Envers, stores revisions with auditor/action attribution, and aggregates events from application-defined `HistoryEventSupplier` beans into a unified timeline. This guide covers internals and the `AuditService` API. For the entity-facing tutorial (how to add a history tab to your entity), see <<entity-history>>.
+
+== What You Need to Know
+
+The module has **three clearly separated layers** — skip past a layer only after you're sure you understand it:
+
+[cols="1,3,3", options="header"]
+|===
+|Layer |Purpose |Public API
+
+|**Envers foundation**
+|Hibernate Envers writes entity revisions to `_AUD` tables when an `@Audited` entity is persisted. The SDK's `AuditRevisionEntity` + `AuditRevisionListener` enrich each revision with `auditorId` (from `SecurityContext`) and `actionId` (from `AuditorActionHolder`).
+|`@Audited`, `AuditRevisionEntity`
+
+|**Query layer**
+|`AuditService.queryChanges()` reads revisions via Envers `AuditReader`, pairs them (prev → curr), and computes per-field diffs for an explicit set of field paths. Output: `List<RevisionPair<E>>`.
+|`AuditService`, `RevisionPair`, `FieldChange`
+
+|**Presentation layer**
+|`HistoryEventProvider` auto-discovers all `HistoryEventSupplier` beans, resolves suppliers for a given entity class via `isAssignableFrom`, collects `HistoryEvent` instances, sorts by date desc, and returns `HistoryEventView` records for rendering.
+|`HistoryEventSupplier`, `HistoryEvent`, `HistoryEventProvider`
+|===
+
+Key characteristics:
+
+- **Auto-discovery** — every `HistoryEventSupplier` bean is picked up automatically; no registration required.
+- **Assignability matching** — `HistoryEventProvider` matches `supplier.getRootClass().isAssignableFrom(entityClass)`. That's why `DocumentHistorySupplier` with `getRootClass() == HasDocuments.class` fires for **every** entity implementing `HasDocuments`.
+- **Transactional boundary** — `HistoryEventProvider.getHistoryViews()` is `@Transactional`. Do not call from non-transactional contexts.
+- **Explicit field tracking** — `AuditService.queryChanges()` computes diffs **only** for the `fieldPaths` you pass in. There is no "track all fields" mode.
+
+== Architecture Overview
+
+[source]
+----
+                  ┌──────────────────────────────┐
+   Entity change  │   @Audited entity persisted  │
+                  └──────────────┬───────────────┘
+                                 │
+                                 ▼
+                ┌──────────────────────────────────┐
+   Envers       │  Hibernate Envers                │
+   interceptor  │  writes row to <entity>_AUD      │
+                │  + creates AuditRevisionEntity   │
+                └──────────────┬───────────────────┘
+                               │ AuditRevisionListener
+                               ▼
+                ┌──────────────────────────────────┐
+                │  aud table row:                  │
+                │  id | timestamp | auditor_id |   │
+                │  action_id                       │
+                └──────────────────────────────────┘
+
+-- later, when UI requests history --
+
+                ┌──────────────────────────────────┐
+   Controller   │  EntityHistoryTabController      │
+                │  → historyEventProvider          │
+                │     .getHistoryViews(clazz, id)  │
+                └──────────────┬───────────────────┘
+                               │
+                               ▼
+                ┌──────────────────────────────────┐
+   Provider     │  1. Resolve suppliers for clazz  │
+                │     via isAssignableFrom         │
+                │  2. supplier.getHistoryEvents()  │
+                │  3. AuditService.queryChanges()  │
+                │     → AuditReader (Envers query) │
+                │  4. Sort by date desc            │
+                │  5. Wrap as HistoryEventView     │
+                └──────────────┬───────────────────┘
+                               │
+                               ▼
+                ┌──────────────────────────────────┐
+   View         │  Thymeleaf fragments render:     │
+                │  icon + type + date + auditor +  │
+                │  custom model                    │
+                └──────────────────────────────────┘
+----
+
+== Envers Foundation
+
+=== AuditRevisionEntity — the `aud` Table
+
+Every Envers revision creates one row in the `aud` table. The SDK's revision entity captures two extensions beyond the Envers default:
+
+[source,java]
+----
+@Entity
+@Table(name = "aud")
+@RevisionEntity(AuditRevisionListener.class)
+@HideInDocs
+@NotTrackable
+public class AuditRevisionEntity implements Serializable {
+
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY) @RevisionNumber
+    private int id;
+
+    @RevisionTimestamp
+    private Instant timestamp;
+
+    @Column(name = "auditor_id")
+    private UUID auditorId;      // <1>
+
+    @Column(name = "action_id")
+    private Long actionId;       // <2>
+}
+----
+<1> Populated from `SecurityContextHolder.getContext().getAuthentication().getPrincipal()` when the principal is an `AuditorUser`. If no user is authenticated (e.g., system job, test context), stays `null`.
+<2> Populated from `AuditorActionHolder.getCurrentAction()`. Links a revision to a user action (HTTP request, background job, etc.) — useful for correlating multiple entity changes made by the same logical operation.
+
+`@HideInDocs` excludes the table from generated schema docs; `@NotTrackable` prevents the audit entity itself from being audited (would cause infinite recursion).
+
+=== AuditRevisionListener
+
+Hibernate calls the listener each time Envers creates a new revision:
+
+[source,java]
+----
+public class AuditRevisionListener implements RevisionListener {
+
+    @Override
+    public void newRevision(Object o) {
+        AuditRevisionEntity revisionEntity = (AuditRevisionEntity) o;
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication != null && authentication.getPrincipal() instanceof AuditorUser user) {
+            revisionEntity.setAuditorId(user.getAuditorId());
+        }
+
+        AuditorAction action = AuditorActionHolder.getCurrentAction();
+        if (action != null) {
+            revisionEntity.setActionId(action.getId());
+        }
+    }
+}
+----
+
+WARNING: If `SecurityContext` doesn't contain an `AuditorUser` (e.g., async job, scheduler, test), the revision is created with `auditorId = null` — history UI will show "system" or empty auditor. Wrap such code with `SecurityContextHolder.getContext().setAuthentication(systemAuth)` if attribution is required.
+
+=== Entity Requirements
+
+For an entity to participate in history tracking:
+
+[cols="1,3", options="header"]
+|===
+|Requirement |Reason
+
+|`@Audited` on the entity class
+|Tells Envers to write revisions when instances change
+
+|`@Audited` on each `@Embeddable` with tracked fields
+|Required for nested field paths like `individualInfo.fullName` — without it, Envers won't track changes inside the embedded object
+
+|`@Table(name = "...")` (preferred) **or** `@DiscriminatorValue` (for inheritance children)
+|`EntityNameCache` resolves the logical entity name for i18n field labels using this annotation. Entity without either throws `IllegalArgumentException` at first history query.
+
+|Envers `_AUD` schema exists
+|Envers needs `<entity>_AUD` tables + the `aud` + `revinfo` tables. The SDK's Flyway/Liquibase migrations create these automatically when the dependency is on classpath.
+|===
+
+Example — the `aud` naming convention resolution logic:
+
+[source,java]
+----
+public static String getEntityType(Class<? extends Persistable<?>> clazz) {
+    return entityTypeCache.computeIfAbsent(clazz, EntityNameCache::cacheName);
+}
+
+private static String cacheName(Class<?> entityClass) {
+    Table table = entityClass.getAnnotation(Table.class);
+    if (table != null) {
+        return table.name();
+    }
+    validateDiscriminatorExists(entityClass);      // <1>
+
+    Class<?> parentClass = entityClass.getSuperclass();
+    while (parentClass != null && parentClass != Object.class) {
+        Table parentTable = parentClass.getAnnotation(Table.class);
+        if (parentTable != null) {
+            return parentTable.name();
+        }
+        parentClass = parentClass.getSuperclass();
+    }
+    throw new IllegalArgumentException(/* ... */);
+}
+----
+<1> For subclasses without their own `@Table` (SINGLE_TABLE inheritance), the entity **must** have `@DiscriminatorValue`. Otherwise `IllegalArgumentException` fires on the first history query — fails fast rather than silently returning `null`.
+
+== AuditService API
+
+`AuditService` is the only public query interface — a single method that wraps the Envers `AuditReader` and computes field-level diffs.
+
+=== queryChanges()
+
+[source,java]
+----
+public interface AuditService {
+
+    <ID, E extends Persistable<ID>> List<RevisionPair<E>> queryChanges(
+        Class<E> entityClass,
+        ID entityId,
+        Set<String> fieldPaths,
+        Set<RevisionType> revisionTypes
+    );
+}
+----
+
+Parameters:
+
+- **`entityClass`** — concrete entity class (not proxy). `AuditReader.forRevisionsOfEntity()` uses it.
+- **`entityId`** — identifier of the specific instance.
+- **`fieldPaths`** — explicit set of fields to compute diffs for. Dot notation supported: `"status"`, `"individualInfo.fullName"`. Pass empty `Set.of()` when revision type is `ADD` or `DEL` and diffs aren't needed.
+- **`revisionTypes`** — subset of `ADD`, `MOD`, `DEL`. Revisions outside this set are skipped entirely.
+
+Returns `List<RevisionPair<E>>` sorted by revision number ascending.
+
+=== RevisionPair<E>
+
+The result record contains everything needed to render a history event:
+
+[source,java]
+----
+public record RevisionPair<E>(
+    RevisionType revisionType,
+    int revisionNumber,
+    Instant updatedAt,
+    Auditor updatedBy,
+    E before,                              // <1>
+    E after,                               // <2>
+    Map<String, FieldChange> changes       // <3>
+) {
+    public record FieldChange(Object oldValue, Object newValue) {}
+}
+----
+<1> `null` for `ADD` revisions (no prior state). `before` entity state comes from Envers — it's a detached, read-only snapshot.
+<2> `null` for `DEL` revisions (no post-deletion state).
+<3> Keys are **exactly** the field paths you passed in `fieldPaths`. Values present only when old and new differ (tested via `Objects.equals`). For `MOD` revisions with no changes among tracked fields, the pair is **filtered out** of the result list entirely.
+
+=== Diff Computation Mechanics
+
+The implementation (`AuditServiceImpl`) uses reflection with a per-class field cache:
+
+[source,java]
+----
+private final Map<Class<?>, Map<String, Field>> fieldCache = new ConcurrentHashMap<>();
+
+private Field findField(Class<?> clazz, String fieldName) {
+    return fieldCache
+        .computeIfAbsent(clazz, k -> new ConcurrentHashMap<>())
+        .computeIfAbsent(fieldName, fn -> {
+            Class<?> current = clazz;
+            while (current != null) {
+                try {
+                    Field field = current.getDeclaredField(fn);
+                    field.setAccessible(true);
+                    return field;
+                } catch (NoSuchFieldException e) {
+                    current = current.getSuperclass();
+                }
+            }
+            throw new RuntimeException("Field not found: " + fn + " in class " + clazz.getName());
+        });
+}
+----
+
+Notes:
+
+- Traverses superclasses — `AbstractAuditable` fields are visible.
+- Throws at runtime if the field name is wrong — **use JPA metamodel constants** (`Entity_.FIELD_NAME`) to catch typos at compile time.
+- For nested paths (`"a.b.c"`), the embedded intermediate object is dereferenced recursively; if an intermediate is `null`, the leaf value is treated as `null` on that side.
+
+=== Direct Usage Beyond Suppliers
+
+Most code uses `AuditService` through the abstract supplier bases. Direct usage makes sense for:
+
+- **Compliance reports** — dump full revision history of an entity to a file
+- **Forensic/debugging** — compare two specific revisions
+- **Custom views** — a history panel that doesn't fit the tab model
+
+[source,java]
+----
+@Service
+public class ComplianceReportService {
+
+    private final AuditService auditService;
+
+    public List<RevisionPair<Credit>> getCreditAmountHistory(UUID creditId) {
+        return auditService.queryChanges(
+            Credit.class,
+            creditId,
+            Set.of(Credit_.AMOUNT, Credit_.INTEREST_RATE),
+            Set.of(RevisionType.ADD, RevisionType.MOD)
+        );
+    }
+}
+----
+
+[NOTE]
+====
+The method must run inside a transaction (Envers uses the same `EntityManager`). Annotate the caller or configure `@Transactional(readOnly = true)` on the method itself.
+====
+
+== Supplier Aggregation
+
+=== HistoryEventProvider
+
+The provider is the orchestrator — a single `@Service` that application code interacts with:
+
+[source,java]
+----
+@Service
+public class HistoryEventProvider {
+
+    @Autowired private EntityManager entityManager;
+    @Autowired private List<HistoryEventSupplier> historySuppliers;    // <1>
+
+    private final Map<Class<?>, List<HistoryEventSupplier>> suppliersCache
+            = new ConcurrentHashMap<>(64);                              // <2>
+
+    private List<HistoryEventSupplier> getHistorySuppliers(Class<? extends Persistable<?>> entityClass) {
+        return suppliersCache.computeIfAbsent(entityClass, c ->
+            historySuppliers.stream()
+                .filter(s -> s.getRootClass().isAssignableFrom(entityClass))    // <3>
+                .collect(Collectors.toList()));
+    }
+
+    @Transactional
+    public <E extends Persistable<ID>, ID extends Serializable>
+    Collection<HistoryEventView> getHistoryViews(Class<E> clazz, ID id, Locale locale) {
+        /* ... collect events from each supplier, sort by date desc ... */
+    }
+}
+----
+<1> Spring injects **every** `HistoryEventSupplier` bean. No explicit registration.
+<2> Resolution cache — the supplier list per entity class is computed once and cached forever (`ConcurrentHashMap`, no eviction). Safe because supplier set is fixed at startup.
+<3> `isAssignableFrom` is the key mechanic: a supplier with `getRootClass() == HasDocuments.class` matches **every** subtype. This is how `DocumentHistorySupplier` fires for all `HasDocuments` implementations automatically.
+
+Result is always sorted newest-first:
+
+[source,java]
+----
+result.sort(Comparator.comparing((HistoryEventView v) -> v.event().getDate()).reversed());
+----
+
+=== HistoryEventSupplier Contract
+
+The interface your application implements (directly or via abstract bases):
+
+[source,java]
+----
+public interface HistoryEventSupplier<R, E extends HistoryEvent> {
+
+    Class<R> getRootClass();                                          // <1>
+
+    String getEventPage();                                            // <2>
+
+    default Map<String, Object> getEventModel(R root, E event, Locale locale) {
+        return Collections.emptyMap();                                // <3>
+    }
+
+    List<E> getHistoryEvents(R root);                                 // <4>
+}
+----
+<1> The entity type this supplier handles. Can be an interface (e.g., `HasDocuments`) or concrete class.
+<2> Path to the Thymeleaf fragment rendering events from this supplier. Must exist as a `th:fragment="history"` in a template.
+<3> Extra model attributes for the template. Override when your fragment needs more than the base `event` object.
+<4> The business logic: given the entity, return its history events. May query Envers via `AuditService` or any other source (other services, external systems).
+
+=== HistoryEvent Hierarchy
+
+The base class carries the four universal fields; each supplier's static inner class adds its own:
+
+[source,java]
+----
+public abstract class HistoryEvent {
+    public enum Icon {ADD, EDIT, GENERATED, UPLOADED, SIGNED, DELETED}
+
+    private final Icon icon;
+    private final String type;        // i18n key, e.g. "PARTICIPANT_CREATED"
+    private final Instant date;
+    private final Auditor auditor;
+    /* getters */
+}
+----
+
+.Icon semantics
+[cols="1,3", options="header"]
+|===
+|Icon |Typical use
+
+|`ADD` |Entity or related entity created
+|`EDIT` |Entity fields modified
+|`GENERATED` |System-produced artifact (generated document)
+|`UPLOADED` |File uploaded by user
+|`SIGNED` |Signature applied to a document
+|`DELETED` |Soft-delete or archival event
+|===
+
+The icon is rendered by the Thymeleaf template — typically as a Font Awesome class via a shared fragment like `/history/fragments/_icon.html`.
+
+== Extension Bases (`impl/`)
+
+Four abstract classes cover the common Envers-backed cases. Use them by default — implement `HistoryEventSupplier` directly only when events come from a non-Envers source.
+
+=== AbstractAddedHistorySupplier — Creation Events
+
+Tracks a single event per entity — its creation (revision type `ADD`).
+
+Template: `/history/fragments/added` (framework-provided).
+
+Real-project usage:
+
+[source,java]
+----
+include::{sourcedir}/participant/history/ParticipantAddedHistorySupplier.java[tags=class]
+----
+
+That's the full supplier — three lines of logic. The base class handles the Envers query:
+
+[source,java]
+----
+public List<CreatedAtHistoryEvent> getHistoryEvents(E entity) {
+    List<RevisionPair<E>> revisions = auditService.queryChanges(
+        rootClass,
+        entity.getId(),
+        Set.of(),                         // <1>
+        Set.of(RevisionType.ADD)
+    );
+    if (revisions.isEmpty()) {
+        return List.of();                 // <2>
+    }
+    RevisionPair<E> creation = revisions.get(0);
+    return List.of(new CreatedAtHistoryEvent(
+        Icon.ADD, eventType,
+        creation.updatedAt(), creation.updatedBy(),
+        creation.after()
+    ));
+}
+----
+<1> Empty field set — no diff needed for creation
+<2> Can legitimately happen for entities inserted before `@Audited` was added
+
+=== AbstractModifiedHistorySupplier — Field Changes
+
+Tracks modifications to an explicit field set. Template: `/history/fragments/modified`.
+
+Real-project usage — note the nested paths via JPA metamodel:
+
+[source,java]
+----
+include::{sourcedir}/client/history/ClientModifiedHistorySupplier.java[tags=class]
+----
+
+Event shape:
+
+[source,java]
+----
+public static class ModifiedHistoryEvent extends HistoryEvent {
+    private final Object entity;                                  // after-state
+    private final Map<String, RevisionPair.FieldChange> changes;  // old/new per field
+    /* getters */
+}
+----
+
+The default template iterates `changes.entrySet()` and renders each as a row with localized field label + `ObjectPrintUtils.name(value, locale)` for before/after.
+
+=== AbstractRelatedEntityAddedHistorySupplier — Child Entity Creation
+
+Tracks creation of child entities as events on the parent's timeline. Both parent and related must be `@Audited`.
+
+Real-project usage:
+
+[source,java]
+----
+include::{sourcedir}/client/history/ClientParticipantCreatedEventSupplier.java[tags=class]
+----
+
+Key differences from `AbstractAddedHistorySupplier`:
+
+- Constructor takes **four** args: rootClass, relatedClass, eventType, **custom event page**
+- You must implement `getRelatedEntities(root)` — returns the collection of child entities whose creations should be surfaced
+- Template is custom (usually `/history/fragments/<parent>/<child>_created`) because you typically show the child's name/link
+
+The base class queries Envers for each related entity's ADD revision and wraps it in `RelatedEntityAddedHistoryEvent<RELATED>`. The template accesses the child as `event.relatedEntity`.
+
+=== AbstractRelatedEntityModifiedHistorySupplier — Child Entity Field Changes
+
+Tracks modifications on a related entity's fields, but surfaces them on the parent's timeline.
+
+Real-project usage — shows `Application.status` changes on the `Participant`'s history:
+
+[source,java]
+----
+include::{sourcedir}/participant/history/ParticipantApplicationStatusChangedHistorySupplier.java[tags=class]
+----
+
+The class extends `AbstractModifiedHistorySupplier` but **overrides `getHistoryEvents()`** — it queries the related class (Application) with the related entity's ID, not the root entity's. `getRelatedEntity(root)` provides the mapping.
+
+[NOTE]
+====
+**Only one-to-one / many-to-one** relationships fit this pattern (`getRelatedEntity()` returns a single entity). For one-to-many relationships, aggregate manually by querying each child separately.
+====
+
+=== Direct HistoryEventSupplier — Non-Envers Events
+
+When the events don't come from Envers (custom business events, decision tree executions, external-system notifications), implement the interface directly.
+
+Real-project usage — decision tree execution history pulled from `ProcessExecutionService`:
+
+[source,java]
+----
+include::{sourcedir}/participant/history/ParticipantProcessExecutionsHistorySupplier.java[tags=class]
+----
+
+The custom event class adds the `processExecution` and `decisionFacts` fields. The template renders them via a project-specific fragment at `/history/fragments/participant/participant_process_execution.html`.
+
+This pattern is the right choice when:
+
+- Events originate outside the audit tables (message queue, external API, business service)
+- You need richer per-event context than `FieldChange` provides
+- Events should be computed on-demand rather than retrieved from stored revisions
+
+== Built-in Suppliers (Free with `HasDocuments`)
+
+Two `@Component` suppliers are registered automatically by the SDK. They match on the `HasDocuments` interface — **any** entity implementing it gets these events in its history tab without writing a single line of code.
+
+=== DocumentHistorySupplier
+
+Event type: `DOCUMENT_ADDED`. Fires for every `EntityDocument` attached to the holder.
+
+[source,java]
+----
+@Component
+public class DocumentHistorySupplier
+        implements HistoryEventSupplier<HasDocuments, EntityDocumentHistoryEvent> {
+
+    @Override public Class<HasDocuments> getRootClass() { return HasDocuments.class; }
+    @Override public String getEventPage() { return "/history/fragments/entity_document"; }
+
+    @Override
+    public List<EntityDocumentHistoryEvent> getHistoryEvents(HasDocuments documentHolder) {
+        var documents = entityDocumentService.getAllDocuments(documentHolder);
+        return createAddedEvents(documents).toList();
+    }
+}
+----
+
+The supplier does **not** query Envers — it reads the current document collection via `EntityDocumentService` and uses each document's `createdAt` / `createdBy` as the revision data. This means deleted documents are invisible (by design — there's nothing in the holder's current collection to show).
+
+=== SignableDocumentHistorySupplier
+
+Emits **four** distinct events from the document's revision history, keyed on changes in `status` and `document` fields:
+
+[cols="1,2,3", options="header"]
+|===
+|Icon |Event type |Trigger
+
+|`GENERATED` |`SIGNABLE_DOCUMENT_GENERATED` |Revision type `ADD` — document created
+|`UPLOADED` |`SIGNABLE_DOCUMENT_UPLOADED` |`document` field transitions from `null` → non-null
+|`SIGNED` |`SIGNABLE_DOCUMENT_SIGNED` |`status` field transitions to `SignatureStatus.SIGNED`
+|`DELETED` |`SIGNABLE_DOCUMENT_DELETED` |`document` field transitions from non-null → `null`
+|===
+
+The logic queries Envers for tracked fields `SignableDocument_.STATUS` and `SignableDocument_.DOCUMENT` across both ADD and MOD revision types, then emits one or more events per revision based on which fields changed.
+
+[NOTE]
+====
+**Ordering**: `SignableDocumentHistorySupplier` sorts events **ascending** by date inside its own `getHistoryEvents()`, but `HistoryEventProvider` re-sorts everything **descending** at the end. The internal sort just ensures within-document consistency if a single revision triggers multiple events.
+====
+
+TIP: Because both suppliers match on `HasDocuments`, entities that implement `HasDocuments` but don't actually use signable documents still pay a (very small) query cost. Not worth special-casing — the overhead is negligible in practice.
+
+== HistorySupplierEvent Interface
+
+A marker interface for entities that **are themselves** history events — they don't need a supplier to transform them.
+
+[source,java]
+----
+public interface HistorySupplierEvent {
+    Instant getCreatedAt();
+    Auditor getCreatedBy();
+}
+----
+
+Used by `Notification` (in `com.timvero.structure.notification`) — a notification entity directly implements the interface, so a single wrapper supplier can adapt it into the history timeline by calling `getCreatedAt()` / `getCreatedBy()` directly instead of querying Envers.
+
+Use this pattern when:
+
+- The entity already has `createdAt` / `createdBy` denormalized on it
+- Revision history isn't needed (you only care about creation, not edits)
+- The entity is write-once or its mutations are irrelevant to history
+
+== Value Formatting — ObjectPrintUtils
+
+Utility for converting raw field values to user-facing strings. Used by the default modified/added templates and available for custom ones.
+
+[source,java]
+----
+public static String name(Object value, Locale locale) {
+    if (value == null)                         return "";
+    if (value instanceof Collection<?> c)      return join(c, locale);
+    if (value.getClass().isArray())            return joinArray(value, locale);
+    return printValue(value, locale);
+}
+
+private static String printValue(Object field, Locale locale) {
+    if (field instanceof Enum || field instanceof CustomEnum)
+        return EnumUtils.getLocalizedValue(field, locale);           // <1>
+    else if (field instanceof Temporal t)
+        return getTemporalFormatter(t).withLocale(locale).format(t); // <2>
+    else if (field instanceof NamedEntity named)
+        return named.getDisplayedName();                             // <3>
+    else if (field instanceof Persistable<?> p) {
+        p = EntityUtils.initializeAndUnproxy(p);
+        return p.getClass().getSimpleName().split("_")[0] + " #" + p.getId();  // <4>
+    }
+    return field.toString();
+}
+----
+<1> Both standard Java `Enum` and the SDK's `CustomEnum` are localized via `EnumUtils` (looks up message key `EnumClass.VALUE`)
+<2> `LocalDateTime`, `LocalDate`, `Instant` — short-style formatter per locale. Other `Temporal` types throw.
+<3> If the value is a `NamedEntity`, prefer its human-readable `displayedName` over `toString()`
+<4> For any other entity, fallback: short class name + `#<id>`. Strips Hibernate proxy suffix `_$$_...` via `split("_")[0]`. Also unproxies lazy associations — important because uninitialized proxies return meaningless `.toString()` output.
+
+Usage in custom Thymeleaf fragments:
+
+[source,html]
+----
+<td th:text="${T(com.timvero.base.audit.printer.ObjectPrintUtils).name(change.value.oldValue, #locale)}">old</td>
+<td th:text="${T(com.timvero.base.audit.printer.ObjectPrintUtils).name(change.value.newValue, #locale)}">new</td>
+----
+
+Prefer this over raw `${value}` — it handles null, collections, enums, and lazy proxies consistently.
+
+== Advanced Patterns
+
+=== Querying Audit History From a Controller
+
+When you need revision data outside a history tab (e.g., an audit report page):
+
+[source,java]
+----
+@RestController
+@RequestMapping("/api/audit")
+public class CreditAuditController {
+
+    @Autowired private AuditService auditService;
+
+    @GetMapping("/credit/{id}/amount-history")
+    @Transactional(readOnly = true)                            // <1>
+    public List<AmountChangeDto> getAmountHistory(@PathVariable UUID id) {
+        return auditService.queryChanges(
+            Credit.class, id,
+            Set.of(Credit_.AMOUNT),
+            Set.of(RevisionType.ADD, RevisionType.MOD)
+        ).stream()
+        .map(pair -> new AmountChangeDto(
+            pair.updatedAt(),
+            pair.updatedBy(),
+            pair.changes().get(Credit_.AMOUNT)))
+        .toList();
+    }
+}
+----
+<1> Required — Envers reads via the active transaction's `EntityManager`.
+
+=== Filtering by Revision Type
+
+[source,java]
+----
+// Only creation events
+auditService.queryChanges(Credit.class, id, Set.of(), Set.of(RevisionType.ADD));
+
+// Only modifications (skip initial creation)
+auditService.queryChanges(Credit.class, id, trackedFields, Set.of(RevisionType.MOD));
+
+// Full history including deletions
+auditService.queryChanges(Credit.class, id, trackedFields,
+    EnumSet.allOf(RevisionType.class));
+----
+
+=== Tracking Nested Fields Across `@Embedded`
+
+Both the parent and each embedded class must be `@Audited`:
+
+[source,java]
+----
+@Entity @Audited @Table(name = "client")
+public class Client extends AbstractAuditable {
+    @Embedded private IndividualInfo individualInfo;
+    @Embedded private ContactInfo contactInfo;
+}
+
+@Embeddable @Audited
+public class IndividualInfo { private String fullName; /* ... */ }
+
+@Embeddable @Audited
+public class ContactInfo { private String email; /* ... */ }
+
+// Supplier tracks paths:
+Set.of(
+    Client_.INDIVIDUAL_INFO + "." + IndividualInfo_.FULL_NAME,
+    Client_.CONTACT_INFO + "." + ContactInfo_.EMAIL
+)
+----
+
+If you forget `@Audited` on an embeddable, Envers doesn't populate the nested fields in revisions — `changes` map comes back empty and no history event fires, silently.
+
+=== Mixing Envers and Non-Envers Suppliers on the Same Entity
+
+A single entity's history tab can aggregate events from any number of suppliers. The timeline shows:
+
+- `ParticipantAddedHistorySupplier` — Envers (creation)
+- `ParticipantApplicationStatusChangedHistorySupplier` — Envers (field change on related)
+- `ParticipantProcessExecutionsHistorySupplier` — non-Envers (from `ProcessExecutionService`)
+- `DocumentHistorySupplier` — auto-registered, fires because `Participant implements HasDocuments`
+- `SignableDocumentHistorySupplier` — same
+
+`HistoryEventProvider` merges them all, sorts by date desc, renders each via its own template. No coupling between suppliers.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use JPA metamodel constants for field paths** — `Client_.CONTACT_INFO + "." + ContactInfo_.EMAIL` survives refactors; `"contactInfo.email"` doesn't
+* {ok} **Annotate `@Embeddable` classes with `@Audited`** whenever you track their fields — otherwise changes silently won't be detected
+* {ok} **Declare `@Table(name = "...")` even on single-table inheritance parents** — `EntityNameCache` uses the table name as the i18n prefix
+* {ok} **Prefer abstract bases over direct `HistoryEventSupplier`** — abstract bases handle Envers wiring; direct implementation is for non-Envers sources only
+* {ok} **Implement `HasDocuments` to get document history for free** — no supplier code required; `DocumentHistorySupplier` and `SignableDocumentHistorySupplier` cover both generic and signable documents
+* {ok} **Reuse built-in `HistoryEvent.Icon` values** — templates rely on them for CSS class selection; custom icons need template changes
+* {ok} **Populate `SecurityContext` with an `AuditorUser` before any write**, including async jobs and tests — otherwise revisions come back with `auditorId = null`
+* {ok} **Use `ObjectPrintUtils.name()` in custom templates** — handles collections, enums, proxies, locale formatting consistently
+* {ok} **Keep `getHistoryEvents()` side-effect free** — it runs inside a read-only query context; mutating state there breaks isolation
+* {ok} **Call `HistoryEventProvider` from transactional controllers** — `@Transactional(readOnly = true)` on the controller method is enough
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Forgetting `@Audited` on a nested `@Embeddable`** — `changes` map comes back empty, no event fires, no error; the bug surfaces only when someone notices missing history
+* {bad} **Hard-coding field names** (`"status"` instead of `Application_.STATUS`) — a rename in the entity silently breaks the supplier; runtime `NoSuchFieldException` appears only on the first history query
+* {bad} **Calling `HistoryEventProvider.getHistoryViews()` outside a transaction** — Envers needs the shared `EntityManager`; outside a TX you get `LazyInitializationException` or empty results depending on config
+* {bad} **Implementing `HistoryEventSupplier` without `@Component`** — Spring's `List<HistoryEventSupplier>` injection won't pick it up; the supplier is silently dead code
+* {bad} **Extending an abstract supplier for an entity that isn't `@Audited`** — `AuditService.queryChanges()` returns empty; supplier always yields zero events with no diagnostic
+* {bad} **Mutating entity state inside `getHistoryEvents()`** — runs in a read-only transactional context; writes may be flushed unpredictably or fail with `TransactionException`
+* {bad} **Using a `Set<String>` of tracked fields that mixes entity and related-entity paths** in `AbstractRelatedEntityModifiedHistorySupplier` — the paths are resolved against the **related** class, so paths from the root class silently return no changes
+* {bad} **Setting `@Audited` on entities with `@ElementCollection`** without auditing the element type — Envers handles this awkwardly; prefer a `@OneToMany` with an `@Audited` child entity
+* {bad} **Using `HasDocuments` without wiring `EntityDocumentService`** — `DocumentHistorySupplier` runs but throws NPE; `HasDocuments` is a contract, not just a marker
+* {bad} **Assuming `auditorId` is always populated** — background jobs, Flyway migrations, and bootstrap code produce revisions with `auditorId = null`; UI must tolerate the `null` case
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every audited entity has `@Audited` + `@Table(name = "...")` (or `@DiscriminatorValue` for inheritance children)
+* {todo} All `@Embeddable` classes used as tracked nested paths have `@Audited`
+* {todo} Every `HistoryEventSupplier` implementation is annotated with `@Component`
+* {todo} Envers `_AUD` schema is created by Flyway/Liquibase migrations and matches entity schema
+* {todo} `AuditorUser` is wired into `SecurityContext` for all write paths, including scheduled jobs and message consumers
+* {todo} All tracked field paths use JPA metamodel constants (`Entity_.FIELD_NAME`) rather than strings
+* {todo} i18n keys exist for each event type (`history.type.<EVENT_TYPE>`) and each tracked field label (`<table>.<field>`)
+* {todo} Thymeleaf fragments at paths returned by `getEventPage()` exist and define `th:fragment="history"`
+* {todo} Custom templates use `ObjectPrintUtils.name()` for value rendering
+* {todo} Entity detail pages include an `EntityHistoryTabController` subclass
+* {todo} Performance-tested for entities with > 1 000 revisions — Envers queries can scan full `_AUD` table without appropriate indexes
+* {todo} `aud.auditor_id` foreign key (or just referenced column) is indexed if reports query by auditor
+* {todo} Monitoring captures cases where `auditorId = null` — signals missing auth context in a write path
+* {todo} Async jobs wrap their logic in a transaction and populate `SecurityContext` (or explicitly document why revisions will be system-authored)
+* {todo} Background / bulk-import workflows have an explicit policy for `@Audited` (skip Envers via `@NotAudited` on import-only flows, or accept the revision volume)
+
+---
+
+**Related:** <<entity-history>>, <<documents>>, <<documents>>, <<user-action-audit>>, <<data-model>>
+
+**Next:** <<entity-history>>

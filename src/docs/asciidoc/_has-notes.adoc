@@ -1,45 +1,393 @@
 [[has-notes]]
-= HasNotes Integration
+= HasNotes — Entity Notes with Change History
 
-The `HasNotes` interface allows any entity to have associated notes and comments through automatic integration with `ViewableFilterController`.
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The note module (`com.timvero.ground.note`) attaches user-authored notes / comments to any entity via the `HasNotes` marker interface. Beyond the notes themselves, every edit is captured in a separate change-history table, giving you an audit trail of what was written, by whom, and when — without wiring your own audit logic.
+
+== What You Need to Know
+
+The module has three distinct pieces:
+
+[cols="1,3,2", options="header"]
+|===
+|Piece |Role |Key types
+
+|**Marker interface**
+|`HasNotes` — declares an entity as notable
+|`HasNotes` (extends `Persistable<UUID>`)
+
+|**Persisted entities**
+|Notes and their change history — two tables (`entity_note`, `entity_note_change`), separate audit records per edit
+|`EntityNote`, `EntityNoteChange`
+
+|**Service + repositories**
+|CRUD API, paginated queries, change history retrieval
+|`EntityNoteService`, `EntityNoteRepository`, `EntityNoteChangeRepository`
+|===
+
+Key characteristics:
+
+- **Zero controller code** required — implement `HasNotes` on an entity whose controller extends `ViewableFilterController`, and the notes UI appears automatically on the detail page
+- **Ownership by `ownerId`** — inherited from `AbstractOwnable`; no direct association to the parent entity (denormalized for fast queries)
+- **Change-on-every-edit** — each `editComment()` call creates a new `EntityNoteChange` row; the current text lives on `EntityNote`, history on `EntityNoteChange`
+- **Important / pinned flag** — `EntityNote.important` boolean used for sorting; important notes always appear first
+- **Soft `edited` flag** — set to `true` automatically the first time `setText()` is called after creation; never resets
 
 == How It Works
 
-If your entity already has a dedicated view page with `ViewableFilterController`, you can add Notes functionality by simply implementing the `HasNotes` interface - the Notes UI will appear automatically.
+If your entity already has a dedicated view page with `ViewableFilterController`, add notes by implementing `HasNotes` — the notes UI appears automatically. The integration happens in three layers:
 
-The integration happens in three layers:
+1. **Entity Level** — Add `HasNotes` interface to existing entity
+2. **Controller Level** — Already extends `ViewableFilterController` (no changes needed)
+3. **Template Level** — Framework automatically enables the notes UI on the view page
 
-1. **Entity Level** - Add `HasNotes` interface to existing entity
-2. **Controller Level** - Already extends `ViewableFilterController` (no changes needed)
-3. **Template Level** - Framework automatically enables Notes UI on the view page
+When `ViewableFilterController` detects `HasNotes`, it sets `notesEnabled = true` in the template model and wires the JavaScript integration for note operations.
 
 == Setup
 
-Simply add `HasNotes` interface to your entity:
+Add the marker to your entity:
 
 [source,java]
 ----
 @Entity
 public class Application extends AbstractAuditable implements HasNotes {
-    // Your entity fields...
+    // your business fields
 }
 ----
 
-Your controller should already extend `ViewableFilterController` - no additional code needed for Notes functionality.
+That's the entire setup. `AbstractAuditable` isn't a requirement — any entity implementing `HasNotes` (which is `Persistable<UUID>`) works. No schema migration needed on your entity's table — notes live in `entity_note` / `entity_note_change` keyed by `owner_id`.
 
-== What Happens Automatically
+== Entity Model
 
-When `ViewableFilterController` detects that your entity implements `HasNotes`:
+=== EntityNote — The Current Note
 
-1. **Sets** `notesEnabled = true` in template model
-2. **Provides** JavaScript integration for note operations
+[source,java]
+----
+@Entity
+@Table(name = "entity_note", indexes = {
+    @Index(name = "idx_entity_note_owner", columnList = "owner_id")           // <1>
+})
+public class EntityNote extends AbstractOwnable {
 
-== Features You Get
+    @Column(columnDefinition = TEXT)
+    private String text;
 
-* Notes section appears in entity views automatically
-* Rich text note creation and editing
-* Pin notes
-* User attribution and timestamps
-* Audit trail integration
+    @Column(nullable = false)
+    private boolean important;                                                 // <2>
 
-No additional configuration required - the framework handles everything through the `ViewableFilterController` integration pattern.
+    @Column(name = "edited", nullable = false)
+    private boolean edited;                                                    // <3>
+
+    public EntityNote(UUID ownerId, String text, boolean important) {
+        super(ownerId);
+        this.text = text;
+        this.important = important;
+    }
+
+    public void setText(String text) {
+        this.text = text;
+        this.edited = true;                                                    // <4>
+    }
+}
+----
+<1> Dedicated index on `owner_id` — every query for "all notes on entity X" goes through it. No other indexes; the module doesn't expect global searches of notes.
+<2> Pinning flag. Important notes sort first in list queries (`ORDER BY important DESC, created_at DESC`).
+<3> "Has been edited since creation" — pure UI hint (the "edited" badge next to the note). Once `true`, stays `true`.
+<4> **Automatic `edited` transition** — `setText()` always sets `edited = true`. Even if the service uses the setter on initial creation, it wouldn't matter because the note is persisted fresh after the constructor, not via `setText`. The field is only flipped on actual post-save edits.
+
+Extends `AbstractOwnable`, so the entity also has:
+
+- `id` (UUID, auto-generated)
+- `ownerId` (the `HasNotes` entity's id — never updated after insert)
+- `createdAt` / `createdBy` (Spring Data auditing — set at persist time, never mutated)
+
+**No `updatedAt` / `updatedBy`** — `AbstractOwnable` omits them by design. Edit history lives in `EntityNoteChange`, not on the note itself.
+
+=== EntityNoteChange — The Audit Trail
+
+[source,java]
+----
+@Entity
+@Table(name = "entity_note_change", indexes = {
+    @Index(name = "idx_entity_note_change_note", columnList = "note_id")
+})
+@EntityListeners(AuditingEntityListener.class)
+public class EntityNoteChange extends AbstractPersistable<UUID> {
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @CreatedBy
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "created_by", updatable = false)
+    private Auditor createdBy;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "note_id", nullable = false, updatable = false)
+    private EntityNote note;                                                    // <1>
+
+    @Column(columnDefinition = "text")
+    private String text;                                                        // <2>
+}
+----
+<1> Link back to the `EntityNote` — immutable; change rows are append-only
+<2> **Full text snapshot at the time of edit** — not a diff. Reconstructing "what did the note say 3 weeks ago" is one read of the matching change row; no replay needed
+
+Each row in `entity_note_change` represents either:
+
+- **The initial creation** — the first change row has the same text as the original note
+- **Each subsequent edit** — new text + new `createdAt` + new `createdBy`
+
+Querying the change history for a note gives you the complete version-by-version evolution. The **current** text is always on `EntityNote.text`; the history table is for audit only.
+
+[NOTE]
+====
+**Why not use Envers / `AbstractAuditable`?** The note module deliberately stores complete text snapshots in a dedicated table rather than relying on Envers. Two reasons: (1) the audit story is about *who said what*, not *who changed what field*, so full snapshots are more natural; (2) this keeps the notes flow independent of the project's Envers configuration — notes work even if Envers is disabled.
+====
+
+=== HasNotes — The Marker
+
+[source,java]
+----
+public interface HasNotes extends Persistable<UUID> {
+    // no methods — purely a marker
+}
+----
+
+Implementing it is the sole trigger for:
+
+- Notes UI appearing on the entity's detail page
+- `EntityNoteService` accepting the entity as an owner argument
+- History integration (see <<entity-history>> — not currently wired for notes, but the pattern is compatible)
+
+== Service API — EntityNoteService
+
+The `@Service` that encapsulates all note operations:
+
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`addComment(HasNotes owner, String text, boolean important)`
+|Create a new note + the initial `EntityNoteChange` row. Returns the saved `EntityNote`.
+
+|`getNotes(HasNotes owner, int pageNumber, int pageSize)`
+|Paginated list of notes for this owner, sorted `important DESC, createdAt DESC`. Returns `List<EntityNote>`.
+
+|`countNotes(HasNotes owner)`
+|Total count — used for pagination metadata and UI badges ("3 notes").
+
+|`findNote(HasNotes owner, UUID noteId)`
+|Find a single note. **Verifies ownership** — throws `NotFoundException` if the note belongs to a different owner. Prevents accidental cross-entity leakage.
+
+|`editComment(HasNotes owner, UUID noteId, String text)`
+|Update the note's text (auto-setting `edited = true` via setter). Creates a new `EntityNoteChange` row. Does NOT touch `important`.
+
+|`pinComment(HasNotes owner, UUID noteId, boolean important)`
+|Toggle pinning — sets the `important` flag. Does NOT create a change row (pinning isn't considered a text edit).
+
+|`getChangeHistory(HasNotes owner, UUID noteId)`
+|Ordered list of `EntityNoteChange` rows, newest first.
+|===
+
+Usage from a controller (rarely needed — the notes UI calls the service internally):
+
+[source,java]
+----
+@Autowired private EntityNoteService noteService;
+
+public void addInitialNoteOnDecline(Application application, String reason) {
+    noteService.addComment(application, "Auto-declined: " + reason, true);
+}
+----
+
+=== Transaction Semantics
+
+[cols="2,2", options="header"]
+|===
+|Method |Transaction
+
+|`addComment`, `editComment`, `pinComment`
+|`@Transactional` (read/write)
+
+|`getNotes`, `countNotes`, `findNote`, `getChangeHistory`
+|`@Transactional(readOnly = true)`
+|===
+
+Call from inside your own transaction to compose with other writes — default propagation joins the existing one.
+
+=== Ownership Enforcement
+
+Every method except `addComment` / `getNotes` / `countNotes` cross-checks the note's `ownerId` against the passed-in `HasNotes.getId()`. If they don't match, `NotFoundException` (HTTP 404) is thrown rather than a generic error — so probing for other users' notes looks like "not found", not "access denied" (side-channel prevention).
+
+== Repositories
+
+=== EntityNoteRepository
+
+[source,java]
+----
+public interface EntityNoteRepository extends JpaRepository<EntityNote, UUID> {
+
+    @Query("SELECT e FROM EntityNote e WHERE e.ownerId = :owner " +
+           "ORDER BY e.important DESC, e.createdAt DESC")                       // <1>
+    List<EntityNote> findByOwner(@Param("owner") UUID owner, Pageable pageable);
+
+    @Query("SELECT COUNT(e) FROM EntityNote e WHERE e.ownerId = :owner")
+    Long countByOwner(@Param("owner") UUID owner);
+}
+----
+<1> **Important notes float to the top** regardless of age. Within the same `important` value, newest-first. This sort is the reason the index on `owner_id` alone is sufficient — the in-memory/B-tree sort on the small per-owner slice is cheap.
+
+No additional query methods are provided by the SDK. If you need custom queries (e.g., "search by text", "notes authored by user X"), add them in a project-specific repository.
+
+=== EntityNoteChangeRepository
+
+[source,java]
+----
+public interface EntityNoteChangeRepository extends JpaRepository<EntityNoteChange, UUID> {
+
+    @Query("SELECT e FROM EntityNoteChange e WHERE e.note.id = :noteId " +
+           "ORDER BY e.createdAt DESC")
+    List<EntityNoteChange> findByNoteId(@Param("noteId") UUID noteId);
+}
+----
+
+Only one query — history for a single note. Paging intentionally omitted; most notes have 1-5 versions, full list is cheap.
+
+== Advanced Patterns
+
+=== Programmatic Note Creation
+
+When business logic needs to leave a note — a workflow transition, an automated check, an integration callback:
+
+[source,java]
+----
+@Service
+public class DeclineService {
+
+    @Autowired private EntityNoteService noteService;
+
+    @Transactional
+    public void decline(Application application, String reason, String details) {
+        application.setStatus(ApplicationStatus.DECLINED);
+
+        noteService.addComment(
+            application,
+            "Auto-declined: " + reason + "\n\n" + details,
+            true                                 // important — pin it
+        );
+    }
+}
+----
+
+This creates the note with the current `SecurityContext` principal as the `createdBy`. For system-generated notes where there's no user context (schedulers, async jobs), ensure the security context is populated with the system auditor (see <<entity-module-sdk-reference-hierarchy>> for the pattern).
+
+=== Displaying Change History
+
+Expose the change history on the detail page:
+
+[source,java]
+----
+@GetMapping("/application/{id}/notes/{noteId}/history")
+@ResponseBody
+public List<NoteHistoryDto> history(@PathVariable UUID id, @PathVariable UUID noteId) {
+    Application app = applicationRepository.findById(id).orElseThrow(NotFoundException::new);
+
+    return noteService.getChangeHistory(app, noteId).stream()
+        .map(c -> new NoteHistoryDto(
+            c.getCreatedAt(),
+            c.getCreatedBy() != null ? c.getCreatedBy().getName() : "system",
+            c.getText()))
+        .toList();
+}
+----
+
+The returned list is newest-first; reverse it in the UI if you want to show evolution in chronological order.
+
+=== Using Notes for Integration Metadata
+
+The `text` column is `TEXT` — use it to store structured data for non-user-facing audit purposes:
+
+[source,java]
+----
+// DocuSign webhook fires on signature event
+noteService.addComment(
+    application,
+    "DocuSign envelope " + envelopeId + " signed by " + recipient + " at " + timestamp,
+    false);
+----
+
+Appears as a regular note in the UI, but the content is meaningful for compliance reviews. Combine with a convention like `"[SYSTEM]"` prefix to let templates style system notes differently.
+
+=== Bulk Note Creation
+
+`addComment` runs one insert per call. For bulk imports (seed data, migration), go directly to the repositories:
+
+[source,java]
+----
+@Transactional
+public void importLegacyNotes(Application app, List<LegacyNote> legacyNotes) {
+    List<EntityNote> notes = legacyNotes.stream()
+        .map(ln -> new EntityNote(app.getId(), ln.getText(), ln.isImportant()))
+        .toList();
+    noteRepository.saveAll(notes);
+
+    // Create initial change row for each
+    List<EntityNoteChange> changes = notes.stream()
+        .map(n -> new EntityNoteChange(n, n.getText()))
+        .toList();
+    noteChangeRepository.saveAll(changes);
+}
+----
+
+Note: `createdAt` / `createdBy` audit fields are set by Spring Data auditing during the `save()` call — they reflect the **import** time, not the legacy creation time. If legacy timestamps matter, you have to mutate the fields manually before save, which bypasses the standard audit listener.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Implement `HasNotes` even on entities where the UI doesn't render notes** — lets programmatic code still use `EntityNoteService`, keeps schema consistent
+* {ok} **Use `important = true` for automatic system notes** — pins compliance-relevant entries to the top so reviewers see them first
+* {ok} **Use the service, not repositories directly** — `EntityNoteService` enforces ownership, creates change rows on edit, and runs in the right transaction
+* {ok} **Pass the owner entity, not just its id** — the service uses `.getId()` internally; the type-safe `HasNotes` argument prevents mix-ups between UUID sources
+* {ok} **Populate `SecurityContext` before calling `addComment` from async code** — otherwise `createdBy` ends up `null` and the audit trail loses attribution
+* {ok} **Sort change history newest-first for audit review** — the repository already does this; templates should preserve the order
+* {ok} **Use `TEXT` content type without size limits in the DB** — the column is intentionally unbounded; don't add `@Size(max=...)` unless you have a specific UX reason
+* {ok} **Keep pinning orthogonal to change history** — `pinComment` doesn't create a change row; treat it as a UI toggle, not an audit event
+* {ok} **Consider `important` as "has operational significance"** rather than "is urgent" — sorting order is stable; changing the semantics mid-flight breaks user expectations
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Mutating `EntityNote.text` directly bypassing the service** — skips the change-row creation, `edited` flag may be correct but history is incomplete
+* {bad} **Hard-deleting notes via `noteRepository.delete(...)`** — audit rows in `entity_note_change` become orphan references; there's no cascade; prefer adding a "deleted" marker note rather than removing
+* {bad} **Changing `EntityNote.ownerId` after creation** — breaks the ownership check; the field isn't marked `updatable = false` but `AbstractOwnable` treats it as immutable; audit history becomes orphaned
+* {bad} **Paginating `getChangeHistory`** — the method returns an unbounded list by design; adding pagination means reconstructing history requires multiple queries. For multi-thousand-edit notes (extremely rare), reconsider whether they should be split into multiple notes
+* {bad} **Calling `pinComment` as a way to signal an "updated" event** — pinning doesn't touch text or fire a change row; monitoring systems won't see it. Use `editComment` (even with the same text — the service still writes a change row) or a domain event
+* {bad} **Indexing `entity_note.text` for full-text search without review** — the column is `TEXT`; size varies widely; a naive index bloats storage. If search is needed, use a full-text index (PostgreSQL `GIN` + `tsvector`) in a project-specific migration
+* {bad} **Relying on `EntityNote.edited` as an "edited recently" signal** — the flag is sticky (never resets to `false`); it says "ever edited", not "edited recently". For "recently edited", compare the latest `EntityNoteChange.createdAt` to the note's `createdAt`
+* {bad} **Using `EntityNoteService.addComment` inside a read-only transaction** — the method is `@Transactional` (read/write) and will attempt to enlist; causes `TransactionException` when the outer transaction is marked read-only
+* {bad} **Surfacing `EntityNote` entities directly in JSON responses** — includes the `owner_id` and Hibernate lazy proxies; always map to a DTO
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every user-visible entity that may need comments implements `HasNotes`
+* {todo} `entity_note` and `entity_note_change` tables present in migrations (created by SDK migrations — verify they ran)
+* {todo} `idx_entity_note_owner` and `idx_entity_note_change_note` indexes present
+* {todo} `SecurityContext` populated on every code path that creates notes (including schedulers, webhooks, integrations)
+* {todo} UI notes panel tested on the entity's detail page — loads and paginates correctly
+* {todo} Change-history display (if exposed) surfaces `createdBy = null` as "system" rather than blank
+* {todo} Integration tests verify `findNote` rejects cross-owner lookups (important for multi-tenant safety)
+* {todo} Monitoring: alert on repeated `NotFoundException` from note endpoints — may indicate probing / side-channel attempts
+* {todo} Compliance review: ensure the audit trail satisfies legal retention (no bulk-delete paths that orphan change rows)
+* {todo} Performance-tested for entities with many notes (>100) — important-DESC sort stays cheap on small per-owner slices
+* {todo} If custom queries added, they honor `ownerId` scoping to avoid cross-entity leakage
+* {todo} Backup / export paths include both `entity_note` and `entity_note_change` — restoring only the note loses history
+
+---
+
+**Related:** <<entity-module-sdk-reference-hierarchy>>, <<audit-module-sdk-reference-internals>>, <<entity-history>>, <<documents>>
+
+**Next:** <<entity-history>>, <<audit-module-sdk-reference-internals>>

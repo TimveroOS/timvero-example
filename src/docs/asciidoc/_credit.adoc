@@ -1,3 +1,4 @@
+[[credit-management]]
 = Credit Management System
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -525,5 +526,219 @@ public class CreditCard extends Credit {
 * **Access Control**: Use role-based security for credit operations
 * **Audit Logging**: Maintain comprehensive audit trails for regulatory compliance
 * **Data Retention**: Implement data retention policies for closed credits
+
+[[disbursement-payments]]
+== Disbursement Payments
+
+The SDK ships a small persistence-side module at `com.timvero.disbursement.payment` — **four files, one subpackage** (`entity`) — that records every real-world money movement tied to a credit. Unlike the main `CreditPayment` / `CreditOperation` chain (documented in <<credit-operations-framework>>), which tracks *accounting* events on the credit, the disbursement module tracks the *external voucher* that actually paid the money out or collected it. It is how the credit lifecycle reconciles against what the treasury / payment-provider rail actually did.
+
+=== Module Contents
+
+[cols="1,3", options="header"]
+|===
+| File | Role
+
+| `DisbursementPayment` | Entity — one row per money-movement tied to a credit.
+| `DisbursementReason` | Enum — why this disbursement happened (`COLLECTED_PAYMENT`, `OPERATION`, `MERCHANT_FEE`).
+| `DisbursementScheme` | Enum — how the product pays out (`PREPAYMENT`, `COLLECTED`).
+| `DisbursementPaymentRepository` | Spring Data repository — lookup by credit id.
+|===
+
+=== The `DisbursementPayment` Entity
+
+[source,java]
+----
+@Entity
+@Table(name = "disbursement_payment")
+public class DisbursementPayment extends UndeletableEntity<Long> {
+
+    @Column(nullable = false)
+    private DisbursementReason reason;
+
+    @Embedded
+    @CompositeType(MonetaryAmountType.class)
+    @Columns(columns = { @Column(name = "currency"), @Column(name = "amount") })
+    private MonetaryAmount amount;
+
+    @ManyToOne(fetch = FetchType.LAZY, cascade = {CascadeType.MERGE, CascadeType.PERSIST})
+    @JoinColumn(name = "voucher_id")
+    @Fetch(FetchMode.SELECT)
+    private Voucher voucher;
+
+    @Column(nullable = false)
+    private UUID creditId;
+
+    @Column
+    private LocalDate createDate;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "credit_payment")
+    private CreditPayment creditPayment;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "credit_operation")
+    private CreditOperation creditOperation;
+}
+----
+
+Things worth internalising:
+
+* **`UndeletableEntity<Long>` base** — the row is write-append only. There is no `delete()` path; reversals are modelled as *new* rows with opposite direction, not mutations. See <<entity-module-sdk-reference-hierarchy>> for the base. This matches regulator expectations for financial audit trails.
+* **`creditId` is a raw `UUID`, not a `@ManyToOne Credit`** — the module deliberately avoids the servicing-side `Credit` association. It lets the disbursement module stay decoupled from the domain-specific `Credit` subclass (so any `Credit` extending the SDK base can use it without creating a reverse FK).
+* **`voucher`** — the external document that represents the money movement on the accounting/treasury side (`com.timvero.disbursement.voucher.Voucher`). Cascade is `MERGE + PERSIST` only — *not* `REMOVE`. The voucher outlives the disbursement and can be referenced by several rows (e.g. when a single bank transfer covers multiple credit-side operations).
+* **`creditPayment` / `creditOperation` (mutually exclusive)** — two overloaded public constructors force the choice: one takes a `CreditPayment`, the other a `CreditOperation`. Exactly one is set per row. `creditPayment` links inbound money (the customer paid, this is the payment it settled); `creditOperation` links outbound money (this is the operation — usually a disbursement charge or fee — that the voucher paid for).
+* **`reason`** — classifies the row into one of three buckets (see below). Indexes usually combine `(creditId, reason)` for per-credit reporting.
+* **`createDate`** is `LocalDate` (business date, not instant) — matches how the calculation engine books operations.
+
+=== `DisbursementReason`
+
+[source,java]
+----
+public enum DisbursementReason implements Listable<DisbursementReason> {
+    COLLECTED_PAYMENT,
+    OPERATION,
+    MERCHANT_FEE;
+}
+----
+
+[cols="1,3", options="header"]
+|===
+| Reason | When it's used
+
+| `COLLECTED_PAYMENT`
+| A borrower payment that was collected via the voucher rail and applied to a `CreditPayment`. Wires into `creditPayment`. Typical under `DisbursementScheme.COLLECTED`.
+
+| `OPERATION`
+| A loan-side operation (most often the principal disbursement itself, but also merchant payouts, fee disbursements) paid out through a voucher. Wires into `creditOperation`.
+
+| `MERCHANT_FEE`
+| Fee paid to a merchant/partner, booked against a `CreditOperation`. Kept separate from `OPERATION` for reporting — merchant fees are usually recoverable/reconciliable against a separate ledger.
+|===
+
+`Listable` is the SDK's "enum the admin UI can render in a dropdown with a localised label" marker (see <<entity-module-sdk-reference-hierarchy>>) — if you add a new reason, add a `messages.properties` entry under `disbursement.reason.<NAME>`.
+
+=== `DisbursementScheme`
+
+[source,java]
+----
+public enum DisbursementScheme {
+    PREPAYMENT,
+    COLLECTED
+}
+----
+
+The scheme is a **product-level** choice — it lives on your credit product / offer, not on each disbursement row, and it dictates *how* a disbursement is registered against the credit:
+
+* **`PREPAYMENT`** — the lender pays the merchant up-front, then collects from the borrower over time. Disbursement is booked when the voucher clears the lender's side; subsequent borrower payments flow through the normal payment-transaction pipeline and land as `CreditPayment`s. Typical for point-of-sale / BNPL products.
+* **`COLLECTED`** — the merchant collects from the borrower and remits to the lender. Each remittance is a `DisbursementPayment(reason = COLLECTED_PAYMENT, creditPayment = ...)` — the voucher represents the merchant's settlement batch, and `creditPayment` links it back to what the calculation engine booked. Typical for merchant-of-record / affiliate lending.
+
+The scheme does not change the entity schema — it changes which `reason` values are expected and which leg (`creditPayment` vs `creditOperation`) is populated.
+
+=== `DisbursementPaymentRepository`
+
+[source,java]
+----
+public interface DisbursementPaymentRepository
+        extends JpaRepository<DisbursementPayment, Long>,
+                JpaSpecificationExecutor<DisbursementPayment> {
+
+    List<DisbursementPayment> findByCreditId(UUID creditId);
+}
+----
+
+One custom finder — everything else per-credit view needs goes through the dynamic `Specification` machinery (filter by date range, by reason, by presence of a `creditPayment` link, etc.). See <<list-filters>> for the filter DSL.
+
+`findByCreditId` is the lookup every credit-detail screen uses; it returns rows in insertion order (no explicit `Sort`). If you need chronological display, sort by `createDate` at the call site — rows inserted on the same business date share a date but not necessarily an insertion order, so a secondary sort on `id` desc is usually wanted.
+
+=== How Disbursement Wires Into the Credit Lifecycle
+
+[source]
+----
+                       ┌────────────────────────────────────────┐
+                       │       DisbursementScheme = PREPAYMENT  │
+                       └────────────────────────────────────────┘
+  Offer accepted ──► CreditOperation (principal disbursement)
+                                   │
+                                   ▼
+          Voucher prepared ──► DisbursementPayment(
+                                  reason = OPERATION,
+                                  creditOperation = ...principal op...,
+                                  voucher = <treasury voucher>)
+                                   │
+                                   ▼
+          Voucher cleared ───► treasury / payment-provider rail
+                                   │
+                                   ▼  (later, unrelated)
+          Borrower pays ─────► PaymentTransaction (INCOMING)
+                                   │   see <<payment-transactions>>
+                                   ▼
+                              CreditPayment (via handler)
+                              — no DisbursementPayment row on this leg
+
+                       ┌────────────────────────────────────────┐
+                       │       DisbursementScheme = COLLECTED   │
+                       └────────────────────────────────────────┘
+  Borrower pays merchant ─► merchant batches remittance
+                                   │
+                                   ▼
+          Remittance voucher ──► DisbursementPayment(
+                                    reason = COLLECTED_PAYMENT,
+                                    creditPayment = ...CreditPayment...,
+                                    voucher = <remittance voucher>)
+                                   │
+                                   ▼
+                              Credit recalculation (see <<credit-operations-framework>>)
+----
+
+Two integration points worth being explicit about:
+
+1. **No circular dependency with servicing.** `DisbursementPayment` references `CreditPayment` / `CreditOperation` (which live in `com.timvero.servicing.credit.entity.operation`), but there is no reverse FK from the servicing side into `disbursement_payment`. The calculation engine in <<credit-servicing>> doesn't read disbursement rows — it only reads `CreditOperation`s. This means the calculation engine will happily recompute a credit even if the disbursement rail is completely offline.
+2. **Immutability is by convention + `UndeletableEntity`.** Setters exist on all fields, but every caller in the servicing flow treats a row as write-once. Reversals (refunds, voided disbursements) are modelled as new rows pointing to the original via shared `creditId` + `reason`, not as mutations.
+
+Querying the pair `(creditPayment, creditOperation)` is the easiest audit check: exactly one must be non-null per row. If both are null, the row was created outside a transaction and is a data-integrity bug. If both are set, some caller bypassed the two constructors — also a bug.
+
+=== Relationship to `PaymentTransaction`
+
+`DisbursementPayment` and `PaymentTransaction` (see <<payment-transactions>>) sit on **opposite sides** of the same event:
+
+[cols="1,2,2", options="header"]
+|===
+| Concern | `PaymentTransaction` | `DisbursementPayment`
+
+| Records | The *payment-provider* side — "Stripe charged the card" | The *lender-books* side — "voucher cleared treasury"
+| Status lifecycle | 13-state machine (`DRAFT` → `SUCCEED`/etc.) | None — `UndeletableEntity`, write-once
+| Direction marker | `TransactionType.INCOMING/OUTGOING` | `DisbursementReason` (semantic, not directional)
+| Links upward to credit | Via project-specific subclass (`BorrowerTransaction` carries a `Credit` reference) | Via raw `creditId: UUID`
+| Retry / reconciliation | Owned by `PaymentTransactionService` | N/A (row is already committed fact)
+|===
+
+A single borrower payment typically produces **both**: a `PaymentTransaction` row (what the card processor did) and a `DisbursementPayment` row (what the voucher booked to the lender's ledger). The `CreditPayment` in between links them — `PaymentTransaction` points at the operation via its handler, `DisbursementPayment.creditPayment` points at the same operation.
+
+[[credit-anti-patterns]]
+== Anti-Patterns
+
+* {bad} **Deleting `DisbursementPayment` rows to "correct" a mistake** — the entity extends `UndeletableEntity`, which is the SDK's audit-trail guarantee. Regulators expect every money movement to be visible forever. Correct with a compensating new row (opposite reason or linked to a refund operation); never delete.
+* {bad} **Setting both `creditPayment` and `creditOperation` on the same row** — the two public constructors are *mutually exclusive*; exactly one must be non-null. Constructing via the private constructor + setters breaks this invariant. Reports that union the two joins will double-count. Always go through the two-arg-`(CreditPayment)` or two-arg-`(CreditOperation)` public constructor.
+* {bad} **Using `@ManyToOne Credit` in place of the `creditId: UUID` field** — makes the module transitively depend on the domain-specific `Credit` subclass and breaks the one-way-decoupling that lets disbursement live in its own xtension. Lookups go through `findByCreditId(UUID)`; preserve that shape.
+* {bad} **Assuming `findByCreditId()` returns results sorted by date** — Spring Data derives the query with no `Sort`. Add `OrderBy createDate desc, id desc` or sort at the call site if chronological rendering matters.
+* {bad} **Registering a borrower payment under `DisbursementScheme.PREPAYMENT` as a `DisbursementPayment(COLLECTED_PAYMENT, …)` row** — under PREPAYMENT the borrower-side is not a disbursement. It's a `PaymentTransaction` → `CreditPayment` only. Creating a `DisbursementPayment` for it duplicates the payment in per-credit reports that union disbursements + payments.
+* {bad} **Cascading `Voucher` removal via the disbursement row** — the `voucher` relation is `CascadeType.{MERGE, PERSIST}` *deliberately*, with no `REMOVE`. One voucher usually fans out to several disbursement rows; removing any one row must not remove the voucher.
+* {bad} **Mixing `MERCHANT_FEE` and `OPERATION` reasons under a single voucher without reconciling** — they hit the same `creditOperation` slot but belong to different ledger accounts downstream. Reports that bucket by reason will disagree with reports that bucket by operation type unless both filters stay in sync.
+
+[[credit-production-checklist]]
+== Production Checklist
+
+* {todo} Every `DisbursementPayment` has exactly one of `creditPayment` / `creditOperation` set — run a nightly integrity check (`SELECT ... WHERE (credit_payment IS NULL) = (credit_operation IS NULL)`).
+* {todo} `DisbursementScheme` for each credit product is set on the product entity and matches the actual rails used — a product accidentally configured as `PREPAYMENT` while operating under `COLLECTED` produces half-booked payments.
+* {todo} `messages.properties` has `disbursement.reason.COLLECTED_PAYMENT / OPERATION / MERCHANT_FEE` entries for every locale — `DisbursementReason implements Listable`, the admin UI renders labels from there.
+* {todo} Admin UI exposes `DisbursementPayment` rows per-credit via `findByCreditId()` with a secondary sort on `createDate desc` applied at the call site.
+* {todo} A `DisbursementPaymentRepository` `Specification`-based filter view is wired into the credit detail tab (date range + reason + voucher-link filters) — see <<list-filters>>.
+* {todo} `Voucher` records are retained for the regulatory window — because `DisbursementPayment.voucher` is `MERGE + PERSIST` only, vouchers must be cleaned up by a separate archival job, not via cascading delete from disbursements.
+* {todo} Reversal / refund flows create *new* `DisbursementPayment` rows (not mutations) — the original row must stay readable for audit.
+* {todo} No application code calls `delete()` / `remove()` against `DisbursementPaymentRepository` — the `UndeletableEntity` base doesn't physically prevent it, it relies on discipline.
+* {todo} Per-credit reconciliation view cross-checks `sum(DisbursementPayment where creditPayment != null)` against `sum(CreditPayment)` for the same `creditId` — divergence flags a missed booking.
+* {todo} Envers auditing is enabled if your regulator requires change tracking for financial entities (see <<audit-module-sdk-reference-internals>>) — `UndeletableEntity` alone gives "never deleted" but not "change history".
+
+**Related:** <<payment-transactions>> (provider-side record — the other half of every money movement), <<credit-operations-framework>> (what `creditPayment` / `creditOperation` point at), <<credit-servicing>> (the calculation engine that reads `CreditOperation`s without looking at disbursements), <<entity-module-sdk-reference-hierarchy>> (`UndeletableEntity` and `Listable` bases), <<audit-module-sdk-reference-internals>> (Envers-style history on disbursement rows if enabled).
 
 The credit management system provides a robust foundation for implementing various lending products while maintaining consistency, auditability, and extensibility across different credit types.

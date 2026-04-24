@@ -706,3 +706,741 @@ public class LoanSummaryModel extends DocumentModel {
 4. **Generate Documents** using `DocumentService.generate()`
 
 This provides a complete document template system with rich formatting, dynamic content, and signature integration.
+
+[[document-template-persisted-entity]]
+== DocumentTemplate — The Persisted Template Entity
+
+Everything above describes the template _engine_ — `DocumentCategory`, `DocumentModel`, `DocumentType`, Pebble rendering. The piece that stores the actual markup (so admins can edit it without a redeploy) is `com.timvero.structure.template.entity.DocumentTemplate`. One `DocumentCategory` implements the contract; many `DocumentTemplate` rows may share the same `DocumentType`.
+
+=== Entity shape
+
+[source,java]
+----
+@Entity
+@Table(name = "document_template")
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+@NotTrackable
+public class DocumentTemplate extends HistoryEntity implements NamedEntity {
+    @Column private String title;
+    @Column(columnDefinition = "text") private String text;
+    @Column(name = "filename")         private String filename;
+
+    @Column(name = "document_type")
+    @Type(NamedParameterType.class)
+    private DocumentType documentType;
+
+    @Column(name = "template_type")
+    @Enumerated(EnumType.STRING)
+    private DocumentTemplateType templateType;
+
+    @Override public String getDisplayedName() { return title; }
+}
+----
+
+Field-by-field:
+
+* **`title`** — admin-facing label shown in the template list and picker. Also returned by `getDisplayedName()` because `DocumentTemplate implements NamedEntity`.
+* **`text`** — the raw template markup (Pebble source). `columnDefinition = "text"` forces Postgres `text` rather than a length-capped `varchar`; contracts easily exceed 4 KB.
+* **`filename`** — itself a Pebble expression, evaluated at generation time by `DocumentCategory.generateHtmlDocument()` via `templateService.evaluate(template.getFilename(), mapModel, locale)`. Lets the generated file name include the borrower's name or the application code.
+* **`documentType`** — stored via `NamedParameterType` (a Hibernate custom type that persists the `name` field of a `NamedParameter`). The column is a plain string — there is no FK — see <<document-type-deserializer>> for how it resolves on read.
+* **`templateType`** — `HTML` or `TXT`, controls `Content-Type`, charset, and file extension when the rendered document is wrapped into a `DocumentResource` (see <<storage>>).
+
+=== Inheritance: HistoryEntity
+
+`DocumentTemplate extends HistoryEntity`, which means every "edit" produces a new row and flips `active = false` on the previous version. Two columns drive this:
+
+* **`lineageId`** (`@Column(updatable = false)`) — stable identifier across versions. Admin URLs reference `lineageId`, not the row's own UUID.
+* **`active`** — exactly one row per `lineageId` has `active = true`; that's the version the engine picks up. Old versions stay in the table for audit and rollback.
+
+The runtime lookups in `DocumentCategory` use this invariant:
+
+* **`generateSingle()`** — calls `repository.findByDocumentTypeAndActiveTrue(type)` and throws `EntityNotFoundException` if zero or >1 rows match. Use when there's exactly one template per `DocumentType`.
+* **`generateLatestVersion(templateId, ...)`** — calls `repository.findByLineageIdAndActiveTrue(templateId)` where `templateId` is the lineage id. Use when a `DocumentType` has multiple templates (one `DocumentType` can have many `DocumentTemplate` rows with the same lineage) and the caller has pre-selected one.
+
+=== @NotTrackable: why audit history is suppressed
+
+`@NotTrackable` (from `com.timvero.ground.entity.reload`) tells the cache-reload infrastructure to skip this entity. Without it, every admin edit would invalidate the whole L2 cache — and since `DocumentTemplate` is itself `@Cache(READ_WRITE)`, the round-trip would be pathological. Versioning via `HistoryEntity` is the audit trail; the general-purpose audit system doesn't need a second copy.
+
+=== Relationship to DocumentType
+
+`DocumentType` is a `CustomEnum`-style class (it extends `com.timvero.ground.entity.NamedParameter`):
+
+[source,java]
+----
+public final class DocumentType extends NamedParameter {
+    public DocumentType(String name) { super(name); }
+}
+----
+
+`DocumentType` instances are created as `public static final` constants in each `DocumentCategory` (e.g., `CONTRACT = new DocumentType("CONTRACT")`). See <<entity-module-sdk-reference-hierarchy>> for the `NamedParameter` / `CustomEnum` pattern more generally. Because these live in Spring beans, the runtime can walk `List<DocumentCategory<?, ?, ?>>` to enumerate all known types — which is exactly what `DocumentTemplateFormService.init()` does.
+
+[[admin-template-management]]
+== Admin Template Management — FormService + Form + Mapper
+
+Templates are edited like any other SDK entity: a form DTO, a MapStruct mapper, and a service that extends `EntityFormService`. See <<form-classes-setup-and-usage>> for the full pattern; this section covers the template-specific pieces.
+
+=== DocumentTemplateForm
+
+[source,java]
+----
+public class DocumentTemplateForm {
+    private String title;
+    private String text;
+    private String filename;
+    private DocumentType documentType;
+    private DocumentTemplateType templateType;
+    private boolean active;
+    private String testEntityId;   // <1>
+}
+----
+<1> Not persisted. The admin "Test" button sends the id of a real entity to render the template against — see `DocumentCategory.testTemplate()`. Kept out of the entity by `@Mapping(target = "testEntityId", ignore = true)` on `toForm` in the mapper.
+
+=== DocumentTemplateFormMapper
+
+[source,java]
+----
+@Mapper
+public interface DocumentTemplateFormMapper extends EntityToFormMapper<DocumentTemplate, DocumentTemplateForm> {
+
+    @Mapping(target = "lineageId", ignore = true)   // <1>
+    @Override
+    void toEntity(DocumentTemplateForm form, @MappingTarget DocumentTemplate entity);
+
+    @InheritConfiguration
+    @Override
+    DocumentTemplate createEntity(DocumentTemplateForm form);
+
+    @Mapping(target = "testEntityId", ignore = true) // <2>
+    @Override
+    DocumentTemplateForm toForm(DocumentTemplate entity);
+}
+----
+<1> `lineageId` is assigned by `HistoryEntityFormService` on first save and must not be overwritten by the mapper on subsequent edits.
+<2> `testEntityId` is web-only state; it never round-trips to/from the DB.
+
+=== DocumentTemplateFormService
+
+Extends `HistoryEntityFormService<DocumentTemplate, DocumentTemplateForm>` — which itself extends `EntityFormService<E, F, UUID>`. The history variant overrides `save()` so that every edit inserts a new row and deactivates the prior version, keyed by `lineageId`. Three responsibilities sit on top:
+
+**1. Discovering document types from the `DocumentCategory` beans:**
+
+[source,java]
+----
+@Autowired(required = false)
+private Collection<DocumentCategory<?, ?, ?>> categories = new LinkedList<>();
+
+@PostConstruct
+private void init() {
+    categoryMap = categories.stream()
+        .collect(Collectors.toMap(DocumentCategory::getType, Function.identity()));
+    documentTypes = categoryMap.keySet().stream()
+        .sorted(Comparator.comparing(DocumentType::getName))
+        .toArray(DocumentType[]::new);
+}
+----
+
+Registering a new `DocumentCategory` bean automatically makes its `DocumentType` available in the edit form — no config. `required = false` keeps startup green on a fresh project with zero categories.
+
+**2. Populating the edit model (the dropdowns):**
+
+[source,java]
+----
+@Override
+protected void assembleEditModel(DocumentTemplate template, DocumentTemplateForm form, Map<String, Object> model) {
+    model.put("documentForm", form);
+    model.put("documentTypes", documentTypes);                // <1>
+    model.put("templateTypes", DocumentTemplateType.values()); // <2>
+    model.put("entityTypes", Stream.of(documentTypes).collect(Collectors.toMap(
+        NamedParameter::getName,
+        type -> categoryMap.get(type).getEntityClass()        // <3>
+    )));
+}
+----
+<1> Enumerated types from registered categories — the Document Type dropdown.
+<2> `HTML` or `TXT` — the Template Type dropdown.
+<3> Map of type name → entity class; the "Test" autocomplete uses this to know which entity to search against for the current document type.
+
+**3. Building the view (read-only) model:**
+
+`assembleViewModel()` eagerly loads the selected version and lazily loads the full version history for the history tab (via `Lazy.of(...)`). The `isNoneActiveVersionExist` flag lets the view show a "restore" button when every version is deactivated — a "soft-deleted" lineage.
+
+**4. Exposing template choices to other services:**
+
+[source,java]
+----
+public Map<UUID, String> getTemplatesMap(DocumentType... types) {
+    return Stream.of(types)
+        .flatMap(type -> repository.findByDocumentTypeAndActiveTrue(type))
+        .collect(Collectors.toMap(HistoryEntity::getLineageId, DocumentTemplate::getTitle));
+}
+----
+
+Returns `lineageId → title` for all active templates of the given types. Call this from notification configuration screens or contract-type selectors — anywhere the user needs to pick a template.
+
+=== Versioning semantics at the UI layer
+
+Because `HistoryEntityFormService.save()` inserts-and-deactivates rather than UPDATEing, an admin who fixes a typo does not mutate what the audit log will show for the previous month. Documents generated yesterday referenced yesterday's row by primary key; the `lineageId`-based lookup in `generateLatestVersion()` always picks up the current active one for fresh renders.
+
+[[document-template-admin-controller]]
+=== DocumentTemplateController — Admin Web Controller
+
+The page at `/template` is a `ViewableFilterController` (see <<web-infrastructure-entity-view-controllers>>) with four custom endpoints for the live preview panel:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/template")
+@MenuItem(order = 900_610, name = "template", group = "setting")
+public class DocumentTemplateController
+        extends ViewableFilterController<UUID, DocumentTemplate, DocumentTemplateFilter> {
+
+    @Override protected String getViewPage() { return "/template/view"; }
+
+    @Override
+    protected void assembleViewModel(DocumentTemplate template, Model model) {
+        model.addAllAttributes(formService.assembleViewModel(template));   // versions, choices
+    }
+
+    @GetMapping("/variables_details") @PreAuthorize("hasRole(this.viewRole)")
+    public String getVariablesDetails(@RequestParam DocumentType docType, Model model) { /* Thymeleaf fragment */ }
+
+    @GetMapping("/variables")         @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public Map<String, Collection<BeanPropertyModel>> getVariables(@RequestParam DocumentType docType) { /* JSON for autocomplete */ }
+
+    @GetMapping("/entities")          @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public Map<?, String> getEntities(@RequestParam DocumentType docType,
+                                      @RequestParam(required = false) String search) { /* search dropdown */ }
+
+    @PostMapping("/test")             @PreAuthorize("hasRole(this.viewRole)") @ResponseBody
+    public ResponseEntity<InputStreamResource> testTemplate(
+            @Valid @ModelAttribute DocumentTemplateForm form, BindingResult errors)
+            throws TemplateEvaluatonException, IOException, BindException { /* renders PDF preview */ }
+
+    @ExceptionHandler({TemplateEvaluatonException.class, TemplateEvaluationRuntimeException.class,
+        NotSuitableTestEntityException.class, NotFoundException.class})
+    @ResponseBody
+    public ResponseEntity<Map<String, Object>> error(Exception exception) { /* user-friendly JSON errors */ }
+}
+----
+
+Key points:
+
+* **`@PreAuthorize("hasRole(this.viewRole)")`** on every custom endpoint — SpEL `this.viewRole` reads the `*_VIEW` role derived from the `@RequestMapping` path (`TEMPLATE_VIEW`). No hardcoded strings; see the "Role Derivation Convention" in <<web-infrastructure-advanced-patterns>>.
+* **`/variables_details`** returns an HTML fragment (loaded into the side panel by the admin UI); `/variables` returns JSON with the same data (used by the template editor's autocomplete). Two URLs, same underlying `templateVariables` map, different response types.
+* **`/entities` is search-enabled** — the admin types into the "Test entity" autocomplete and the dropdown filters live. Implemented by delegating to `DocumentCategory.getTestEntities(search, messages::message)` which each category implements per its entity type.
+* **`/test` returns `InputStreamResource`** — the rendered PDF (or HTML) streams straight back as the response body. The admin UI pipes it into an embedded `<object>` preview, so every edit-save-preview cycle avoids writing a test document to storage.
+* **The `@ExceptionHandler` collapses template-rendering failures into a unified JSON shape** `{message, line?}` that the admin editor highlights inline. `TemplateEvaluatonException.getLineNumber()` is especially useful — it maps directly to the Pebble/Thymeleaf line numbers in the editor gutter (see <<document-templates-template-engines-thymeleaf-pebble>>).
+
+[[document-template-filter]]
+== Filtering and Listing — DocumentTemplateFilter / FilterService
+
+The list page uses the SDK's annotation-driven filter framework (see <<list-filters-annotation-driven-jpa-query-dsl>>). The filter is deliberately minimal:
+
+[source,java]
+----
+public class DocumentTemplateFilter extends ListFilter {
+    @Field(restriction = Restriction.LIKE, value = "title")
+    private String title;
+
+    @Field(restriction = Restriction.EQ, value = "active")
+    private boolean active = true;     // <1>
+}
+
+@Service
+public class DocumentTemplateFilterService
+    extends FilterListService<DocumentTemplate, DocumentTemplateFilter> {
+}
+----
+<1> Default `true`: the list shows active versions only. The filter panel exposes a toggle to include historical versions when the admin is debugging a regression.
+
+There's no `documentType` filter because the list UI is typically grouped by type with a section per `DocumentCategory`. If you need one, add `@Field(restriction = Restriction.EQ, value = "documentType")` — the `NamedParameterType` handles the JPA literal binding.
+
+[[document-template-exporter]]
+== Environment Transfer — Template Exporter
+
+Templates are first-class citizens in the environment-transfer pipeline: `git`-tracked JSON snapshots moved from `dev` → `uat` → `prod` alongside catalog items, roles, and form schemas. See <<catalog>> for the shared export pattern.
+
+[source,java]
+----
+@Service
+@Order(7100)                                           // <1>
+public class DocumentTemplateExporter
+    extends AbstractHistoryEntityExporter<DocumentTemplate, DocumentTemplateExportData> {
+
+    @Override public String getVersion() { return "1"; }
+}
+----
+<1> Exporter order matters: run after `DocumentCategoryExporter`/registrations that define the `DocumentType` constants, before anything that references a template by `lineageId` (e.g., a `CreditProduct` that names its contract template).
+
+=== DocumentTemplateExportData
+
+A plain DTO that mirrors the entity's user-editable fields — no `lineageId`, no `active`, no audit columns. Those are applied by `AbstractHistoryEntityExporter.save()`:
+
+[source,java]
+----
+public class DocumentTemplateExportData {
+    private String title;
+    private String text;
+    private String filename;
+
+    @JsonDeserialize(using = DocumentTypeDeserializer.class)   // <1>
+    private DocumentType documentType;
+
+    private DocumentTemplateType templateType;
+
+    @Override public int hashCode() { ... }   // <2>
+    @Override public boolean equals(Object obj) { ... }
+}
+----
+<1> Required — `DocumentType` has no default Jackson constructor. See <<document-type-deserializer>>.
+<2> `AbstractHistoryEntityExporter.save()` skips the insert when `toForm(existing).equals(incoming)` — the equality contract determines whether an import creates a new version or is a no-op. Keep all meaningful fields in `equals`; omitting one makes imports idempotent when they shouldn't be.
+
+=== DocumentTemplateToDtoMapper
+
+[source,java]
+----
+@Mapper
+public interface DocumentTemplateToDtoMapper
+    extends AbstractHistoryEntityToDtoMapper<DocumentTemplate, DocumentTemplateExportData> {
+
+    @Mapping(target = "lineageId", ignore = true)
+    @Override DocumentTemplate createEntity(DocumentTemplateExportData form);
+
+    @Override DocumentTemplateExportData toForm(DocumentTemplate entity);
+}
+----
+
+The `lineageId` ignore is critical — the key in the exported map IS the `lineageId`, and `AbstractHistoryEntityExporter.save()` assigns it explicitly after `createEntity`. Letting the mapper touch it would overwrite the import's chosen key.
+
+=== Exporter lifecycle
+
+The `AbstractHistoryEntityExporter` base gives you:
+
+* **`loadKeys()`** — returns every active `lineageId` (`findByActiveTrue()` with criteria projection).
+* **`load(key)`** — loads the active row and maps to `DocumentTemplateExportData`.
+* **`save(key, dto)`** — compares existing DTO to incoming; if different, inserts a new row with `lineageId = key` and deactivates the previous version via `inactivateOld()`.
+
+The net effect: importing `prod.json` to `dev` creates a new history entry showing "imported from prod" timestamp, rather than mutating the existing row. Audit trails survive environment promotions.
+
+[[document-type-deserializer]]
+== DocumentTypeDeserializer — JSON Resolution
+
+`DocumentType` is a value-type wrapper around a string (`NamedParameter`). Jackson can't instantiate it from a JSON string without help because there's no `@JsonCreator` constructor registered — and even if there were, deserialization would produce a _new_ instance rather than the singleton `public static final` constant defined in the relevant `DocumentCategory`. `DocumentTypeDeserializer` bridges this:
+
+[source,java]
+----
+@Component
+public class DocumentTypeDeserializer extends JsonDeserializer<DocumentType> {
+
+    private static List<DocumentCategory<?, ?, ?>> categories;     // <1>
+
+    @Autowired(required = false)
+    public void setCategories(List<DocumentCategory<?, ?, ?>> categories) {
+        DocumentTypeDeserializer.categories = categories;
+    }
+
+    @Override
+    public DocumentType deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        for (DocumentCategory<?, ?, ?> category: categories) {
+            if (category.getType().getName().equals(p.getText())) {
+                return category.getType();                         // <2>
+            }
+        }
+        throw new RuntimeException("Unsupported document type " + p.getText());
+    }
+}
+----
+<1> Static holder — Jackson's `StdDeserializer` is instantiated per `ObjectMapper`, not per request, and isn't Spring-aware. The one-time Spring setter wire-up into a static field is how the deserializer reaches the category beans. It's ugly but well-trodden; `setCategories` is called once at container startup.
+<2> Returns the singleton constant, not a new instance. This lets downstream `==` comparisons work — which matter for things like `category.getType() == CONTRACT` in switch expressions.
+
+`@JsonDeserialize(using = DocumentTypeDeserializer.class)` is applied only to `DocumentTemplateExportData.documentType` — that's the one DTO that receives externally-sourced type names (from the exported JSON file). The edit-form path (`DocumentTemplateForm`) uses a regular `ConversionService` converter because the dropdown already enumerates valid values.
+
+When an import fails with "Unsupported document type X", the fix is _not_ to edit the JSON — it's to register the `DocumentCategory` bean that defines `X`.
+
+[[document-template-repositories]]
+== Repositories
+
+[source,java]
+----
+public interface DocumentTemplateRepository extends JpaRepository<DocumentTemplate, UUID>,
+    JpaSpecificationExecutor<DocumentTemplate> {
+
+    Stream<DocumentTemplate> findByDocumentTypeAndActiveTrue(DocumentType documentType);
+
+    boolean existsByDocumentTypeAndActiveTrue(DocumentType documentType);
+
+    Stream<DocumentTemplate> findByActiveTrue();
+
+    Optional<DocumentTemplate> findByLineageIdAndActiveTrue(UUID templateId);
+}
+----
+
+A few non-obvious points:
+
+* **`Stream<>` return type, not `List<>`** — callers (`DocumentCategory.generateHtmlSingle`, `FormService.getTemplatesMap`) immediately `.reduce()` or `.flatMap()`. Returning a stream avoids materializing intermediate lists. Wrap caller code in a transaction so the stream closes; all call sites already do (`@Transactional` on the `DocumentCategory` or form service).
+* **`existsByDocumentTypeAndActiveTrue`** — cheap probe for "is a template defined for this type?" — useful for gating UI controls ("Generate contract" button) without loading the row.
+* **`findByLineageIdAndActiveTrue`** — the canonical lookup during generation. `DocumentCategory.generateHtmlLatestVersion` calls `.orElseThrow()` here; the error propagates as a `TemplateEvaluatonException` from the public `generateLatestVersion(...)` surface.
+* **`JpaSpecificationExecutor`** — needed by `DocumentTemplateFilterService` / `FilterListService` for the annotation-driven filter DSL.
+
+The primary key for `JpaRepository` is the row UUID, not the lineage id — so `existsById` / `findById` would answer a question you almost never want to ask ("does this specific version exist?"). Use the `findByLineageIdAndActiveTrue` accessor instead.
+
+[[template-engines-thymeleaf-and-pebble]]
+[[document-templates-template-engines-thymeleaf-pebble]]
+== Template Engines — Thymeleaf & Pebble
+
+Everything above (`DocumentCategory.generateHtmlSingle`, `generateHtmlLatestVersion`, the WYSIWYG text in `DocumentTemplate.text`, the `DocumentModel` variable aliases) funnels through the SDK's `TemplateService` SPI — a single-method interface `String evaluate(String template, Map<String,?> model, Locale locale)`. Two implementations exist; exactly one is wired at runtime, chosen by a Spring property. The default in `application.properties` is `template.service=pebble`; setting it to `template.service=thymeleaf` swaps the engine without touching any `DocumentCategory`, `DocumentModel`, or `DocumentTemplate` wiring.
+
+Pebble is the primary, production-default engine. It has the full custom-filter / custom-function surface the SDK ships (money, enum, last4, spell-out, pretty-print, `findEntityDocument`, `findClaim`) — see <<pebble-filters>> for the deep-dive. Thymeleaf is the alternative — same data model, different syntax, different trade-offs.
+
+=== When to pick each
+
+[cols="1,2,2", options="header"]
+|===
+|Concern |Pebble |Thymeleaf
+
+|**Syntax density**
+|`{{ value \| currency }}` — Jinja-style, terse, reads like a string-interpolation DSL
+|`${#numbers.formatCurrency(value)}` — SpEL-style, verbose, but indistinguishable from Thymeleaf markup used elsewhere in the UI
+
+|**Validity as HTML**
+|Template source is not valid HTML (`{% if %}` breaks most HTML tools)
+|Template source **is** valid HTML — `th:if`, `th:text` attributes live on real DOM elements; template opens in a browser for preview
+
+|**Custom filters/functions**
+|Rich SDK library — see <<pebble-filters>>
+|Standard Thymeleaf expression objects (`#strings`, `#numbers`, `#dates`, `#lists`, `#temporals`) plus the `ThymeleafCustomDialect` registered in `ThymeleafTemplateConfig`
+
+|**Lazy-association unwrapping**
+|Handled inside `TemplatePebbleExtension` via a dedicated node visitor
+|Handled by the application-UI Thymeleaf dialect — see <<thymeleaf-helpers-expression-objects-lazy-unwrapping>>
+
+|**Designer workflow**
+|Developer-centric — templates are typically hand-authored by engineers
+|Designer-friendly — a frontend designer who knows Thymeleaf from the admin UI can edit document templates the same way
+
+|**Runtime cost**
+|Fast; templates are compiled once and cached by Pebble's own `TemplateLoader`
+|Slightly heavier — `SpringTemplateEngine` carries the full Spring-Thymeleaf stack; resolver has `setCacheable(false)` so document templates parse every render
+|===
+
+Rule of thumb: **if you are extending the SDK for the first time, stay on Pebble**. The custom filters cover the 20-line formatting shortcuts that every contract and email needs. Move to Thymeleaf only when your designers live in the Thymeleaf world already (the same dialect powers the admin UI templates — <<thymeleaf-helpers-expression-objects-lazy-unwrapping>>) and you want one mental model for both surfaces.
+
+=== Activating Thymeleaf
+
+Single property in `application.properties`:
+
+[source,properties]
+----
+# pebble (default) | thymeleaf
+template.service=thymeleaf
+----
+
+`ThymeleafTemplateConfig` is gated by `@ConditionalOnProperty(name = "template.service", havingValue = "thymeleaf")` — it contributes three beans:
+
+[source,java]
+----
+@Configuration
+@ConditionalOnProperty(name = "template.service", havingValue = "thymeleaf")
+public class ThymeleafTemplateConfig {
+
+    @Bean
+    ITemplateResolver documentTemplateResolver() {
+        SpringResourceTemplateResolver resolver = new SpringResourceTemplateResolver();
+        resolver.setOrder(30);
+        resolver.setPrefix("classpath:document/");
+        resolver.setSuffix(".html");
+        resolver.setTemplateMode(TemplateMode.HTML);
+        resolver.setCharacterEncoding("UTF-8");
+        resolver.setCacheable(false);
+        return resolver;
+    }
+
+    @Bean
+    TemplateEngine documentTemplateEngine() { /* wires resolver + messageSource + ThymeleafCustomDialect */ }
+
+    @Bean
+    TemplateService templateService() {
+        return new ThymeleafTemplateService(documentTemplateEngine());
+    }
+}
+----
+
+Three observations:
+
+* **`setOrder(30)`** — lower than the admin-UI template resolver, so document templates resolve first when a template name collides.
+* **`setPrefix("classpath:document/")`** / **`.html`** — file-based templates live under `src/main/resources/document/*.html`; name-only resolution (`templateEngine.process("contract", ctx)` loads `classpath:document/contract.html`). Inline `DocumentTemplate.text` strings bypass the resolver.
+* **`setCacheable(false)`** — the DB-stored `DocumentTemplate.text` changes every time an admin edits a row; caching by template name would serve stale HTML.
+
+=== `ThymeleafTemplateService` — the adapter
+
+[source,java]
+----
+public class ThymeleafTemplateService implements TemplateService {
+    private final TemplateEngine engine;
+
+    @Override
+    public String evaluate(String template, Map<String, ?> model, Locale locale) {
+        try {
+            return engine.process(template, new Context(locale, new HashMap<>(model)));
+        } catch (TemplateEngineException e) {
+            throw new TemplateEvaluatonException(e.getMessage(), e);
+        }
+    }
+}
+----
+
+The adapter is deliberately thin — `engine.process(String, Context)` accepts either a resolver-bound template name **or** a raw template string (Thymeleaf auto-detects). The `DocumentModel` variable aliases flow through the `Context` as-is; `Locale` drives `#{messages.key}` resolution against the same Spring `MessageSource` Pebble uses.
+
+Any `TemplateEngineException` (bad expression, missing variable, malformed `th:*` attribute) is re-thrown as `TemplateEvaluatonException` — the same exception type Pebble produces, so upstream code (`DocumentCategory.generateSingle`, form preview rendering) handles both engines identically.
+
+=== Syntax cheat-sheet (Pebble -> Thymeleaf)
+
+[cols="2,2", options="header"]
+|===
+|Pebble |Thymeleaf
+
+|`{{ application.code }}`
+|`<span th:text="${application.code}">…</span>` — or inline `[[${application.code}]]`
+
+|`{{ amount \| currency }}`
+|`<span th:text="${#numbers.formatCurrency(amount)}">…</span>` (via standard expression object)
+
+|`{% if application.status == 'APPROVED' %}…{% endif %}`
+|`<div th:if="${application.status.name() == 'APPROVED'}">…</div>`
+
+|`{% for item in items %}…{% endfor %}`
+|`<tr th:each="item : ${items}">…</tr>`
+
+|`{{ findEntityDocument(application, 'CONTRACT') }}`
+|Not available out-of-the-box — expose the same helper as a `ThymeleafCustomDialect` expression object, or pre-compute the value in `DocumentModel`
+|===
+
+The "pre-compute in `DocumentModel`" pattern is the recommended escape hatch — the model is a plain Java object whose getters are visible to either engine identically. Keep template-side logic thin regardless of the engine (see the Best Practices below).
+
+[[pdf-conversion-pipeline]]
+== PDF Conversion Pipeline
+
+`DocumentCategory.convertToPdf(html)` is the hook that turns rendered HTML (from either template engine) into a PDF byte stream. It delegates to the single Spring-registered `PdfConverter` bean. Two implementations ship with the SDK, both in `com.timvero.service.impl.pdf` — selection is by property, exactly one wires at startup.
+
+[cols="1,2,2", options="header"]
+|===
+|Axis |`WkhtmltopdfConverter` |`WeasyprintConverter`
+
+|**Binary**
+|`wkhtmltopdf` — C++ binary, WebKit-based, static linking via patched Qt
+|`weasyprint` — Python package, CPython runtime required
+
+|**Install footprint**
+|~50 MB binary, single file, drop-in on any Linux distro
+|Python 3 + pip + `cairo` / `pango` / `gdk-pixbuf` native libs — heavier base image
+
+|**CSS support**
+|Legacy WebKit — good-enough for `@media print`, page breaks, headers/footers
+|Modern CSS — proper `@page` rules, CSS Grid, custom fonts via `@font-face`
+
+|**Headers/footers**
+|Native — `<header>` / `<footer>` elements auto-extracted into separate files and passed via `--header-html` / `--footer-html`
+|Handled via CSS `@page { @top-center { content: … } }`
+
+|**Execution model**
+|External process per render, HTML file on disk
+|External process per render, HTML streamed via stdin
+
+|**Maintenance status**
+|Upstream archived (2023) — still widely used; no new releases
+|Actively maintained; Python ecosystem
+|===
+
+=== Activation
+
+Neither converter is `@Component`-scanned unconditionally. Each carries `@ConditionalOnProperty(name = "document.pdf.converter", havingValue = "…")`. Set one in `application.properties`:
+
+[source,properties]
+----
+# Option A — wkhtmltopdf
+document.pdf.converter=wkhtmltopdf
+# optional overrides
+document.pdf.wkhtmltopdf.cline.shell=
+document.pdf.wkhtmltopdf.cline.commandName=wkhtmltopdf
+document.pdf.wkhtmltopdf.cline.commandOpts=-s,A4
+document.pdf.wkhtmltopdf.cache.capacity=100
+document.pdf.wkhtmltopdf.tmp.dir=${application.home}/tmp/wkhtmltopdf
+
+# Option B — weasyprint (note: shell prefix for python invocation)
+document.pdf.converter=weasyprint
+document.pdf.weasyprint.cline.shell=python3,-m
+document.pdf.weasyprint.cline.commandName=weasyprint
+document.pdf.weasyprint.cline.commandOpts=
+----
+
+If `document.pdf.converter` is unset, **no** `PdfConverter` bean exists — `DocumentCategory.convertToPdf()` becomes a no-op that returns the HTML bytes. That mode is fine for local dev (review HTML in a browser) but fails any e-signature flow that requires PDF (see <<documents>>, `application.signable.force.pdf=true`).
+
+=== `WkhtmltopdfConverter` — process invocation
+
+At `@PostConstruct` the converter runs `wkhtmltopdf -V` and captures exit code into a volatile `enabled` flag. The probe is non-fatal — if the binary is missing, `enabled()` returns `false` but the bean still exists; call sites can check before invocation. It also precomputes `basicCommandArgs`:
+
+[source,java]
+----
+@PostConstruct
+private void init() {
+    // 1. probe `-V`, store `enabled = (exitValue == 0)`
+    // 2. append configured `commandOpts` (default "-s,A4")
+    // 3. enforce required switches:
+    //      --encoding UTF-8         (overwrites any user-supplied value)
+    //      --print-media-type       (unless --no-print-media-type was set)
+    //      --enable-local-file-access
+    basicCommandArgs = Collections.unmodifiableList(commands);
+}
+----
+
+The three forced switches are load-bearing:
+
+* **`--encoding UTF-8`** — without it, non-ASCII characters from entity data (borrower names, currency symbols) render as `?`. The setter *overwrites* any user-supplied `--encoding` — the SDK assumes UTF-8 end-to-end.
+* **`--print-media-type`** — forces `@media print` CSS to apply; without it the PDF uses screen styles.
+* **`--enable-local-file-access`** — allows referencing local asset files (logos, fonts under `classpath:` after materialization). Required by modern wkhtmltopdf for any `<img src="file:///…">` or `<link href="file:///…stylesheet.css">`.
+
+Each call to `convert(html)` delegates to `WkhtmltopdfCompiler.compile(html)` first, then executes the binary with the compiled paths.
+
+=== `WkhtmltopdfCompiler` / `WkhtmltopdfTemplate` — on-disk materialization
+
+wkhtmltopdf consumes files, not strings — `stdin` input for headers/footers is unreliable. The compiler writes three `.html` temp files per render:
+
+[source,java]
+----
+// WkhtmltopdfTemplate (package-private) — constructed once per convert() call:
+Document doc = Jsoup.parse(html);              // parse via jsoup
+headerPath = extract(doc, "header");           // splice out <header> -> tmp file
+footerPath = extract(doc, "footer");           // splice out <footer> -> tmp file
+templatePath = write(doc);                     // remainder -> tmp file
+----
+
+`extract(doc, selector)` clones all `<style>` elements from the main document into the header/footer file so CSS rules carry across — otherwise branded headers would render unstyled. Each temp file is created under `${application.home}/tmp/wkhtmltopdf/` with `.deleteOnExit()` — the JVM cleans them up at shutdown; long-running processes accumulate tmp files unless the directory is mounted on tmpfs.
+
+The command then becomes:
+
+[source]
+----
+wkhtmltopdf <basicCommandArgs> --header-html <headerPath> --footer-html <footerPath> <templatePath> -
+----
+
+Trailing `-` means "write PDF bytes to stdout" — captured by `StreamConsumer` (see below).
+
+If the template has no `<header>` / `<footer>` elements, the compiler emits `-T 10mm` / `-B 10mm` defaults (10 mm top/bottom margins) instead of the `--header-html` / `--footer-html` switches.
+
+`WkhtmltopdfCompiler` also implements `CacheManagerCustomizer<JCacheCacheManager>` — it creates a JCache region named `wkhtmltopdf_templates` with capacity driven by `document.pdf.wkhtmltopdf.cache.capacity` (default 100). The cache region is provisioned but **not currently populated** in the SDK — it exists for downstream extensions that want to memoize compiled templates by hash.
+
+=== `WeasyprintConverter` — simpler pipeline
+
+Weasyprint reads HTML from stdin and writes PDF to stdout — no temp files needed:
+
+[source,java]
+----
+Process process = Runtime.getRuntime().exec(commandArgs);   // weasyprint --encoding UTF-8 - -
+StreamConsumer outputStreamConsumer = new StreamConsumer(process.getInputStream());  // PDF bytes
+StreamConsumer errorStreamConsumer = new StreamConsumer(process.getErrorStream());   // diagnostics
+outputStreamConsumer.start();
+errorStreamConsumer.start();
+
+Document doc = Jsoup.parse(html);
+try (Writer writer = new OutputStreamWriter(process.getOutputStream(), UTF_8)) {
+    doc.html(writer);                           // stream HTML -> stdin
+}
+
+outputStreamConsumer.join();  errorStreamConsumer.join();  process.waitFor();
+if (process.exitValue() != 0) throw new RuntimeException(new String(errorStreamConsumer.getBytes()));
+----
+
+The `python3 -m` shell prefix (configurable via `document.pdf.weasyprint.cline.shell`) is needed on systems where `weasyprint` is a Python module rather than a standalone binary — module invocation dodges the `#!/usr/bin/env python` shebang issues on slim Docker images.
+
+Like wkhtmltopdf, the constructor probes `weasyprint --version` and captures an `enabled` flag.
+
+=== `StreamConsumer` — why a thread per stream
+
+Both converters use the public `StreamConsumer extends Thread` utility in `com.timvero.service.impl.pdf` (wkhtmltopdf has a legacy private inner-class copy of the same class — identical behavior):
+
+[source,java]
+----
+public class StreamConsumer extends Thread {
+    public void run() {
+        int bytesRead = stream.read();
+        while (bytesRead >= 0) { bytes.write(bytesRead); bytesRead = stream.read(); }
+        stream.close();
+    }
+}
+----
+
+The hazard it dodges is a well-known JDK trap: `Process.getInputStream()` / `getErrorStream()` are bounded OS pipes. If either stream fills up and nothing drains it, the child process blocks on its next `write()` — the Java side deadlocks in `process.waitFor()` forever. Large PDFs (10+ pages, image-heavy contracts) overflow the stdout pipe buffer within milliseconds. Two `StreamConsumer` threads drain stdout and stderr in parallel, captured as `byte[]` via `ByteArrayOutputStream`; `join()` on both before `waitFor()` guarantees full capture.
+
+`IOException` inside `run()` is stored on the instance (not rethrown) — the parent converter inspects `getError()` after `join()`. Not the prettiest idiom, but it preserves the thread's termination contract.
+
+=== Where the pipeline meets `convertToPdf`
+
+The flow when an admin clicks "Generate PDF" on an entity action:
+
+. `DocumentCategory.generateSingle(entity, forcePdf = true)`  (or `generateLatestVersion(...)`)
+. Loads the active `DocumentTemplate`, looks up `DocumentModel` variable aliases, calls `TemplateService.evaluate(text, model, locale)` — Pebble or Thymeleaf per `template.service`.
+. If `forcePdf`, calls `convertToPdf(html)` — delegates to the Spring-injected `PdfConverter`.
+. That bean is either `WkhtmltopdfConverter` or `WeasyprintConverter`, depending on `document.pdf.converter`. Neither is present when the property is unset — `convertToPdf` then returns the HTML bytes as-is.
+. Bytes go to `DocumentStorage` (see <<storage>>), wrapped in a `Document` row, optionally attached to a notification (see <<notifications>>) or sent to an e-signature provider (see <<documents>>, DocuSign integration).
+
+There is no round-robin, no fallback, no negotiation — the property is a hard wire. Switching engines in production requires a restart.
+
+=== Operational concerns
+
+* {todo} **Docker base image** — slim Python/Alpine images are too lean. wkhtmltopdf needs glibc + fontconfig + a font package (`ttf-dejavu` at minimum) or PDFs render with missing glyphs. Weasyprint needs `libcairo2`, `libpango-1.0-0`, `libgdk-pixbuf2.0-0`, `libffi`, `shared-mime-info`. The standard Pumpkin Dockerfile includes both; slim variants that only install one fail silently when `enabled()` returns `false`.
+* {todo} **Fonts at render time** — both engines resolve fonts through fontconfig at runtime. Custom brand fonts referenced by `@font-face { src: url(file://…) }` require `--enable-local-file-access` on wkhtmltopdf (forced by SDK) plus the font file being present in the container filesystem, not the application classpath.
+* {todo} **Temp directory (wkhtmltopdf only)** — `document.pdf.wkhtmltopdf.tmp.dir` defaults to `${application.home}/tmp/wkhtmltopdf`. On Kubernetes with ephemeral storage this is fine, but on shared hosts the directory grows until JVM shutdown — `.deleteOnExit()` does not delete on crash. Mount on tmpfs or add a cron-based cleanup.
+* {todo} **Process-per-render cost** — both converters `Runtime.exec()` on every call. A burst of 50 contract generations spawns 50 native processes; under backpressure the OS process table matters. Offload bulk PDF generation to the `JobQueue` (see <<operations>>) rather than handling inline in an HTTP request.
+* {todo} **`enabled()` is advisory** — call sites don't gate on it; an attempted render on a disabled converter throws `RuntimeException` from `Runtime.exec` (ENOENT). Add a health check that invokes `PdfConverter#enabled()` at startup and fails the readiness probe if it's `false`.
+
+== Best Practices
+
+* {ok} **One `DocumentCategory` per business document type** — it's the Spring-discoverable contract; `DocumentTemplateFormService` enumerates categories to populate the edit form's Document Type dropdown
+* {ok} **Keep `DocumentType` constants `public static final`** — deserialization returns the singleton; downstream `==` / `equals` comparisons depend on instance identity
+* {ok} **Model all dynamic data in `DocumentModel` getters, not in the template `text`** — logic in Pebble is hard to test; Java getters are covered by normal unit tests
+* {ok} **Capture "generation date" in the model constructor, not in a getter** — `LocalDate.now()` inside `getGenerationDate()` produces a different timestamp each time the template re-evaluates the expression
+* {ok} **Make `filename` itself a Pebble expression** — `"{{ application.code }}_contract"` yields deterministic, debuggable file names in the vault (see <<storage>>)
+* {ok} **Use `existsByDocumentTypeAndActiveTrue` to gate UI** — cheap, avoids loading the full `text` column to decide whether to show a "Generate" button
+* {ok} **Register `DocumentTemplateExporter` at `@Order(7100)`** — after the `DocumentCategory` beans exist so `DocumentTypeDeserializer` can resolve type names on import
+* {ok} **Reference templates by `lineageId` from other entities** (e.g., `CreditProduct.contractTemplateId`) — stable across edits; the active-version lookup happens at generation time
+* {ok} **Use `DocumentTemplateFormService.getTemplatesMap(type...)` when building a template-picker dropdown** — encapsulates the "active only" invariant in one place
+* {ok} **Rely on `HistoryEntity` soft-delete** — never hard-delete a `DocumentTemplate` row; audit requires that previously-generated documents resolve their source template
+
+== Anti-Patterns
+
+* {bad} **Creating a new `DocumentType` instance at a call site** — `new DocumentType("CONTRACT")` does NOT equal the category's `public static final CONTRACT` by reference; most lookups happen via `NamedParameter.equals()` which is name-based, but `==` comparisons silently fail
+* {bad} **Hard-deleting `DocumentTemplate` rows** — historical documents reference these by id; deletion breaks the "view original template" audit action
+* {bad} **Mutating a live template via JPA outside the form service** — skips the `HistoryEntityFormService.save()` insert-and-deactivate; audit trail loses the edit
+* {bad} **Putting business logic in Pebble `{% if %}` branches** — it won't be covered by tests, it's invisible to static analysis, and changes ship as template-content edits rather than code reviews
+* {bad} **Caching the result of `generateLatestVersion()` by `templateId` alone** — the entity parameter changes the rendered output; cache by `(templateId, entityId, entityVersion)` or don't cache
+* {bad} **Forgetting `@JsonDeserialize(using = DocumentTypeDeserializer.class)`** on any new DTO that carries a `DocumentType` across JSON — Jackson will either fail or produce an instance that isn't the singleton
+* {bad} **Defining two `DocumentCategory` beans with the same `DocumentType` name** — `DocumentTemplateFormService.init()` uses `Collectors.toMap` which throws on duplicate keys; startup fails
+* {bad} **Filtering the template list by `active = false` in production UI** — the field defaults to `true` for a reason; only debugging/rollback workflows need historical rows
+* {bad} **Evaluating `template.getText()` directly with `TemplateService`** and bypassing `DocumentCategory.generateHtmlDocument()` — you lose the entity-alias map construction, the `Locale` resolution, and the filename templating
+* {bad} **Returning a `List<DocumentTemplate>` from a stream method without closing the transaction** — `Stream<>` from Spring Data needs an open tx; collect inside the transactional method, don't leak the stream
+* {bad} **Switching `template.service` without re-testing every template** — Pebble-only filters (`| currency`, `| last4`, `findEntityDocument(...)`) silently produce garbage or blank output under Thymeleaf; cover every `DocumentTemplate` row with a render smoke-test before flipping the property
+* {bad} **Draining `Process.getInputStream()` / `getErrorStream()` on the calling thread** — either pipe fills first and deadlocks `waitFor()`; always use `StreamConsumer` (or equivalent) threads per stream
+* {bad} **Relying on `PdfConverter.enabled() == false` fallback** — the flag is advisory, no caller checks it; if the binary is missing in a production container, the next `convertToPdf()` throws. Gate deployment on a readiness probe that calls `enabled()` at startup.
+* {bad} **Calling `DocumentCategory.convertToPdf()` synchronously inside an HTTP handler for large/batch generations** — each call spawns a native process; offload to a background job (see <<operations>>)
+
+== Production Checklist
+
+* {todo} Every `DocumentCategory` registered as a Spring bean and reachable at startup (check logs for the Document Type dropdown population)
+* {todo} Each `DocumentType` has a corresponding active `DocumentTemplate` row in every environment (probe via `existsByDocumentTypeAndActiveTrue`; write a smoke test)
+* {todo} `DocumentTemplateExporter` registered with `@Order(7100)` and included in the environment-transfer pipeline (see <<catalog>>)
+* {todo} Exported JSON snapshots committed alongside schema changes — templates travel with the code that models their data
+* {todo} `DocumentTypeDeserializer` wired — verify by running a dry-run import in staging
+* {todo} PDF converter (`PdfConverter` bean) configured if any template relies on `convertToPdf()` — missing bean silently returns the HTML
+* {todo} Template picker dropdowns (notification configs, contract types, offer letters) use `DocumentTemplateFormService.getTemplatesMap()` — not hand-rolled repository calls
+* {todo} i18n keys exist: one per `DocumentType.name` in the admin menu and filter labels
+* {todo} `lineageId`-based FK columns in consumer entities (e.g., `CreditProduct.contractTemplateId`) — never the row UUID
+* {todo} Signable-document flows (see <<documents>>) resolve their template via `generateLatestVersion(lineageId, entity, forcePdf)` — not `generateSingle(entity, forcePdf)` — when multiple templates share a type
+* {todo} Notification rendering (see <<notifications>>) uses `DocumentTemplate` for outbound-message bodies where markup is non-trivial
+* {todo} `template.service` property set explicitly in every environment (don't rely on default); smoke-test covers at least one template per `DocumentCategory` under the active engine
+* {todo} `document.pdf.converter` property set to `wkhtmltopdf` or `weasyprint`; readiness probe calls `PdfConverter.enabled()` and fails startup if `false`
+* {todo} Docker base image includes the binary + required native libs (fontconfig, cairo/pango for Weasyprint) — confirmed by a `RUN wkhtmltopdf -V` / `weasyprint --version` step in the image build
+* {todo} `document.pdf.wkhtmltopdf.tmp.dir` mounted on ephemeral / tmpfs storage so abandoned `.html` temp files don't accumulate
+
+**Related:** <<form-classes-setup-and-usage>>, <<list-filters-annotation-driven-jpa-query-dsl>>, <<catalog>>, <<entity-module-sdk-reference-hierarchy>>, <<storage>>, <<documents>>, <<notifications>>, <<pebble-filters>>, <<thymeleaf-helpers-expression-objects-lazy-unwrapping>>
+
+**Next:** <<documents>>

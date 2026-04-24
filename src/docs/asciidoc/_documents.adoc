@@ -1,22 +1,155 @@
+[[documents]]
+[[document-management]]
 = Document Management
 
 :sourcedir: ../../main/java/com/timvero/example/admin
 
-This section describes how to implement document management functionality for entities in the platform, including document type associations and UI integration.
+This section describes how to attach documents to your entities using the SDK's document module (`com.timvero.ground.document`). It covers two persisted subsystems: **plain documents** (uploaded files tied to an entity) and **signable documents** (templated documents with a full lifecycle: generate → upload → sign).
 
 == Document System Overview
 
-The document management system allows entities to have associated documents with configurable upload and requirement rules. The system consists of:
+An entity becomes document-aware by implementing the marker interface `HasDocuments`. The SDK then exposes two independent subsystems attached to any `HasDocuments` owner:
 
-* **`HasDocuments`** - Interface marking entities that can have documents
-* **`DocumentTypeAssociation`** - Configuration for document types per entity
-* **`EntityDocumentTabController`** - UI integration for document management tabs
+[cols="1,3,3", options="header"]
+|===
+|Subsystem |Purpose |Key types
 
-== Document Type Configuration
+|**Plain documents**
+|User-uploaded files (ID scans, supporting docs, photos) with optional per-type rules
+|`EntityDocument`, `EntityDocumentService`, `EntityDocumentFinder`, `DocumentTypeAssociation`, `EntityDocumentType`
 
-Document types are configured using `DocumentTypeAssociation` with a builder pattern that allows defining uploadable and required document types with conditional logic.
+|**Signable documents**
+|Templated documents with a state lifecycle — generate from template, send for signature, upload signed copy, track status
+|`SignableDocument`, `SignableDocumentService`, `SignableDocumentType`, `DocumentSignature`, `SignatureStatus`, exceptions in `exception/`
+|===
 
-=== Document Type Associations
+Both subsystems share:
+
+- `HasDocuments` marker (extends `Persistable<UUID>`)
+- Soft delete via `active` flag + `@Undeletable` (the SDK-wide pattern)
+- Ownership by `ownerId` (inherited from `AbstractOwnable`)
+- Envers audit tracking (with `NOT_AUDITED` on referenced `Document` to avoid bloating the audit tables)
+- Automatic integration into the History tab via built-in `DocumentHistorySupplier` / `SignableDocumentHistorySupplier` (see <<entity-history>>)
+
+== Plain Documents
+
+=== HasDocuments Interface
+
+The marker interface that turns any entity into a document owner:
+
+[source,java]
+----
+public interface HasDocuments extends Persistable<UUID> {
+    // no methods — purely a marker
+}
+----
+
+Implement it on your entity:
+
+[source,java]
+----
+@Entity
+public class Participant extends AbstractAuditable implements HasDocuments {
+    // your business fields
+}
+----
+
+Once marked, the entity can be used with `EntityDocumentService`, the history suppliers fire automatically, and the tab controller wires up without further configuration.
+
+=== EntityDocument — The Persisted Entity
+
+`EntityDocument` is the row in the `entity_document` table — one per uploaded file:
+
+[source,java]
+----
+@Entity
+@Table(name = "entity_document")
+@Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
+@Undeletable(propertyName = EntityDocument_.ACTIVE)
+public class EntityDocument extends AbstractOwnable {
+
+    @Column(name = "active", nullable = false)
+    private boolean active = true;                        // <1>
+
+    @OneToOne(fetch = FetchType.EAGER)
+    @Fetch(FetchMode.JOIN)
+    @JoinColumn(name = "document_id", updatable = false, nullable = false)
+    private Document document;                            // <2>
+
+    @Column(name = "document_type")
+    @Type(CustomEnumType.class)
+    private EntityDocumentType documentType;              // <3>
+
+    @Column(name = "details")
+    private String details;                               // <4>
+
+    public EntityDocument(UUID ownerId, Document document, EntityDocumentType documentType) {
+        super(ownerId);
+        this.document = document;
+        this.documentType = documentType;
+    }
+    /* getters/setters */
+}
+----
+<1> Soft-delete flag. Delete operations set this to `false`; the physical file in storage remains. History suppliers and the tab filter out inactive rows automatically.
+<2> Reference to the actual stored file (`Document` from `com.timvero.structure.storage.entity`). `FetchMode.JOIN` means the document metadata loads in the same query — avoids N+1 when listing.
+<3> The type discriminator — e.g., `ID_SCAN`, `PROOF_OF_ADDRESS`. See `EntityDocumentType` below.
+<4> Required only for `EntityDocumentType.OTHER` — a human-readable description entered at upload time. Other types leave it null.
+
+Extends `AbstractOwnable`, so the entity also has `createdAt`, `createdBy`, and `ownerId` (all immutable after insert — matching the append-only nature of uploads).
+
+=== EntityDocumentType — Custom Enum Discriminator
+
+[source,java]
+----
+public final class EntityDocumentType extends CustomEnum<EntityDocumentType> {
+
+    public static EntityDocumentType OTHER = new EntityDocumentType("OTHER");
+
+    public EntityDocumentType(String name) {
+        super(name);
+    }
+}
+----
+
+`OTHER` is the single SDK-provided constant. Define your project types as constants in a `@Configuration` class so `CustomEnum` registers them at startup — same pattern as `CreditType`:
+
+[source,java]
+----
+@Configuration
+public class ParticipantDocumentTypes {
+    public static final EntityDocumentType ID_SCAN        = new EntityDocumentType("ID_SCAN");
+    public static final EntityDocumentType PROOF_ADDRESS  = new EntityDocumentType("PROOF_OF_ADDRESS");
+    public static final EntityDocumentType PAYSLIP        = new EntityDocumentType("PAYSLIP");
+}
+----
+
+[NOTE]
+====
+`EntityDocumentType.OTHER` has special behavior: `EntityDocumentService.saveDocument()` requires non-blank `details` when uploading as `OTHER`. For any other type `details` stays null.
+====
+
+=== Document Type Configuration — DocumentTypeAssociation
+
+Document types are made available on an entity by registering `DocumentTypeAssociation<E>` beans. Each association declares which types are uploadable, which are required, and under what conditions.
+
+[source,java]
+----
+public interface DocumentTypeAssociation<T extends HasDocuments> {
+
+    Class<T> getEntityClass();
+
+    List<EntityDocumentType> getUploadableTypes();   // <1>
+    List<EntityDocumentType> getRequiredTypes();     // <2>
+
+    boolean test(T entity);                          // <3>
+
+    static <E extends HasDocuments> Builder<E> forEntityClass(Class<E> entityClass) { /* ... */ }
+}
+----
+<1> Types the user is allowed to upload manually (e.g., `ID_SCAN`, `PROOF_OF_ADDRESS`)
+<2> Types that **must** be uploaded before a downstream operation can proceed (checked via `EntityDocumentService.requiredDocumentsAdded(owner)`)
+<3> Predicate — the association applies only when it returns `true` for the current entity state. Multiple predicates chain via AND.
 
 ==== Required Document Configuration
 
@@ -29,7 +162,7 @@ include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[line
 
 This configuration:
 
-* Makes `ID_SCAN` document required
+* Makes `ID_SCAN` required
 * Only applies when participant status is `NEW`
 * Only applies to participants with `GUARANTOR` or `BORROWER` roles
 
@@ -42,22 +175,140 @@ Documents that can be uploaded without restrictions:
 include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=35..38]
 ----
 
-This allows `OTHER` document type to be uploaded for any participant without conditions.
+Allows `OTHER` document type to be uploaded for any participant without conditions.
 
-=== Document Type Definitions
+==== Multiple Associations on One Entity
 
-Document types are defined as constants in the configuration:
+You can register **several** `DocumentTypeAssociation<Participant>` beans — they are all evaluated; their `getUploadableTypes()` / `getRequiredTypes()` are unioned for the given entity at runtime. This lets you keep rules modular:
 
 [source,java]
 ----
-include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=20..21]
+@Bean
+DocumentTypeAssociation<Participant> guarantorDocs() { /* GUARANTOR-only types */ }
+
+@Bean
+DocumentTypeAssociation<Participant> borrowerDocs()  { /* BORROWER-only types */ }
+
+@Bean
+DocumentTypeAssociation<Participant> commonDocs()    { /* available to everyone */ }
 ----
+
+At runtime, `EntityDocumentService.getUploadableDocumentTypes(participant)` returns the union of types from every association where `test(participant)` holds.
+
+=== Builder Pattern
+
+Associations are built via a fluent builder:
+
+.Available methods
+[cols="2,3", options="header"]
+|===
+|Method |Purpose
+
+|`uploadable(EntityDocumentType)`
+|Adds a type the user can upload manually
+
+|`required(EntityDocumentType)`
+|Adds a type that must be present for completion
+
+|`predicate(Predicate<E>)`
+|Adds a gating condition. Multiple `.predicate(...)` calls are chained with AND via `Predicate.and()`
+
+|`build()`
+|Produces the `DocumentTypeAssociation<E>`
+|===
+
+Predicate chaining example:
+
+[source,java]
+----
+include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=21..25]
+----
+
+All predicates must return `true` for the association to apply.
+
+=== EntityDocumentService — Core API
+
+The `@Service` that performs all document operations:
+
+[cols="2,3", options="header"]
+|===
+|Method |Behavior
+
+|`saveDocument(owner, resource, type, details)`
+|Validates type is editable for owner (via associations), stores the file via `DocumentStorage.storeDocument()`, creates `EntityDocument` row, persists. Returns the created `EntityDocument`. Requires non-blank `details` when type is `OTHER`.
+
+|`loadDocumentContent(subjectDocument)`
+|Returns the `DocumentResource` (content + metadata). Delegates to `DocumentStorage`.
+
+|`deleteDocument(owner, documentId)`
+|**Soft delete** — sets `active = false`. Validates type is editable for current entity state. File stays in storage.
+
+|`getAllDocuments(owner)`
+|Returns all documents (including inactive). Used by history suppliers.
+
+|`isEditable(owner, type)`
+|Evaluates the `DocumentTypeAssociation` rules — is this type in any matching association's uploadable OR required list?
+
+|`getUploadableDocumentTypes(owner)` / `getRequiredDocumentTypes(owner)` / `getEditableDocumentTypes(owner)`
+|Union of types from all matching associations. `editable` = uploadable ∪ required.
+
+|`requiredDocumentsAdded(owner)`
+|Returns `true` if every required type has at least one active document. Used as a gate before advancing workflow status.
+
+|`getRemainingDocumentTypes(owner)`
+|Required types not yet uploaded — show as "you still need to upload: …"
+|===
+
+[NOTE]
+====
+**Storage folder convention**: uploads land under `<EntityClassSimpleName>/<entityId>/uploaded` (e.g., `Participant/7f2a.../uploaded`). Used by the default `folder(entity)` method; override to customize.
+====
+
+=== EntityDocumentFinder — Read-Only Queries
+
+A thin `@Service` for read-only queries over both plain and signable documents:
+
+[source,java]
+----
+public class EntityDocumentFinder {
+
+    public List<EntityDocument> getDocuments(HasDocuments owner);                     // active only
+    public List<SignableDocument> getAllSignableDocuments(HasDocuments owner);        // signable, all states
+
+    public Optional<EntityDocument> latest(HasDocuments owner, EntityDocumentType type);
+    public Optional<SignableDocument> latest(HasDocuments owner, SignableDocumentType type);
+    public Optional<DocumentSignature> signatureOfLatest(HasDocuments owner, SignableDocumentType type);
+
+    public boolean isLatestSigned(HasDocuments owner, SignableDocumentType type);    // shortcut
+    public boolean isPresent(HasDocuments owner, EntityDocumentType type);
+    public boolean isMissing(HasDocuments owner, EntityDocumentType type);
+}
+----
+
+Use `EntityDocumentFinder` directly in checkers and decision logic — it's cheaper than calling `EntityDocumentService.getAllDocuments()` and filtering in Java.
+
+=== Repositories
+
+Two JPA repositories are available. Pick based on what you need:
+
+[cols="2,3", options="header"]
+|===
+|Repository |Use
+
+|`EntityDocumentRepository`
+|The low-level repo used internally by `EntityDocumentFinder`. Custom JPQL queries for `latest()` and `exists()`. Not typically injected in application code.
+
+|`BaseDocumentRepository`
+|Extends `JpaRepository` + `JpaSpecificationExecutor` + `SynchronousAccessRepository`. Use when you need ad-hoc specifications or `getSync()` pessimistic locking on document rows.
+|===
+
+Prefer injecting `EntityDocumentService` or `EntityDocumentFinder` unless you need specifications or write-locking on `EntityDocument` rows.
 
 == UI Integration
 
-=== Document Tab Implementation
+=== Document Tab
 
-To display document management interface, create a tab controller extending `EntityDocumentTabController`:
+To display document management UI, create a tab controller extending `EntityDocumentTabController`:
 
 [source,java]
 ----
@@ -66,90 +317,410 @@ include::{sourcedir}/participant/tab/ParticipantDocumentsTab.java[]
 
 Key features:
 
-* **`@Order(1500)`** - Controls tab display order in the UI
-* **`isVisible()`** - Determines when the tab should be shown
-* **Automatic functionality** - Upload, download, and delete operations are handled automatically
+* `@Order(1500)` — tab display position in the UI
+* `isVisible()` — show/hide based on entity state
+* **Automatic functionality** — upload, download, delete operations wired to `EntityDocumentService` with permission checks; the template is framework-provided
 
-=== Entity Requirements
+== Signable Documents
 
-Entities must implement the `HasDocuments` interface:
+Signable documents are a separate subsystem for templated documents that go through a signing workflow. Unlike plain documents (which are just uploaded files), signable documents have a **state lifecycle**, reference a `DocumentTemplate`, store both the generated PDF and the signed PDF, and track signature metadata.
+
+=== SignableDocument — The Entity
 
 [source,java]
 ----
-public interface HasDocuments extends Persistable<UUID> {
-    // No additional methods required
+@Entity
+@Table(name = "entity_signable_document",
+       uniqueConstraints = @UniqueConstraint(columnNames = {"ownerId", "documentType"}))  // <1>
+@Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
+@Undeletable(propertyName = SignableDocument_.ACTIVE)
+public class SignableDocument extends AbstractOwnable {
+
+    @Column(name = "active", nullable = false)
+    private boolean active = true;
+
+    @Type(CustomEnumType.class)
+    private SignableDocumentType documentType;                              // <2>
+
+    @Enumerated(EnumType.STRING)
+    private SignatureStatus status = SignatureStatus.PENDING_SIGNATURE;     // <3>
+
+    @ManyToOne(fetch = FetchType.EAGER)
+    private DocumentTemplate template;                                      // <4>
+
+    @OneToMany(cascade = CascadeType.PERSIST) @JoinTable(name = "entity_signable_document_generated")
+    @MapKeyColumn(name = "generated_documents_media_type")
+    @NotAudited
+    private Map<String, Document> generatedDocuments;                       // <5>
+
+    @OneToOne(fetch = FetchType.EAGER)
+    private Document document;                                              // <6>
+
+    @ManyToOne(fetch = FetchType.LAZY, cascade = {CascadeType.MERGE, CascadeType.PERSIST})
+    private DocumentSignature signature;                                    // <7>
+
+    @Column(name = "decision_made_at")
+    private Instant decisionMadeAt;                                         // <8>
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
+    private ExceptionEntity documentGenerationException;                    // <9>
+
+    public boolean isSigned() { return status == SignatureStatus.SIGNED; }
+}
+----
+<1> **Unique constraint `(ownerId, documentType)`** — one *active* signable document per (owner, type). Regenerating an existing document re-activates the same row and resets its state (see `SignableDocumentService.createOrActivate` below).
+<2> Type discriminator (registered as `CustomEnum`, see below).
+<3> Current state — five values, see `SignatureStatus` section below.
+<4> Which template was used to generate this document. Updated when regenerated.
+<5> Intermediate generated files in multiple formats (HTML + PDF). Map keyed by media type string — lets the UI offer "download as HTML" and "download as PDF" separately. `@NotAudited` because Envers shouldn't record every bytes-churn.
+<6> The **final** signed document — becomes non-null only after the user uploads the signed version (or signs inline via an integration like DocuSign).
+<7> Signature metadata (signer name, email, phone, signature image). Nullable until signed.
+<8> Timestamp of the last status transition. Auto-updated inside `setStatus()`.
+<9> If generation failed, links to an `ExceptionEntity` capturing the error (for operator debugging). Status becomes `GENERATION_FAILED`.
+
+=== SignatureStatus — State Lifecycle
+
+[source,java]
+----
+public enum SignatureStatus implements InEnum<SignatureStatus> {
+    GENERATION_FAILED,      // template rendering threw
+    PENDING_SIGNATURE,      // generated successfully, awaiting signature
+    REFUSE,                 // user/signer explicitly declined
+    SIGNED,                 // signed document received & stored
+    REVOKE                  // deleted/cancelled by admin
 }
 ----
 
-== Builder Pattern Usage
+[source]
+----
+      (initial generate)                (retry)
+               │                           │
+               ▼                           │
+     ┌──────────────────┐                  │
+     │  GENERATION_     │──────────────────┘
+     │    FAILED        │
+     └──────────────────┘
+               │ (successful regenerate via SignableDocumentService.generate)
+               ▼
+     ┌──────────────────┐     (user signs)     ┌──────────┐
+     │ PENDING_SIGNATURE │─────────────────────▶│  SIGNED  │
+     └──────────────────┘                      └──────────┘
+               │                                     │
+               │ (user refuses)    (admin deletes via
+               │                    SignableDocumentService.delete)
+               ▼                                     ▼
+     ┌──────────────────┐                      ┌──────────┐
+     │     REFUSE       │                      │  REVOKE  │
+     └──────────────────┘                      └──────────┘
+----
 
-The `DocumentTypeAssociation` uses a fluent builder pattern:
+The service transitions `PENDING_SIGNATURE` automatically after successful generation. `SIGNED` is set by integration code (DocuSign webhook or inline upload). `REFUSE` / `REVOKE` are terminal-but-resumable — `generate()` will re-activate the row and reset state.
 
-=== Available Methods
-
-* **`uploadable(EntityDocumentType)`** - Adds a document type that can be uploaded
-* **`required(EntityDocumentType)`** - Adds a document type that must be uploaded
-* **`predicate(Predicate<E>)`** - Adds conditional logic for when the association applies
-
-=== Predicate Chaining
-
-Multiple predicates can be combined:
+=== SignableDocumentType
 
 [source,java]
 ----
-include::{sourcedir}/participant/ParticipantDocumentTypesConfiguration.java[lines=21..25]
+public final class SignableDocumentType extends CustomEnum<SignableDocumentType> {
+
+    private final DocumentType documentType;         // <1>
+
+    public SignableDocumentType(String name, DocumentType documentType) {
+        super(name);
+        this.documentType = documentType;
+    }
+}
+----
+<1> Each signable type is bound to a `DocumentType` from `com.timvero.structure.template` — this is the link to the template engine. The template engine's `DocumentCategory` registered for that `DocumentType` is what actually renders the document.
+
+Define project-specific types:
+
+[source,java]
+----
+@Configuration
+public class ApplicationSignableDocumentTypes {
+    public static final SignableDocumentType LOAN_AGREEMENT =
+        new SignableDocumentType("LOAN_AGREEMENT", ApplicationContractDocumentCategory.TYPE);
+}
 ----
 
-Predicates are combined using AND logic - all conditions must be true.
+See <<document-templates>> for how to register the backing `DocumentCategory`.
+
+=== DocumentSignature — Signature Metadata
+
+[source,java]
+----
+@Entity
+@Table(name = "entity_document_signature")
+@Inheritance(strategy = InheritanceType.JOINED)                  // <1>
+@DiscriminatorColumn(discriminatorType = DiscriminatorType.STRING)
+public class DocumentSignature extends UUIDPersistable {
+
+    private String signer;                                        // <2>
+    private String email;
+    private String phone;
+
+    @OneToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "signature_document")
+    private Document signatureDocument;                           // <3>
+}
+----
+<1> `JOINED` inheritance — integration modules extend this with their own signature metadata (e.g., DocuSign's envelope ID). Each subclass gets its own table joined to the base.
+<2> Identity info captured at signing. Populated by the integration that handled the signing.
+<3> The signature image/file (e.g., rendered signature PNG from DocuSign). Stored via `DocumentStorage`.
+
+To add custom signature metadata:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue("DOCUSIGN")
+public class DocusignSignature extends DocumentSignature {
+    private String envelopeId;
+    private String recipientId;
+    /* ... */
+}
+----
+
+=== SignableDocumentService — Operations
+
+[cols="2,3", options="header"]
+|===
+|Method |Behavior
+
+|`generate(owner, type)`
+|Generate using the default template for the `DocumentType`. Creates a new `SignableDocument` or re-activates the existing one. Calls `DocumentCategory.generateSingle`. Converts to PDF if `application.signable.force.pdf=true` (default).
+
+|`generate(owner, type, templateUuid)`
+|Same but with explicit template UUID. Calls `DocumentCategory.generateLatestVersion`.
+
+|`saveUploadDocument(owner, signableDoc, resource)`
+|Store an uploaded signed version into `signableDoc.document`. Does **not** change status — the caller (typically a controller after signature validation) should set `SIGNED` separately.
+
+|`delete(owner, type)`
+|Soft-delete the latest signable document of given type. Sets `active=false`, status → `REVOKE`.
+
+|`deleteUploaded(owner, documentId)`
+|Clear the uploaded file on an existing signable document (resets `document` to null), keeping the row itself active.
+
+|`getAllDocuments(owner)` / `getTypes()` / `getSubjectDocument(owner, id)`
+|Queries (delegated to `EntityDocumentFinder` and `EntityManager`)
+|===
+
+**Re-generation semantics** (`createOrActivate`):
+
+[source]
+----
+find latest SignableDocument by (ownerId, documentType)
+   │
+   ├── not found → create new (PENDING_SIGNATURE)
+   │
+   └── found → set active=true, status=PENDING_SIGNATURE,
+               clear document, clear signature
+----
+
+Re-generating always resets signature state — the old generated file and signature are lost (by design; use audit history for forensics).
+
+**Error handling during generation**:
+
+- `TemplateEvaluatonException` — saved as `ExceptionEntity` linked via `documentGenerationException`, status → `GENERATION_FAILED`, logged at WARN level
+- Any other `RuntimeException` — same treatment plus ERROR-level log with owner context
+- Both paths call `finally { saveDocument(...) }` so the failure state is persisted
+
+=== Exceptions
+
+Three checked exceptions in `com.timvero.ground.document.exception`:
+
+[cols="2,3", options="header"]
+|===
+|Exception |When it's thrown
+
+|`SignatureException` (base)
+|Base class for signature-related errors. Catch this to handle any failure generically.
+
+|`InvalidSignatureStateException`
+|Attempted operation on a document in the wrong state (e.g., trying to sign a `REFUSE`d document). Typically thrown by integration code, not the SDK service itself.
+
+|`SignatureConfigurationException`
+|Wiring/configuration error — missing `DocumentCategory` for a `SignableDocumentType`, unrecognized template, etc. Usually a startup bug surfaced at first use.
+|===
+
+All are checked (extend `Exception`), so calling code must declare them. When catching in controllers, map to user-friendly errors or return them through the `ValidationException` mechanism.
+
+=== Folder Convention for Signable Files
+
+Generated and uploaded signable files land under `<EntityClassSimpleName>/<entityId>/signable` — note the `/signable` suffix versus `/uploaded` for plain documents. Keeps the two subsystems cleanly separated in storage.
+
+[[documents-admin-download-controller]]
+=== DocumentController — Generic Download/View Endpoint
+
+Two endpoints expose every `Document` by id, regardless of whether it came from plain uploads, signable generation, or notification attachments. The controller is the single URL the whole admin UI links to when it wants to let a user click a filename:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/document")
+@PreAuthorize("hasRole('" + Permission.DOCUMENT_VIEW + "')")
+public class DocumentController {
+
+    @Autowired protected DocumentStorage documentStorage;
+
+    @GetMapping("/{documentId}/download")             // forces browser download
+    public ResponseEntity<InputStreamResource> download(@PathVariable UUID documentId) throws IOException {
+        Document document = documentStorage.getDocumentById(documentId);
+        return HttpUtils.fileDownload(documentStorage.getDocumentResource(document));
+    }
+
+    @GetMapping("/{documentId}/view")                 // inline display (PDF preview, etc.)
+    public ResponseEntity<InputStreamResource> view(@PathVariable UUID documentId) throws IOException {
+        Document document = documentStorage.getDocumentById(documentId);
+        return HttpUtils.fileView(documentStorage.getDocumentResource(document));
+    }
+}
+----
+
+Key points:
+
+* **One permission (`DOCUMENT_VIEW`) for every document in the system.** There is no per-entity gate here — if the user can see a download link in the UI, the link is usable. Access control happens one level up, where the link is rendered (the entity page's own permission decides whether `${document.id}` appears in the HTML at all).
+* **Two verbs: `download` vs `view`.** `HttpUtils.fileDownload` sets `Content-Disposition: attachment` (browser saves); `HttpUtils.fileView` sets `inline` (browser previews PDFs/images in-place). Every `<a href="/document/{id}/download">` and every `<iframe src="/document/{id}/view">` in the admin templates routes through this controller.
+* **No `@MenuItem`** — the controller is plumbing, not a page. It is *never* reached by menu navigation, only by direct link from entity pages, notification bodies (attachments), or template test panels.
+* **`documentStorage.getDocumentResource(document)`** goes through whichever `DocumentStorageService` is wired — filesystem, S3, or custom — see `DocumentStorage` in <<storage>>. The controller is storage-agnostic.
+
+There is no upload endpoint here. Uploads are entity-specific and land through the `HasDocuments` tab controller (`/entity/{id}/documents`, see <<web-infrastructure-entity-view-controllers>>) so they carry entity context and can be authorized per-entity.
+
+== Related Subsystems
+
+=== History Suppliers Registered Automatically
+
+The SDK registers two `HistoryEventSupplier` beans keyed on `HasDocuments`:
+
+- `DocumentHistorySupplier` — one `DOCUMENT_ADDED` event per `EntityDocument`
+- `SignableDocumentHistorySupplier` — four events (`GENERATED`, `UPLOADED`, `SIGNED`, `DELETED`) based on status and field transitions
+
+Any entity that implements `HasDocuments` gets these events in its history tab **without writing supplier code**. See <<audit-module-sdk-reference-internals>> for mechanics.
+
+=== DocuSign Integration
+
+For external signing services, see <<docusign>>. The DocuSign module uses `SignableDocument` + a custom `DocumentSignature` subclass + webhook callbacks that flip status to `SIGNED`.
+
+=== Template Generation
+
+The actual rendering of signable document contents happens through `DocumentCategory` — see <<document-templates>> for how templates are registered and bound to `SignableDocumentType` via `DocumentType`.
 
 == Complete Implementation Example
 
 To implement document management for an entity:
 
-1. **Entity implements HasDocuments**:
 [source,java]
 ----
+// 1. Entity implements HasDocuments
 @Entity
-public class Participant implements HasDocuments {
-    // Entity implementation
+public class Participant extends AbstractAuditable implements HasDocuments {
+    // business fields
 }
-----
 
-2. **Create document type configuration**:
-[source,java]
-----
+// 2. Register document type associations
 @Configuration
 public class ParticipantDocumentTypesConfiguration {
-    
+
+    public static final EntityDocumentType ID_SCAN = new EntityDocumentType("ID_SCAN");
+
     @Bean
     DocumentTypeAssociation<Participant> requiredDocuments() {
         return DocumentTypeAssociation.forEntityClass(Participant.class)
             .required(ID_SCAN)
-            .predicate(participant -> participant.getStatus() == ParticipantStatus.NEW)
+            .predicate(p -> p.getStatus() == ParticipantStatus.NEW)
             .build();
     }
-    
+
     @Bean
     DocumentTypeAssociation<Participant> optionalDocuments() {
         return DocumentTypeAssociation.forEntityClass(Participant.class)
-            .uploadable(OTHER)
+            .uploadable(EntityDocumentType.OTHER)
             .build();
     }
 }
-----
 
-3. **Create document tab controller**:
-[source,java]
-----
+// 3. Add the tab
 @Controller
 @Order(1500)
 public class ParticipantDocumentsTab extends EntityDocumentTabController<Participant> {
-    
     @Override
     public boolean isVisible(Participant entity) {
-        return true; // Always show documents tab
+        return true;
     }
 }
 ----
 
-This provides a complete document management system with conditional requirements and integrated UI.
+For signable documents, additionally:
+
+[source,java]
+----
+// 4. Define signable types bound to template DocumentTypes
+@Configuration
+public class ApplicationSignableDocumentTypes {
+    public static final SignableDocumentType LOAN_AGREEMENT =
+        new SignableDocumentType("LOAN_AGREEMENT", ApplicationContractDocumentCategory.TYPE);
+}
+
+// 5. Trigger generation from business logic
+@Autowired private SignableDocumentService signableDocumentService;
+
+public void issueAgreement(Application application) {
+    signableDocumentService.generate(application, LOAN_AGREEMENT);
+    // status is now PENDING_SIGNATURE, downloadable via service
+}
+----
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Implement `HasDocuments` on any entity with files** — gets you plain documents, signable documents, history suppliers, tab integration for free
+* {ok} **Define `EntityDocumentType` / `SignableDocumentType` constants in `@Configuration` classes** — `CustomEnum` registration fires at Spring startup
+* {ok} **Split rules into multiple `DocumentTypeAssociation` beans** — keep each bean focused on one persona or business condition; the service unions them
+* {ok} **Use `EntityDocumentFinder` in checkers and decision logic** — cheaper than loading all docs and filtering in Java; the repository has dedicated `latest` / `exists` queries
+* {ok} **Check `requiredDocumentsAdded(owner)` before status transitions** — prevents advancing a workflow when required uploads are missing
+* {ok} **Prefer `SignableDocumentService.generate()` over manual `SignableDocument` instantiation** — ensures unique-constraint handling, retry semantics, exception capture
+* {ok} **Keep `application.signable.force.pdf=true`** — gives users a consistent signed-format, works with most e-signature providers that require PDF
+* {ok} **Subclass `DocumentSignature` (JOINED) for integration-specific metadata** — e.g., DocuSign envelope id, rather than stuffing generic string fields
+* {ok} **Trust the default storage folder convention** (`<EntityClass>/<id>/uploaded|signable`) — it's consistent with SDK conventions and is what `DocumentStorage` expects
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Hard-deleting `EntityDocument` or `SignableDocument` rows** — use the service's `deleteDocument` / `delete` methods; they soft-delete via `active = false`, preserving audit history
+* {bad} **Registering a `DocumentTypeAssociation` without a predicate** — it fires for every entity of that class; prefer `predicate(e -> true)` explicit even for always-on associations
+* {bad} **Mutating `EntityDocument.document`** — the `@JoinColumn` is `updatable = false`; attempted update silently fails or throws
+* {bad} **Uploading with `EntityDocumentType.OTHER` without `details`** — `saveDocument` throws `IllegalArgumentException` at runtime; validate details at the controller layer
+* {bad} **Creating two active `SignableDocument` rows for the same `(ownerId, documentType)`** — the unique constraint fails with `DataIntegrityViolationException`; always go through `SignableDocumentService.generate`, which handles the upsert
+* {bad} **Setting `SignableDocument.status = SIGNED` without populating `signature` and `document`** — UI and history templates expect both to be set; inconsistent state shows as "signed but no file"
+* {bad} **Calling `SignableDocumentService` outside a transaction** — methods are `@Transactional`, but the enclosing request typically needs to share the transaction for related writes (entity state, events)
+* {bad} **Using plain `EntityDocument` for a templated document** — loses the status lifecycle, template linkage, and exception tracking; use `SignableDocument` even if you upload the PDF directly without generating
+* {bad} **Catching `SignatureException` and swallowing it** — it's checked precisely so it can't slip past; either propagate, log + user-facing rejection, or map to `ValidationException`
+* {bad} **Registering a `SignableDocumentType` whose `DocumentType` has no matching `DocumentCategory` bean** — `SignableDocumentService.generate` throws `IllegalArgumentException("No category for ...")` at first use; register the category at startup
+
+== Production Checklist
+
+[.unstyled]
+* {todo} All file-owning entities implement `HasDocuments`
+* {todo} `EntityDocumentType` constants declared in `@Configuration` class
+* {todo} `DocumentTypeAssociation` beans cover every type the UI needs (uploadable + required)
+* {todo} `requiredDocumentsAdded(owner)` gate exists before workflow transitions that depend on uploads
+* {todo} Document tab controller (`EntityDocumentTabController`) added to every entity with uploads
+* {todo} `DocumentStorage` bean configured and tested (local filesystem, S3, etc.)
+* {todo} `SignableDocumentType` constants registered for every templated document
+* {todo} `DocumentCategory` beans exist for every `DocumentType` referenced by a `SignableDocumentType` (startup test recommended)
+* {todo} `application.signable.force.pdf` property reviewed — set to `true` for production (default)
+* {todo} Envers migrations create `entity_document_AUD` and `entity_signable_document_AUD` tables
+* {todo} `entity_signable_document` unique constraint `(owner_id, document_type)` present in migrations
+* {todo} Integration tests verify signable lifecycle: generate → sign → re-generate resets state
+* {todo} Error-handling tested: `TemplateEvaluatonException` during generate → status becomes `GENERATION_FAILED`, exception stored
+* {todo} i18n keys for `SignatureStatus` values and `EntityDocumentType` / `SignableDocumentType` names
+* {todo} Storage folders do not leak across tenants if multi-tenant (owner id alone may not be enough)
+* {todo} Monitoring: alert on sustained `GENERATION_FAILED` — indicates broken template or storage
+
+---
+
+**Related:** <<entity-history>>, <<document-templates>>, <<docusign>>, <<entity-module-sdk-reference-hierarchy>>, <<audit-module-sdk-reference-internals>>
+
+**Next:** <<document-templates>>, <<docusign>>

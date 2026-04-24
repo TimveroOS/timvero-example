@@ -1,3 +1,4 @@
+[[launchpad]]
 = Launchpad Integration
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -316,3 +317,354 @@ entity properly implements HasPendingDecisions interface.
 ```
 
 The Launchpad system provides a powerful way to centralize decision management across different entity types, giving users a unified interface for workflow operations while maintaining entity-specific context and functionality.
+
+// ----------------------------------------------------------------------
+// SDK Internals — added from com.timvero.loan.launchpad and
+// com.timvero.loan.pending_decision source reads
+// ----------------------------------------------------------------------
+
+[[launchpad-sdk-internals]]
+== Launchpad SDK Internals
+
+The launchpad module (`com.timvero.loan.launchpad`) is a thin aggregator sitting on top of `PendingDecisionHolder` rows. It does not own state of its own — it queries holders filtered by the current user's decision department and delegates per-entity rendering to project-supplied `DecisionEntityExtractor` beans.
+
+The whole module is only 4 files: `DecisionEntityExtractor` (SPI contract), `LaunchpadEntityDto` (render DTO), `LaunchpadService` (query + DTO assembly), and `LaunchpadController` (three-tab UI).
+
+=== DecisionEntityExtractor — the SPI
+
+[source,java]
+----
+public interface DecisionEntityExtractor {
+    String getDecisionOwnerType();
+    LaunchpadEntityDto getByHolderId(Long holderId);
+}
+----
+
+`getDecisionOwnerType()` returns a string identifier stored on each `PendingDecisionHolder.ownerType` — this is how the SDK routes a holder back to the right project-side extractor. The value is set **once at holder construction** (constructor-arg, `@Column(updatable = false)`) and audited via Envers but never mutable.
+
+`getByHolderId(Long)` is called **per launchpad row on every page render** — if it triggers N+1 queries on related entities (application, offers, documents), the launchpad tab will feel slow. Fetch-join in the repository query, or use a projection.
+
+See `_launchpad.adoc` earlier sections for the concrete `ParticipantLaunchpadService` implementation used in this project.
+
+=== LaunchpadEntityDto — render contract
+
+Key fields that surface in Thymeleaf:
+
+[%header,cols="1,3"]
+|===
+| Field | Used by
+
+| `key` | `th:key` / list-key de-duplication
+| `mainEntity` + `mainEntityName` | 1st column — parent (typically Application)
+| `targetEntity` + `targetEntityName` | 2nd column — entity that owns the holder
+| `description` | short contextual string (roles, product code, etc.)
+| `viewPage` | **Thymeleaf fragment path** used for the expanded row body
+| `holder` | set by `LaunchpadService` — gives the template `entityDto.decisions`
+| `assignee` | set by `LaunchpadService` after resolving department → user
+|===
+
+Two important observations:
+
+1. `holder` and `assignee` are set **by `LaunchpadService`, not by the project's extractor**. The extractor returns a DTO with `null` holder; the service wires it in. Don't try to set them yourself — it has no effect, and `checkAssignee` will overwrite `assignee` anyway.
+2. `getProcessExecutions()` returns `Collections.EMPTY_LIST` unconditionally. The field exists in the API for forward compatibility with Flowable process-instance display on the launchpad, but the base DTO does not populate it. If you need executions listed, subclass `LaunchpadEntityDto` and override.
+
+=== LaunchpadService — query strategy
+
+`LaunchpadService` exposes three tabs through three `Repository.get*` methods, each scoped by `DecisionStatus.PENDING` and the user's decision department:
+
+[%header,cols="2,2,3"]
+|===
+| Tab | Service method | Repository method
+
+| All | `getAll(user, page, count)` | `getHolders(PENDING, department, pageable)`
+| To be assigned | `getToBeAssigned(user, page, count)` | `getHoldersToBe(PENDING, department, pageable)`
+| Assigned to me | `getToMeAssigned(user, page, count)` | `getHoldersByAssignee(PENDING, department, userId, pageable)`
+|===
+
+Each tab also has a matching `get*Count` method backed by the same `WHERE` clause — `EntityCounterService` uses these counts to drive the sidebar badge.
+
+Non-obvious rules:
+
+* **`ConditionalOnBean(DecisionEntityExtractor.class)`** — `LaunchpadService` is only wired if at least one extractor bean exists. Project without a participant, application, or credit extractor: no launchpad service, no controller, no `/launchpad` route. Adding the first extractor silently activates the whole subsystem.
+* **Decision-department gating** — `getDecisionDepartment(user)` returns `null` for users without a department; `LaunchpadService` returns `0L` count and `List.of()` entries. Users without a `DecisionDepartment` see an empty launchpad, not an error. (See <<user-roles>> for department assignment.)
+* **The `reduce` trap in `getDto`** — the stream collects all extractors whose `getDecisionOwnerType()` matches `holder.getOwnerType()`, then calls `.reduce((a, b) -> { throw }) `. Two extractors with the same owner type throw `IllegalStateException` with the holder ID. Owner types must be globally unique across the project.
+* **Default pagination is `Integer.MAX_VALUE`** — `getPage(null, null)` returns `PageRequest.of(0, MAX_VALUE)`. The controller tabs work unpaginated by default, which is fine for a few hundred rows but will melt on 10k+ pending holders. Set `count` explicitly on the URL if the volume is high.
+
+=== LaunchpadController — URLs + menu
+
+[source,java]
+----
+@Controller
+@RequestMapping(value = PATH)          // PATH = "/launchpad"
+@PreAuthorize("hasRole('" + LAUNCHPAD_VIEW + "')")
+@ConditionalOnBean(LaunchpadService.class)
+@MenuItem(order = 1_100, name = "launchpad")
+public class LaunchpadController { ... }
+----
+
+Endpoints:
+
+* `GET /launchpad` — main view, loads `/launchpad/view.html` with `counterList` model
+* `GET /launchpad/all` — All tab, returns `/launchpad/list.html` with `EntityType.ALL`
+* `GET /launchpad/to-be-assigned` — To-be-assigned tab
+* `GET /launchpad/assigned-to-me` — Assigned-to-me tab
+* `GET /launchpad/{holderId}` — single holder modal, `/launchpad/modal.html`
+
+Request params on the three tab endpoints: optional `page` (0-based) and `count`. The three tabs all render the same template `/launchpad/list.html` with a `DtoEntitiesWrapper(type, dtoEntities)` record — the template branches on `type` (`ALL`/`TO_BE`/`TO_ME`) to show per-tab action buttons.
+
+Authorization is coarse: `LAUNCHPAD_VIEW` gates the entire controller. Fine-grained per-row permissions come from each pending-decision action (below) — see <<user-roles>> for how these roles stack.
+
+[[pending-decisions-subsystem]]
+== Pending Decisions Subsystem
+
+`com.timvero.loan.pending_decision` is the backing store, lifecycle manager, and action toolkit for the launchpad. The package has 14 files across three logical groupings: the entity model (`PendingDecision`, `PendingDecisionHolder`, `DecisionStatus`, `HasPendingDecisions`, repository, service), the action controllers (`action/`), and the audit-history supplier (`history/`).
+
+=== Entity Model
+
+==== PendingDecision
+
+The decision row itself — one per "fact" a decision-department user has to sign off on.
+
+Notable columns:
+
+[%header,cols="1,3"]
+|===
+| Field | Meaning
+
+| `processGroup` | free-text group key used by `RevertPendingDecisionAction` to find sibling decisions (e.g. a single Flowable call-activity generates multiple decisions with the same `processGroup`)
+| `holder` | non-null, non-updatable FK to `PendingDecisionHolder`
+| `fact` | free-text i18n key describing what is being decided
+| `decisionDepartment` | FK to `DecisionDepartment` — the department entitled to resolve the decision
+| `schema` | optional FK to `FormSchema` — presence switches between approve-with-comment and approve-with-form flows (see <<form-schema>>)
+| `status` | `DecisionStatus` enum, default `PENDING`
+| `declineReason` | FK, populated only on decline
+| `comment` | `@Size(max = 1000)` — declared as `COMMENT_LENGTH` constant
+| `decisionMadeBy` | `Auditor` snapshot (not a live user reference)
+| `decisionMadeAt` | `Instant`, null while PENDING
+| `values` | JSON column (`@JdbcTypeCode(SqlTypes.JSON)`) — stores submitted form values when `schema != null`
+|===
+
+The entity is `@Audited`, so all state transitions are queryable through Envers.
+
+==== DecisionStatus — the lifecycle
+
+[source,java]
+----
+public enum DecisionStatus {
+    INFO, PENDING, APPROVED, DECLINED, NOT_ACTUAL
+}
+----
+
+Transitions the SDK actually performs:
+
+* `PENDING → APPROVED` via `PendingDecisionService.approve`
+* `PENDING → DECLINED` via `PendingDecisionService.decline`
+* `APPROVED → PENDING` via `RevertPendingDecisionAction` (revert sets `decisionMadeAt`/`decisionMadeBy`/`comment` to null)
+
+`INFO` and `NOT_ACTUAL` are **declared but never set by the SDK itself**. They exist for project code and Flowable flows that need "informational-only" decisions or that mark decisions as superseded. No SDK query treats them as actionable — the launchpad filter is strict `status = PENDING`, so `INFO` rows are invisible in every tab.
+
+==== PendingDecisionHolder
+
+The aggregation root. One holder owns many decisions and has a per-department assignee map.
+
+[source,java]
+----
+@Column(nullable = false, updatable = false)
+private String ownerType;                   // matches DecisionEntityExtractor
+
+@OneToMany(mappedBy = "holder", cascade = ALL, orphanRemoval = true)
+private List<PendingDecision> decisions;
+
+@ElementCollection
+@CollectionTable
+@Column(name = "assignee_id")
+@MapKeyColumn(name = "department_code")
+private Map<String, UUID> assignees;       // department_code → user_id
+----
+
+The `assignees` map is **keyed by department code, not user**. That is the single most important structural detail: a holder can have one assignee per department simultaneously. Underwriter department's assignee and AML department's assignee coexist on the same holder without conflict.
+
+`getPendingDecisions()` and `getAssignees()` lazy-initialize — safe to call on a fresh holder.
+
+==== HasPendingDecisions — the marker
+
+[source,java]
+----
+public interface HasPendingDecisions {
+    PendingDecisionHolder getPendingDecisionHolder();
+    default List<PendingDecision> getPendingDecisions() {
+        return getPendingDecisionHolder().getPendingDecisions();
+    }
+}
+----
+
+Any entity exposing `PendingDecisionHolder` implements this. In this project, only `Participant` does (verified by grep). Implications:
+
+* `PendingDecisionHolderAssignHistorySupplier` wires itself to `HasPendingDecisions.class` as root — every `HasPendingDecisions` entity automatically gets the "assignment changed" history events on its history tab (see <<has-notes>>).
+* `AssignAction<ID, P>`, `AssignToMeAction<ID, P>`, `DropMeAssignAction<ID, P>` are parameterized on `<ID, P extends HasPendingDecisions & Persistable<ID>>` — any holder-bearing entity can subclass them by specifying its ID type and the entity type. See `AssignParticipantAction` and `AssignToMeParticipantAction` in this project for the one-line pattern.
+
+==== PendingDecisionHolderRepository
+
+Five custom queries, all filtered by `(status, department)`:
+
+* `getHoldersCount(status, department)` / `getHolders(...)` — every holder in the department
+* `getHoldersByAssigneeCount(status, department, userId)` / `getHoldersByAssignee(...)` — joined through `h.assignees` where the value equals the current user's ID
+* `getHoldersToBeCount(status, department)` / `getHoldersToBe(...)` — **uses the `VALUE(a) IS NULL` trick on `LEFT JOIN h.assignees a ON KEY(a) = d.decisionDepartment.code`** to find holders whose department cell is empty. This is the "unassigned" filter, and it is written as a JPQL left join with a composite ON-condition — straightforward to read but non-trivial to replicate in a custom query.
+
+All queries use `select distinct h` because a holder can have multiple decisions and the join explodes.
+
+==== PendingDecisionService
+
+Only three methods. Each mutation is `@Transactional(propagation = MANDATORY)` — meaning these are **never callable from outside an existing transaction**. Calling `approve` from a plain controller without an outer `@Transactional` throws `TransactionRequiredException`.
+
+[source,java]
+----
+public void approve(PendingDecision, comment, UserAccount);
+public void decline(PendingDecision, DeclineReason, comment, UserAccount);
+public boolean canBeResolvedBy(PendingDecision, UserAccount);
+----
+
+`canBeResolvedBy` is the guard every action uses. It returns `true` only if:
+
+1. The decision has a `decisionDepartment` set, and
+2. The user is a member of the same department, and
+3. The user is the assignee for that department on the holder.
+
+Point (3) means **self-assignment is mandatory** — a user cannot approve a decision in their own department without claiming it first via `AssignToMeAction` or being assigned by a supervisor via `AssignAction`.
+
+=== Action Controllers
+
+All live under `pending_decision/action/`. Seven controllers, split into two structural camps:
+
+[%header,cols="1,1,3"]
+|===
+| Type | Works on | Controllers
+
+| Concrete (`@Controller`) | `PendingDecision` directly | `ApprovePendingDecisionAction`, `ApproveWithFormPendingDecisionAction`, `DeclinePendingDecisionAction`, `RevertPendingDecisionAction`
+| Abstract template | `HasPendingDecisions` entity | `AssignAction<ID,P>`, `AssignToMeAction<ID,P>`, `DropMeAssignAction<ID,P>`
+|===
+
+The concrete four mount on `/approve`, `/approve-with-form`, `/decline`, `/revert` and act on decision IDs directly. The abstract three are meant to be subclassed per holder-bearing entity — each subclass supplies the entity type (`AssignParticipantAction extends AssignAction<UUID, Participant>`) and inherits all behavior.
+
+==== Approve / Approve-with-Form bifurcation
+
+Two separate controllers, differentiated by schema presence:
+
+[source,java]
+----
+// ApprovePendingDecisionAction — no schema
+when((d, user) -> d.getStatus() == PENDING
+    && d.getSchema() == null
+    && decisionService.canBeResolvedBy(d, user))
+
+// ApproveWithFormPendingDecisionAction — schema required
+when((d, user) -> d.getStatus() == PENDING
+    && d.getSchema() != null
+    && decisionService.canBeResolvedBy(d, user))
+----
+
+They are **mutually exclusive** — exactly one of the two button's `isAvailable()` returns true for a given decision. The UI renders whichever button matches. If you add a third approval flavour, mirror the exclusivity check to avoid both buttons appearing.
+
+`ApproveWithFormPendingDecisionAction` writes submitted values to `PendingDecision.values` (the JSON column) — these are read back from the BPMN script task or `FinishedScoringListener` (see <<flowable-internals>>). Form rendering uses `formSchema` model attribute; the template is `/pending-decision/action/approve-with-form`.
+
+==== Decline
+
+`DeclinePendingDecisionAction` requires a `declineReasonCode` — pulls active reasons via `DeclineReasonService.getAllActive()` and exposes them as a dropdown. Comment is optional but size-limited to `COMMENT_LENGTH`. The `when` guard has a commented-out participant-status check (`PRE_MANUAL_APPROVAL, MANUAL_APPROVAL`) that hints at SDK history — the guard now relies entirely on `canBeResolvedBy`.
+
+==== Revert — the only APPROVED → PENDING transition
+
+`RevertPendingDecisionAction` moves an approved decision back to pending, but only under a narrow condition:
+
+[source,java]
+----
+&& d.getStatus().equals(DecisionStatus.APPROVED)
+&& decisionService.canBeResolvedBy(d, user)
+&& d.getHolder().getPendingDecisions().stream()
+    .filter(p -> p.getDecisionDepartment() != null)
+    .filter(p -> p.getDecisionDepartment().getCode().equals(
+        decisionDepartment.get().getCode()))
+    .filter(p -> p.getProcessGroup().equals(d.getProcessGroup()))
+    .anyMatch(p -> p.getStatus() == DecisionStatus.PENDING);
+----
+
+A decision can only be reverted while **at least one sibling decision in the same department and `processGroup` is still PENDING**. Intent: preserve the "all-or-nothing" approval of a scoring round. Once every decision in the group is resolved (approved/declined), no reverts are possible — the round is closed and the BPMN engine has already moved on.
+
+Revert clears `decisionMadeAt`, `decisionMadeBy`, `comment` back to null. `declineReason` is not cleared — so reverting an approved decision is safe, but this is not a "decline-revert" path (declined decisions aren't revertible because the guard requires `APPROVED` status).
+
+==== Assign / AssignToMe / DropMeAssign
+
+These are all department-scoped assignment toggles, not decision-level:
+
+* `AssignAction` — pick any user in your department (including nobody via the `NOBODY_ID = UUID.randomUUID()` sentinel, which maps to map-removal). Template: `/decision/action/assign`. Used by a supervisor to delegate.
+* `AssignToMeAction` — one-click self-assign. Only available if the department cell is currently empty (`!assignees.containsKey(department.code)`). Template: `/common/action/yes-no`.
+* `DropMeAssignAction` — release your claim. Available only if your user ID is currently in the assignees map. Removes all map entries pointing at you (handles the edge case of being in multiple department slots).
+
+All three hit `ReloadPageHelper.reloadFragment(LaunchpadController.PATH + LaunchpadController.PATH_ASSIGNED_TO_ME)` after success, so the "assigned to me" sidebar counter refreshes without a full reload. `DropMeAssignAction` reloads the `PATH_TO_BE_ASSIGNED` fragment instead — released holders reappear in the unassigned queue.
+
+The `NOBODY_ID` sentinel in `AssignAction` is a per-JVM random UUID. The dropdown shows it with the i18n key `decision.assignee.nobody`. Selecting it calls `assignees.remove(code)` — the holder returns to the unassigned queue in the launchpad.
+
+=== History Supplier
+
+`PendingDecisionHolderAssignHistorySupplier` emits a `PendingDecisionHolderAssignedEvent` for every `assignees` map mutation. It is a `HistoryEventSupplier<HasPendingDecisions, ...>` — wiring is automatic for any holder-bearing entity.
+
+Mechanics:
+
+* Queries `auditService.queryChanges(PendingDecisionHolder.class, holderId, Set.of("assignees"), ADD | MOD)` to get Envers revision pairs
+* Diffs `currentAssignees` vs `previousAssignees` per revision — emits an event for every map entry whose value changed or was added
+* **Does not emit** for map entries that were *removed* (the `for (entry : currentAssignees)` loop only iterates present keys). A drop-me-assign is visible in Envers but invisible on the history tab. {bad}
+* Each event carries the `DecisionDepartment` and `UserAccount` resolved at render time — if either was soft-deleted, it shows as null and the template fragment `/history/fragments/pending_decision_holder` must handle nulls
+
+[[launchpad-timvero-example-wiring]]
+=== timvero-example Wiring
+
+Grep shows only `Participant` implements `HasPendingDecisions` in this project. The wiring surface is concentrated in `com.timvero.example.admin.participant`:
+
+* `Participant.java` — `implements HasPendingDecisions`, field `pendingDecisionHolder = new PendingDecisionHolder(DECISION_OWNER_TYPE)` with `DECISION_OWNER_TYPE = "PARTICIPANT"` and `CascadeType.ALL`. The holder lifecycle is bound to the participant — no separate save.
+* `ParticipantLaunchpadService.java` — the only `DecisionEntityExtractor` bean, routes holders with `ownerType = "PARTICIPANT"` back to participant+application context. Because it is the only bean of this kind, `LaunchpadService` is wired and the `/launchpad` route is live.
+* `AssignParticipantAction`, `AssignToMeParticipantAction` — one-line subclasses of `AssignAction<UUID, Participant>` and `AssignToMeAction<UUID, Participant>`. `DropMeAssignAction` is not subclassed in this project {todo} — users cannot release their own claim through the UI.
+* `ApproveParticipantAction` — note this is a **participant-level** approve action (checks `participant.getPendingDecisions().isEmpty()`), not a pending-decision approve action. It moves the `Participant` itself through its `ParticipantStatus` lifecycle once all its decisions are resolved. Don't confuse with `ApprovePendingDecisionAction` from the SDK.
+* `PendingDecisionChecker` — an `EntityChecker<PendingDecision, Long>` that listens on `PendingDecision_.STATUS` and, when a decision flips to APPROVED or DECLINED, kicks `FinishedScoringListener` after the transaction commits. This is where the decision → workflow bridge lives (see <<flowable-internals>>, <<counters>>).
+
+=== Cross-references
+
+* <<flowable-internals>> — `PendingDecision` rows are typically created by Flowable script tasks and their status transitions drive BPMN boundary events
+* <<workflow-integration>> — tutorial pairing with this reference
+* <<form-schema>> — `PendingDecision.schema` is a `FormSchema` reference; approve-with-form flow uses the same catalog
+* <<entity-actions>> — all launchpad actions are `EntityActionController`s; their `when(...).then(...)` DSL is documented there
+* <<user-roles>> — `LAUNCHPAD_VIEW` role and `DecisionDepartment` membership are both required for the launchpad to show anything
+* <<counters>> — the sidebar counters on the launchpad view come from `EntityCounterService`; per-tab counts use `LaunchpadService.get*Count`
+* <<entity-module-sdk-reference-hierarchy>> — `PendingDecision extends BasePersistable<Long>`, `PendingDecisionHolder extends BasePersistable<Long>` — the base-class wiring (audit, equality, ID generation) comes from the entity-module hierarchy
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Two extractors returning the same `getDecisionOwnerType()`** — `LaunchpadService.getDto` does a `reduce` that throws `IllegalStateException: Unsupported multiple entity. Holder ID: X`. The error surfaces only when a matching holder is rendered, not at startup. Keep owner-type strings unique across the project.
+* {bad} **Mutating `PendingDecisionHolder.ownerType` post-construction** — the column is `@Column(updatable = false)` and initialized via constructor. A `setOwnerType` does not exist, and adding one silently drops the update. Create a new holder instead.
+* {bad} **Calling `PendingDecisionService.approve/decline` outside a transaction** — propagation is `MANDATORY`; you get `TransactionRequiredException` at runtime. Always call from a `@Transactional` controller, action, or service.
+* {bad} **Storing form submission data anywhere other than `PendingDecision.values`** — the JSON column exists for this. Persisting to a side table breaks the Envers audit trail and the approve-with-form replay.
+* {bad} **Returning a `LaunchpadEntityDto` with a `null` `viewPage`** — the launchpad template resolves this as a Thymeleaf fragment path; null throws at render time. Provide a fragment even if it is an empty `<div>`.
+* {bad} **Fetching related entities lazily inside `DecisionEntityExtractor.getByHolderId`** — called once per row on every tab load; lazy traversal produces N+1 queries at the page level. Use `JOIN FETCH` or a projection.
+* {bad} **Bypassing `canBeResolvedBy` in a custom approve action** — skips the department + assignee check. A user from department X could then approve department Y's decisions. Always gate on `decisionService.canBeResolvedBy(decision, user)` in the `when(...)` predicate.
+* {bad} **Declaring a `PendingDecisionHolder` with `updatable = true` or without `CascadeType.ALL`** — the holder is conceptually part of the owner's aggregate. Without cascade, you have to save the holder manually before saving the owner; with `updatable = true`, a stale merge can replace the holder and orphan all its decisions.
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every `DecisionEntityExtractor` implementation is `@Component` and returns a unique, stable `getDecisionOwnerType()` — constant string, preferably on the owning entity class (e.g. `Participant.DECISION_OWNER_TYPE`)
+* {todo} `DecisionEntityExtractor.getByHolderId` uses a single fetch-joined query — no lazy traversals in the returned DTO chain (application, client, offers eagerly loaded)
+* {todo} Every holder-bearing entity implements `HasPendingDecisions` correctly — `@OneToOne(cascade = CascadeType.ALL)`, `@JoinColumn(nullable = false, updatable = false)`, initialized inline with `new PendingDecisionHolder(DECISION_OWNER_TYPE)`
+* {todo} `DropMeAssignAction` is subclassed for every holder-bearing entity — users must be able to release their own claim, otherwise stuck assignments pile up
+* {todo} `LAUNCHPAD_VIEW` role is granted to every decision-department user — without it the `/launchpad` controller returns 403 even if the department is correct
+* {todo} Every user who needs to decide has a `DecisionDepartment` assigned — absent department means `LaunchpadService` returns empty lists with no error (silent failure)
+* {todo} Pagination is set explicitly (`?count=50`) on high-volume tenants — the default is `Integer.MAX_VALUE`, which works until it doesn't
+* {todo} Thymeleaf fragment at `viewPage` exists at template resolution time — the SDK does not validate the path at extractor-registration time; missing fragment fails only on render
+* {todo} `PendingDecisionChecker` (or equivalent project listener) is wired on `PendingDecision_.STATUS` to bridge decision transitions back into the workflow — otherwise BPMN flows stall waiting for signals that never arrive
+* {todo} Envers audit tables for `pending_decision` and `pending_decision_holder` are present and indexed — the history tab (`PendingDecisionHolderAssignHistorySupplier`) queries them on every render
+* {todo} If drop-me-assign history is required, override `PendingDecisionHolderAssignHistorySupplier` to also emit events for removed keys — the SDK supplier only emits ADD/MOD of present entries
+* {todo} Monitoring on `IllegalStateException: Unsupported multiple entity` — signals a duplicate extractor owner type; catches a misconfiguration that otherwise only fires on the first matching holder
+
+---
+
+**Related:** <<entity-actions>>, <<form-schema>>, <<flowable-internals>>, <<user-roles>>, <<counters>>, <<has-notes>>
+
+**Next:** <<workflow-integration>>

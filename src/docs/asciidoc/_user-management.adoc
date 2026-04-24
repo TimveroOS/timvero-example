@@ -1,0 +1,1187 @@
+[[user-management]]
+= User Management — accounts, auditors, authentication events
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The user module (`com.timvero.structure.user`) is the SDK layer that owns the `UserAccount` entity, the `Auditor` subclass that attributes writes to a user, the Spring Security principal adapter, the password-event pipeline that routes temporary passwords through the notification system, and the `AuditorAction` request-logging infrastructure that feeds into audit revisions. This guide documents the entity graph, the service API, the form pipeline, how authentication events emit notifications, and how per-request actions are captured and correlated back to Hibernate Envers revisions.
+
+== What You Need to Know
+
+The module has **five clearly separated subsystems**. They share the `UserAccount` entity but serve independent purposes — skip past a subsystem only after you're sure you understand it:
+
+[cols="1,3,3", options="header"]
+|===
+|Subsystem |Purpose |Public API
+
+|**Account entity & service**
+|`UserAccount` stores credentials, role, notification preferences. `UserAccountService` provides transactional password operations (change, reset, insert, lock/unlock).
+|`UserAccount`, `UserAccountService`, `UserAccountRepository`
+
+|**Auditor integration**
+|`UserAccountAuditor` is the `Auditor` subclass wired into Spring Data JPA auditing — every `createdBy` / `updatedBy` on an `AbstractAuditable` entity points here when a logged-in user writes.
+|`UserAccountAuditor`, `UserAccountAuditorRepository`
+
+|**Spring Security principal**
+|`AuditorUser` is a minimal SPI contract the Spring Security principal must implement so the audit pipeline can resolve the current auditor id from `SecurityContextHolder`.
+|`AuditorUser` (interface)
+
+|**Password events**
+|Three `@Component` events (`UserCreatedEvent`, `UserChangePasswordEvent`, `UserResetPasswordEvent`) extend `NotificationEvent` and ship temporary passwords to the user via the notification pipeline.
+|`UserPasswordEvent`, `UserAccountPasswordTemplateModel`
+
+|**AuditorAction infrastructure**
+|`AuditorAction` captures one row per HTTP request (url, params, ip, user, action type). `AuditorActionHolder` exposes it as a `ThreadLocal` so the audit module's `AuditRevisionListener` can stamp every Envers revision with the originating request's id.
+|`AuditorAction`, `AuditorActionHolder`, `AuditorActionConfig`
+|===
+
+Key characteristics:
+
+- **`UserAccount` is `@Undeletable`** — uses the SDK's soft-delete pattern; `active = false` replaces `DELETE`. `UserAccountService.disable(UUID)` / `.enable(UUID)` toggle the flag; there is no `delete` on the service.
+- **Every `UserAccount` owns a `UserAccountAuditor`** — one-to-one with `cascade = {MERGE, PERSIST}`, so saving the user persists its auditor in the same transaction. The entity graph intentionally puts the back-pointer on `UserAccountAuditor` (not `UserAccount`), because `createdBy` / `updatedBy` on every other entity reference `Auditor`, not `UserAccount`.
+- **`AuditorUser` is NOT `UserDetails`** — it's a one-method SPI (`getAuditorId()`). The actual Spring Security `UserDetails` wrapper is provided by `com.timvero.ground.security.user.UserAccountHolder`, which `UserAccountService.@PostConstruct` wires with the `UserAccountRepository` so Spring Security can load accounts by username.
+- **Passwords are auto-generated on create and on reset** — the form service calls `UserAccountService.insertPassword()` on first save; only `changePassword()` accepts a user-supplied new password (after verifying the old one).
+- **`AuditorActionConfig` is `@ConditionalOnProperty("audit.action.enabled")`** — the entire `AuditorAction` pipeline (interceptor, login listener, batch writer) is opt-in. Without the property, HTTP requests are not recorded and Envers revisions get `actionId = null`.
+- **`AuditorAction` persistence is asynchronous and batched** — requests accumulate in an in-memory `BlockingQueue`; the batch flushes when it hits `audit.action.batch-size` (default 1000) or on a cron schedule (default `0 28 * * * *`).
+
+NOTE: `UserRole` and permission matching (`UserAccount.exists(permission)`) are covered in <<user-roles>>. This document focuses on the user account itself; read the roles doc before wiring permission-based access control.
+
+== Architecture Overview
+
+[source]
+----
+                ┌─────────────────────────────────────────────┐
+  HTTP request │  Spring Security filters                    │
+               │  → Authentication with AuditorUser principal │
+               └──────────────────────┬──────────────────────┘
+                                      │
+         ┌────────────────────────────┼──────────────────────────────┐
+         │                            │                              │
+         ▼                            ▼                              ▼
+┌────────────────┐         ┌──────────────────────┐     ┌────────────────────────┐
+│ Any @Audited   │         │ AuditorAction        │     │ AuthenticationSuccess  │
+│ write path     │         │ Interceptor          │     │ Event                  │
+│                │         │ preHandle()          │     │                        │
+│ AuditingEntity │         │  → new AuditorAction │     │ AuditorLoginListener   │
+│ Listener       │         │  → setCurrentAction()│     │  → logActionBackOffice │
+│  @CreatedBy    │         │                      │     │     (ActionType.LOGIN) │
+│  @LastModified │         └──────────┬───────────┘     └────────────┬───────────┘
+│  By            │                    │                              │
+└────────┬───────┘                    ▼                              │
+         │                  ┌───────────────────────┐                │
+         │                  │ AuditorActionHolder   │◄───────────────┘
+         │                  │ ThreadLocal           │
+         │                  │  current AuditorAction│
+         │                  └──────────┬────────────┘
+         │                             │
+         │   @CreatedBy/@LastModifiedBy│  read by AuditRevisionListener
+         │   via AuditorAware<Auditor> │  (see audit module)
+         ▼                             ▼
+┌──────────────────────┐     ┌──────────────────────────────┐
+│ createdBy/updatedBy  │     │ aud table row                │
+│ → UserAccountAuditor │     │ auditor_id | action_id       │
+└──────────────────────┘     └──────────────────────────────┘
+
+-- password flows --
+
+┌──────────────────────┐     ┌──────────────────────────────────┐
+│ UserAccountFormService│────▶│ UserAccountService               │
+│  .saveEntity(new)    │     │  .insertPassword(user)           │
+└──────────────────────┘     │  → generate 12-char password     │
+                             │  → bcrypt encode                 │
+┌──────────────────────┐     │  → passwordSingleUse = true      │
+│ UserAccountService   │     │  → save                          │
+│  .changePassword()   │     │  → afterTransaction:             │
+│  .resetPassword()    │     │      UserCreatedEvent.notify()   │
+└──────────────────────┘     │        or UserResetPasswordEvent │
+                             └────────────────┬─────────────────┘
+                                              │
+                                              ▼
+                             ┌──────────────────────────────────┐
+                             │ NotificationEvent pipeline       │
+                             │  → UserAccountPasswordTemplateModel
+                             │     .temporaryPassword           │
+                             │  → send via email/sms templates  │
+                             └──────────────────────────────────┘
+----
+
+== UserAccount Entity
+
+=== Schema
+
+`UserAccount` extends `AbstractAuditable` (UUID id + audit fields) and implements two cross-cutting interfaces:
+
+[source,java]
+----
+@Entity
+@Table(name = "user_account",
+    uniqueConstraints = {@UniqueConstraint(columnNames = {"email"},
+                                           name = UserAccount.EMAIL_UNIQUE_CONSTRAINT)})
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)                          // <1>
+@Indexed                                                                      // <2>
+@Undeletable(propertyName = UserAccount_.ACTIVE)                              // <3>
+public class UserAccount extends AbstractAuditable
+        implements Notifiable, NamedEntity {
+
+    public static final String EMAIL_UNIQUE_CONSTRAINT = "uk_user_uniqueness_email";
+    public static final String LOGIN_UNIQUE_CONSTRAINT = "uk_plpggm55i6uhyv404q6pyu0ub";
+
+    @Column(nullable = false) private boolean active = true;
+    @Column(unique = true, nullable = false) private String login;
+    @FullTextField @Column private String fullName;
+
+    @OneToOne(fetch = FetchType.EAGER,
+              mappedBy = UserAccountAuditor_.USER_ACCOUNT,
+              cascade = {CascadeType.MERGE, CascadeType.PERSIST})
+    private UserAccountAuditor auditor = new UserAccountAuditor(this);        // <4>
+
+    @Column @Email @KeywordField private String email;
+    @Column @Pattern(regexp = ValidationUtils.PHONE_PATTERN) private String phone;
+
+    @HideInDocs                                                               // <5>
+    @Column(name = "password", nullable = false) private String password;
+    @Column(nullable = false) private Instant passwordSetupAt;
+    @Column(nullable = false) private boolean passwordSingleUse;              // <6>
+
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "user_role_id", nullable = false)
+    @Fetch(FetchMode.SELECT)
+    private UserRole role;
+
+    @ElementCollection
+    @CollectionTable(name = "user_account_notification_subscription",
+                     joinColumns = @JoinColumn(name = "user_account_id"))
+    @Column(name = "notification_subscription")
+    @Fetch(FetchMode.SELECT)
+    private List<UUID> notificationSubscription;                              // <7>
+}
+----
+<1> Second-level cache (`READ_WRITE`) — every `createdBy.getName()` lookup in UI lists hits cache after warmup, keeping list views fast.
+<2> Hibernate Search `@Indexed` — `UserAccount` participates in full-text search via `@FullTextField fullName` and keyword `@KeywordField email`.
+<3> `@Undeletable(propertyName = "active")` tells framework code that `active` is the soft-delete flag. `@SQLRestriction("active = true")` on parent collections (e.g., department → users) uses this convention.
+<4> The `UserAccountAuditor` is instantiated **in the field initializer** — a brand-new `UserAccount` already carries its auditor before save. `cascade = PERSIST, MERGE` means `userAccountRepository.save(user)` persists the auditor in the same transaction; no separate auditor-save step.
+<5> `@HideInDocs` excludes the column from generated schema docs so hashed passwords never appear in auto-generated data-model pages.
+<6> `passwordSingleUse = true` — the current password was system-generated and the user must change it on next login. Set by `insertPassword` / `resetPassword`; cleared by `changePassword`.
+<7> `notificationSubscription` holds `UUID` references to `NotificationTemplate` lineage ids — opt-in subscriptions to specific notification types. Stored in `user_account_notification_subscription` join table.
+
+=== NamedEntity + Notifiable
+
+Two SDK interfaces are implemented transiently:
+
+[source,java]
+----
+@Transient
+@Override
+public String getDisplayedName() {
+    return getFullName();
+}
+
+@Transient
+@Override
+public Address getNotificationAddress() { return null; }   // <1>
+
+@Transient
+@Override
+public String getNotificationEmail() { return email; }     // <2>
+
+@Override
+public String getMainNotificationPhone() { return phone; } // <3>
+----
+<1> No postal address on the account entity. If your project needs letter delivery to users, override via a subclass or a separate `Address` entity.
+<2> Email channel — routed by the notification gateway when a template targets EMAIL.
+<3> Phone channel — SMS gateway uses this.
+
+Because `UserAccount` is `Notifiable`, the notification pipeline can target it directly as a recipient (see `AgentNotificationRecipientResolver` in the notification module, used by `UserAccountFormService` to populate the template dropdown).
+
+=== Uniqueness Constraints
+
+Two string constants on the class are the single source of truth:
+
+[source,java]
+----
+public static final String EMAIL_UNIQUE_CONSTRAINT = "uk_user_uniqueness_email";
+public static final String LOGIN_UNIQUE_CONSTRAINT = "uk_plpggm55i6uhyv404q6pyu0ub";
+----
+
+`UserAccountFormService.validateConstraint()` matches these names against the `ConstraintViolationException` the driver throws and maps to a specific field error — the whole point of giving the unique index an explicit name is that the DB-level error becomes translatable at the form layer.
+
+WARNING: The login constraint name `uk_plpggm55i6uhyv404q6pyu0ub` is a Hibernate-auto-generated hash. If you migrate to Liquibase/Flyway and rename the index, **also update this constant** or `validateConstraint()` will stop mapping the error to the login field.
+
+=== Repository
+
+[source,java]
+----
+public interface UserAccountRepository
+        extends JpaRepository<UserAccount, UUID>, JpaSpecificationExecutor<UserAccount> {
+
+    Optional<UserAccount> getByLogin(String username);
+    List<UserAccount> findByNotificationSubscription(UUID lineageId);
+    Optional<UserAccount> getByEmail(String email);
+}
+----
+
+Three finders and the full Specification executor. `getByLogin` is used by the Spring Security bridge; `findByNotificationSubscription` feeds the notification pipeline when a template fires and needs every subscriber.
+
+=== UserAccountFilter / FilterService
+
+[source,java]
+----
+public class UserAccountFilter extends ListFilter {
+    @Field(restriction = LIKE, value = UserAccount_.FULL_NAME) private String fullName;
+    @Field(restriction = LIKE, value = UserAccount_.EMAIL) private String email;
+    @Field(restriction = IN, value = UserAccount_.ROLE + "." + UserRole_.ID)
+    private List<UUID> role;
+    private boolean withDeleted = true;                                       // <1>
+    @Field(restriction = EQ) private Boolean active;                          // <2>
+}
+----
+<1> Overrides `ListFilter.isWithDeleted` to `true` by default — inactive (soft-deleted) users are included unless explicitly excluded. Admin screens need to see disabled users to re-enable them.
+<2> Separate `active` field lets the admin UI explicitly filter "only active" / "only disabled" when needed.
+
+`UserAccountFilterService` enriches the filter form with the list of available roles:
+
+[source,java]
+----
+@Service
+public class UserAccountFilterService extends FilterListService<UserAccount, UserAccountFilter> {
+
+    @Autowired private UserRoleRepository roleRepository;
+
+    @Override
+    protected FilterValues getFilterValues(Locale locale) {
+        FilterValues values = super.getFilterValues(locale);
+        values.add("role", roleRepository.findAll(), UserRole::getName);
+        return values;
+    }
+}
+----
+
+== UserAccountService — Password & Activation API
+
+The single `@Service` that owns all **write-side** operations on `UserAccount`. Controllers and other services should go through it rather than saving the entity directly — the service enforces bcrypt encoding, single-use password semantics, and event emission.
+
+=== Password Operations
+
+Four transactional methods cover the complete lifecycle:
+
+[cols="1,3", options="header"]
+|===
+|Method |Behavior
+
+|`checkPasswordHistory(username, password)`
+|Returns `true` if the candidate password **differs** from the current hash — a first-line protection against re-using the current password. The TODO in the code notes true history check (N previous passwords) is not yet implemented.
+
+|`changePassword(username, newPassword, oldPassword)`
+|User-driven flow. Verifies `oldPassword` against the current hash, encodes `newPassword` with BCrypt, sets `passwordSingleUse = false`, saves, and emits `UserChangePasswordEvent.notify(id, newPassword)`. Returns `false` if user doesn't exist or old password doesn't match.
+
+|`resetPassword(user)`
+|Admin-driven flow. Generates a 12-char random password, encodes it, sets `passwordSingleUse = true`, saves, and schedules `UserResetPasswordEvent.notify()` via `TransactionUtils.afterTransaction` so the temporary password is only sent if the enclosing transaction commits. **Requires `Propagation.MANDATORY`** — must be called from within an existing transaction.
+
+|`insertPassword(user)`
+|Same mechanism as `resetPassword` but emits `UserCreatedEvent` instead. Called from `UserAccountFormService.saveEntity()` for brand-new accounts. Also `Propagation.MANDATORY`.
+|===
+
+The event split (created vs reset) exists so the notification template for a first-time welcome email can differ from a password-reset email — same pipeline, same model, different `NotificationEventType`.
+
+=== Temporary Password Generation
+
+[source,java]
+----
+private final char[] SYMBOL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                            + "0123456789~`!@#$%^&*()-_=+[{]}\\|;:\'\",<.>/?".toCharArray();
+
+private String generatePassword() {
+    int length = 12;
+    Random random = new Random();                                              // <1>
+    char[] buffer = new char[length];
+    for (int index = 0; index < length; index++) {
+        buffer[index] = SYMBOL[random.nextInt(SYMBOL.length)];
+    }
+    return new String(buffer);
+}
+----
+<1> `java.util.Random` is **not** cryptographically secure. For regulated environments, override this service and substitute `SecureRandom`. The generated password lives only until the user's first login — it's transmitted via the notification channel and discarded — but auditors may still flag non-CSPRNG generation.
+
+=== Activation
+
+[source,java]
+----
+@Transactional public boolean disable(UUID userId) { return setActive(userId, false); }
+@Transactional public boolean enable(UUID userId)  { return setActive(userId, true); }
+
+private boolean setActive(UUID id, boolean active) {
+    UserAccount persisted = repository.getReferenceById(id);
+    if (persisted.isActive() != active) {
+        persisted.setActive(active);
+        return true;
+    }
+    return false;
+}
+----
+
+Returns `true` when the flag actually changed — controllers use this to decide whether to flash "user disabled" vs "no change". `getReferenceById` returns a Hibernate proxy, not a full entity — the `isActive()` read triggers lazy init, and the subsequent `setActive()` dirty-marks it for flush.
+
+=== Login-Attempt Unlock
+
+[source,java]
+----
+@Transactional(readOnly = true)
+public void unlock(UUID userId) {
+    UserAccount user = repository.getReferenceById(userId);
+    attemptContainer.refreshAttempts(user.getLogin());
+}
+----
+
+`AttemptContainer` (from `com.timvero.ground.security.user`) tracks failed-login counters for account lockout (see <<password-management>>). `unlock` clears the counter — an admin action after a user is locked out.
+
+=== Spring Security Wiring
+
+The service ships the repository into the SDK's `UserAccountHolder` so Spring Security's user-details lookup works:
+
+[source,java]
+----
+@PostConstruct
+protected void initUserAccountHolder() {
+    UserAccountHolder.setUserDetailsService(repository);
+}
+----
+
+This is the bridge: when Spring Security needs to load a user by username, it goes through `UserAccountHolder`, which calls `UserAccountRepository.getByLogin(username)`. The authentication provider then wraps the returned `UserAccount` in a project-provided `UserDetails` implementation that also implements `AuditorUser`.
+
+== AuditorUser — The Principal Contract
+
+`AuditorUser` is a one-method SPI that the Spring Security principal **must** implement so the audit pipeline can resolve the current auditor id:
+
+[source,java]
+----
+package com.timvero.structure.user;
+
+import java.util.UUID;
+
+public interface AuditorUser {
+    UUID getAuditorId();
+}
+----
+
+Why a separate interface instead of using `UserAccount` directly:
+
+- The principal is a Spring Security concept; `UserDetails` lifecycle differs from entity lifecycle (session-scoped, serializable, often lazy-proxy-free).
+- Tests and system contexts may need an `AuditorUser` without a real `UserAccount` row (e.g., for scheduler-authored writes that still need an auditor id).
+- It decouples the audit module — `AuditRevisionListener` only cares about `getAuditorId()`; it doesn't need to know about `UserAccount` or any Spring Security class.
+
+=== How the Pipeline Uses It
+
+Two hot paths read `AuditorUser`:
+
+[source,java]
+----
+// 1. Envers revision stamping — in com.timvero.base.audit.AuditRevisionListener
+Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+if (authentication != null && authentication.getPrincipal() instanceof AuditorUser user) {
+    revisionEntity.setAuditorId(user.getAuditorId());
+}
+
+// 2. HTTP-request logging — in AuditorActionInterceptor
+Principal authentication = request.getUserPrincipal();
+if (authentication instanceof Authentication auth) {
+    Object principal = auth.getPrincipal();
+    if (principal instanceof AuditorUser) {
+        auditorId = ((AuditorUser) principal).getAuditorId();
+    }
+}
+----
+
+Both paths are **null-tolerant** — an unauthenticated request simply produces `auditorId = null`. That's how background jobs, migrations, and public endpoints behave by default.
+
+=== Typical Implementation
+
+A project's `UserDetails` class combines Spring Security's contract with `AuditorUser`:
+
+[source,java]
+----
+public class ApplicationAuditorUser extends User implements AuditorUser {
+
+    private final UUID auditorId;
+    private final UUID userAccountId;
+
+    public ApplicationAuditorUser(UserAccount account, Collection<? extends GrantedAuthority> authorities) {
+        super(account.getLogin(), account.getPassword(), account.isActive(),
+              true, true, true, authorities);
+        this.auditorId = account.getActionAuditor().getId();
+        this.userAccountId = account.getId();
+    }
+
+    @Override
+    public UUID getAuditorId() { return auditorId; }
+    public UUID getUserAccountId() { return userAccountId; }
+}
+----
+
+Key point: the constructor **dereferences `getActionAuditor()`** while the `UserAccount` is still attached to the session. Storing the two UUIDs as final fields detaches the principal from Hibernate entirely — safe to cache in the HTTP session without `LazyInitializationException`.
+
+== UserAccountAuditor — Concrete Auditor Subclass
+
+Already covered as part of the `Auditor` hierarchy in <<entity-module-sdk-reference-hierarchy>>; here's how it fits the user module specifically:
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue(value = "USER")
+public class UserAccountAuditor extends Auditor {
+
+    @OneToOne(fetch = FetchType.LAZY)
+    @Fetch(FetchMode.SELECT)
+    @JoinColumn(name = "user_account_id", updatable = false, unique = true)
+    private UserAccount userAccount;
+
+    protected UserAccountAuditor() {}
+    public UserAccountAuditor(UserAccount userAccount) { this.userAccount = userAccount; }
+
+    @Override public String getName() { return getUserAccount().getFullName(); }
+    @Override public Persistable<?> getEntity() { return getUserAccount(); }
+}
+----
+
+Observations relevant to this module:
+
+- **The foreign key is on the auditor side**, not on `UserAccount`. The back-reference in `UserAccount` (`@OneToOne mappedBy = "userAccount"`) is a non-owning side; that's why `cascade` on the `UserAccount` side is what triggers the auditor insert when a new user is saved.
+- **`@JoinColumn(updatable = false, unique = true)`** — once a user is linked to an auditor, they can't swap. Enforced at DB level.
+- **`getName()` dereferences `getUserAccount()`** — requires the session to be open. Most UI lookups happen via `createdBy.getName()` on an audited entity's list view; either the entity is loaded in an active transaction, or the list DTO pre-fetches the name. The `@ManyToOne Auditor` on `AbstractAuditable` is `LAZY`, so careless access outside a transaction throws.
+
+=== Relationship Diagram
+
+[source]
+----
+      AbstractAuditable.createdBy  ──┐
+      AbstractAuditable.updatedBy  ──┼── Auditor (abstract, SINGLE_TABLE)
+                                     │          │
+                                     │          ├── UserAccountAuditor (@DiscriminatorValue "USER")
+                                     │          │         └── userAccount → UserAccount
+                                     │          │
+                                     │          └── <your custom subclasses>
+                                     │                    (SchedulerAuditor, WebhookAuditor, ...)
+                                     │
+                                     │
+      aud.auditor_id   ──────────────┘   (Envers revision → Auditor)
+
+      UserAccount ← back-ref (mappedBy)      UserAccountAuditor owns FK
+----
+
+`aud.auditor_id` (in Envers revisions) and every `AbstractAuditable.created_by` column both reference `Auditor.id`. For a user-driven write, both columns point to the same `UserAccountAuditor` row — so the audit history has complete attribution regardless of whether you query Envers or the current-state table.
+
+=== AuditorAware Bean
+
+Spring Data JPA auditing needs one `AuditorAware<Auditor>` bean to resolve "the current auditor" from `SecurityContext`. A typical wiring:
+
+[source,java]
+----
+@Component
+public class SecurityAuditorAware implements AuditorAware<Auditor> {
+
+    @Autowired private AuditorRepository auditorRepository;
+
+    @Override
+    public Optional<Auditor> getCurrentAuditor() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !(auth.getPrincipal() instanceof AuditorUser user)) {
+            return Optional.empty();                                          // <1>
+        }
+        return Optional.of(auditorRepository.getReferenceById(user.getAuditorId()));
+    }
+}
+----
+<1> Empty = `createdBy` / `updatedBy` stays `null`. Background jobs that want "system" attribution should push a synthetic `Authentication` into the context before running their write logic (see <<entity-module-sdk-reference-hierarchy>> "Populating Auditor in SecurityContext").
+
+[[form-pipeline-useraccountform-mapper-service]]
+== Form Pipeline: UserAccountForm / Mapper / Service
+
+The form pipeline is the standard SDK three-class set (see <<forms>>), wired up to enforce the special password-on-create logic.
+
+=== UserAccountForm
+
+[source,java]
+----
+public class UserAccountForm {
+    @NotBlank protected String login;
+    @NotBlank private String fullName;
+    @Phone    private String phone;
+    @Email @NotBlank private String email;
+    @NotNull  private UUID role;
+    private List<UUID> notificationSubscription = new LinkedList<>();
+}
+----
+
+Six fields — no password. Passwords are **never collected through the creation form**; `insertPassword` generates one and `UserCreatedEvent` ships it to the user. The only way a user ever knows their initial password is via the notification channel.
+
+=== UserAccountFormMapper
+
+[source,java]
+----
+@Mapper(uses = ReferenceMapper.class)
+public interface UserAccountFormMapper extends EntityToFormMapper<UserAccount, UserAccountForm> {
+
+    @Mapping(target = "active", ignore = true)
+    @Mapping(target = "password", ignore = true)                              // <1>
+    @Mapping(target = "passwordSetupAt", ignore = true)
+    @Mapping(target = "passwordSingleUse", ignore = true)
+    @Mapping(target = "allNotificationEmails", ignore = true)
+    @Mapping(target = "allNotificationPhones", ignore = true)
+    @Override
+    void toEntity(UserAccountForm form, @MappingTarget UserAccount entity) throws ValidationException;
+
+    @Override @InheritConfiguration
+    UserAccount createEntity(UserAccountForm form) throws ValidationException;
+
+    @Override
+    UserAccountForm toForm(UserAccount entity);
+}
+----
+<1> All password-related fields are explicitly **ignored** at the mapping level. MapStruct would otherwise try to null them out on each `toEntity` call, wiping the stored hash on every edit. Keeping them `ignore = true` means the existing hash survives an admin's edit of name/email/role.
+
+=== UserAccountFormService
+
+[source,java]
+----
+@Service
+public class UserAccountFormService extends EntityFormService<UserAccount, UserAccountForm, UUID> {
+
+    @Autowired private UserAccountService service;
+    @Autowired private UserRoleFormService roleService;
+    @Autowired private NotificationTemplateRepository templateRepository;
+
+    @Override
+    protected void assembleEditModel(UserAccount userAccount, UserAccountForm form,
+                                     Map<String, Object> model) {
+        model.put("userAccountForm", form);
+        model.put("roleMap", roleService.getAllRolesMap());
+        model.put("notificationTemplates",
+            templateRepository.findByRecipientTypeAndActiveTrue(
+                AgentNotificationRecipientResolver.TYPE));                    // <1>
+    }
+
+    @Override
+    protected void validateConstraint(String constraint, Binding binding) {
+        if (UserAccount.EMAIL_UNIQUE_CONSTRAINT.equals(constraint)) {
+            binding.rejectValue("email", "error.userAccount.email.exists");
+        }
+        if (UserAccount.LOGIN_UNIQUE_CONSTRAINT.equals(constraint)) {
+            binding.rejectValue("login", "error.userAccount.login.exists");
+        }
+    }
+
+    @Override
+    protected UserAccount saveEntity(UserAccount entity) {
+        if (entity.isNew()) {
+            service.insertPassword(entity);                                   // <2>
+        }
+        return super.saveEntity(entity);
+    }
+}
+----
+<1> Only templates with `recipientType == AGENT` show up in the subscription dropdown — users are "agents" in the notification model.
+<2> **The pivotal integration point**: before the super-class persists the new entity, the password is generated and set. Because `insertPassword` is `Propagation.MANDATORY`, it joins this form-save transaction. The notification is scheduled via `TransactionUtils.afterTransaction` so the temporary password email is only sent if the commit succeeds.
+
+== Password Events — The Notification Bridge
+
+Three `@Component` events tie user-password operations to the notification pipeline. All three extend a single abstract base:
+
+=== UserPasswordEvent — The Base
+
+[source,java]
+----
+public abstract class UserPasswordEvent
+        extends NotificationEvent<UserAccount, UserAccountPasswordTemplateModel> {
+
+    @Autowired private UserAccountRepository repository;
+
+    public void notify(UUID id, String temporaryPassword) {
+        UserAccountPasswordTemplateModel model = new UserAccountPasswordTemplateModel();
+        model.setTemporaryPassword(temporaryPassword);
+        super.notify(id, model);                                              // <1>
+    }
+
+    @Override
+    protected Optional<UserAccount> loadEntity(UUID id) {
+        return repository.findById(id);
+    }
+}
+----
+<1> The signature `notify(UUID id, String temporaryPassword)` is the module-specific overload. It builds the template model and delegates to `NotificationEvent.notify(UUID, Model)` which finds matching templates, renders them, and queues dispatch.
+
+=== The Three Concrete Events
+
+All three are one-liner subclasses that differ only by `NotificationEventType`:
+
+[source,java]
+----
+@Component
+public class UserCreatedEvent extends UserPasswordEvent {
+    public static final NotificationEventType TYPE = new NotificationEventType("USER_CREATED");
+    @Override public NotificationEventType getType() { return TYPE; }
+}
+
+@Component
+public class UserChangePasswordEvent extends UserPasswordEvent {
+    public static final NotificationEventType TYPE = new NotificationEventType("USER_CHANGE_PASSWORD");
+    @Override public NotificationEventType getType() { return TYPE; }
+}
+
+@Component
+public class UserResetPasswordEvent extends UserPasswordEvent {
+    public static final NotificationEventType TYPE = new NotificationEventType("USER_RESET_PASSWORD");
+    @Override public NotificationEventType getType() { return TYPE; }
+}
+----
+
+The distinct types let operators configure three different templates:
+
+- `USER_CREATED` — welcome email ("Your account has been created. Your temporary password is ...")
+- `USER_RESET_PASSWORD` — password-reset email ("Your password has been reset by an administrator ...")
+- `USER_CHANGE_PASSWORD` — confirmation email after a user changes their own password ("Your password was changed at ...")
+
+=== UserAccountPasswordTemplateModel
+
+[source,java]
+----
+public class UserAccountPasswordTemplateModel extends NotificationModel {
+    private String temporaryPassword;
+
+    public String getTemporaryPassword() { return temporaryPassword; }
+    public void setTemporaryPassword(String p) { this.temporaryPassword = p; }
+}
+----
+
+A single-field model. In the template, reference it as `${model.temporaryPassword}` — the notification module's Thymeleaf rendering picks it up. For the change-password event the field is the new password (the user just set it, so it's already known to them) — it's mostly a placeholder for template consistency; most deployments leave it unreferenced in the change-password template.
+
+WARNING: **The temporary password is a plaintext value passed through to the notification channel.** The notification pipeline typically writes rendered messages to an outbox table. Depending on channel and retention, an attacker with DB read access could recover a user's initial password. Consider shortening the retention window for `USER_CREATED` / `USER_RESET_PASSWORD` notifications or configuring the outbox to mask password fields.
+
+=== Event Lifecycle (Sequence)
+
+[source]
+----
+1. Admin triggers reset via REST endpoint
+2. Controller opens @Transactional, calls UserAccountService.resetPassword(user)
+3. Service generates 12-char password, BCrypt-encodes, sets passwordSingleUse=true
+4. Repository saves (dirty-check on commit)
+5. TransactionUtils.afterTransaction schedules resetPasswordEvent.notify(id, plaintext)
+6. Transaction commits
+7. After-commit hook runs → UserResetPasswordEvent.notify()
+   → super.notify(id, model)
+   → NotificationEvent.loadEntity() → repository.findById(id)
+   → Resolve active templates for type USER_RESET_PASSWORD
+   → Render Thymeleaf with UserAccountPasswordTemplateModel
+   → Queue for send via email/SMS gateway
+----
+
+The `afterTransaction` hook is the **entire reason** `resetPassword` works correctly — if the transaction rolls back, the scheduled notification is dropped, so a failed reset doesn't leak a password the user will never know they have.
+
+[[auditoraction-infrastructure]]
+== AuditorAction Infrastructure
+
+The second half of the module: a per-HTTP-request log that correlates with Envers revisions via `action_id` on the `aud` table (see <<audit-module-sdk-reference-internals>>).
+
+=== AuditorAction Entity
+
+[source,java]
+----
+@Entity
+@Table(name = "user_account_action")
+@HideInDocs
+public class AuditorAction extends BasePersistable<Long> {                    // <1>
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    @CreatedDate
+    private Instant createdAt = Instant.now();                                // <2>
+
+    @ManyToOne(fetch = FetchType.EAGER)
+    @Fetch(FetchMode.SELECT)
+    @JoinColumn(name = "created_by", updatable = false)
+    @CreatedBy
+    private Auditor createdBy;
+
+    @Column(name = "action_type")
+    @Enumerated(EnumType.STRING)
+    private ActionType actionType;                                            // <3>
+
+    @Column(name = "url", length = Length.LONG)     private String url;
+    @Column(name = "params", length = Length.LONG)  private String params;
+    @Column(name = "ip")                            private String ip;
+    @Column(name = "servlet_path")                  private String servletPath;
+}
+----
+<1> **`BasePersistable<Long>`, not `AbstractAuditable`** — the `Long` id is crucial because this table receives one row per HTTP request. UUIDs would bloat the index; Envers revisions reference the action by this Long via `aud.action_id`. The trade-off: no `updated_at` / `updated_by` because actions are append-only anyway.
+<2> `createdAt` initialized to `Instant.now()` **at construction** (not via `@PrePersist`) because the action may live in the `BlockingQueue` for seconds before it's flushed — the timestamp we want is request receipt, not persist time.
+<3> `ActionType` is a standard Java enum: `GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, TRACE, CONNECT, PROPFIND, TRACK, LOGIN`. The three non-HTTP values (`LOGIN`, `PROPFIND`, `TRACK`) are specialized — `LOGIN` is used by the login listener; `PROPFIND`/`TRACK` appear if any WebDAV-style endpoints are exposed.
+
+`@HideInDocs` keeps the `user_account_action` table out of generated schema docs — it's a system table, not a business entity.
+
+=== AuditorActionHolder — The ThreadLocal
+
+[source,java]
+----
+public final class AuditorActionHolder {
+
+    private static final ThreadLocal<Pair<AuditorAction, AuditorActionService>> currentAction
+            = new ThreadLocal<>();
+
+    private AuditorActionHolder() {}
+
+    static void setCurrentAction(AuditorAction action, AuditorActionService service) {
+        currentAction.set(Pair.of(action, service));
+    }
+
+    static void removeCurrentAction() {
+        currentAction.remove();
+    }
+
+    public static AuditorAction getCurrentAction() {                          // <1>
+        Pair<AuditorAction, AuditorActionService> pair = currentAction.get();
+        if (pair != null) {
+            pair.getSecond().save();                                          // <2>
+            return pair.getFirst();
+        }
+        return null;
+    }
+}
+----
+<1> `getCurrentAction()` is the **only public method** — called by `AuditRevisionListener` in the audit module.
+<2> **Surprising side effect**: reading the current action calls `save()` on the enclosing service, which drains the in-memory queue to the DB. This guarantees that by the time an Envers revision is assigned an `action_id`, the action row actually exists in the DB — otherwise the revision would point to an unsaved id and FK constraints would explode on commit. This is why `getCurrentAction()` must not be called in hot paths outside audit-stamping: each call triggers a potential batch flush.
+
+WARNING: ThreadLocal-based context is **not propagated across `@Async` boundaries** by default. If your application kicks off async work from a web controller and that async thread writes `@Audited` entities, the action_id column for those revisions will be `null`. Either copy the action into the async thread explicitly, or accept the null.
+
+=== AuditorActionInterceptor
+
+A Spring MVC `HandlerInterceptor` — registered in `AuditorActionConfig` — captures every incoming request:
+
+[source,java]
+----
+public class AuditorActionInterceptor implements HandlerInterceptor {
+
+    @Autowired private AuditorActionService actionService;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response,
+                             Object handler) {
+        final String url = request.getRequestURI()
+            .substring(request.getContextPath().length() + request.getServletPath().length());
+        final String servletPath = request.getServletPath();
+        final String ip = request.getRemoteAddr();
+        final ActionType method = ActionType.valueOf(request.getMethod());
+        final String query = request.getQueryString();
+
+        UUID auditorId = null;
+        Principal authentication = request.getUserPrincipal();
+        if (authentication instanceof Authentication auth) {
+            Object principal = auth.getPrincipal();
+            if (principal instanceof AuditorUser) {
+                auditorId = ((AuditorUser) principal).getAuditorId();
+            }
+        }
+
+        actionService.logActionBackOffice(url, ip, method, query, auditorId, servletPath);
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response,
+                                Object handler, Exception ex) {
+        actionService.completeAction();                                       // <1>
+    }
+}
+----
+<1> `afterCompletion` clears the ThreadLocal — critical for thread-pool correctness. Tomcat's workers are reused; without this cleanup, a subsequent unrelated request on the same thread would see the previous request's `AuditorAction` and misattribute revisions.
+
+NOTE: **The interceptor must be registered with Spring MVC.** `AuditorActionConfig` only creates the bean; your `WebMvcConfigurer` has to call `registry.addInterceptor(actionInterceptor)`. Without that registration the interceptor is a dormant bean.
+
+=== AuditorActionService
+
+The workhorse — async logging, in-memory queue, batched persistence:
+
+[source,java]
+----
+public class AuditorActionService {
+
+    @Value("${audit.action.batch-size:1000}") private int batchSize;
+    @Autowired private TransactionTemplateBuilder transactionTemplateBuilder;
+    @Autowired private EntityManager entityManager;
+    @Autowired private AuditorRepository auditorRepository;
+    @Autowired @Qualifier("supportExecutor") protected Executor executor;
+
+    private final BlockingQueue<AuditorAction> actions = new LinkedBlockingQueue<>();
+
+    @PreDestroy public void close() { push(); }                               // <1>
+
+    @Scheduled(cron = "${audit.action.cron:0 28 * * * *}")
+    public void save() { push(); }                                            // <2>
+
+    @Async
+    public void logActionBackOffice(String url, String ip, ActionType actionType,
+                                    String query, UUID auditorId, String servletPath) {
+        Auditor auditor = auditorId != null ? auditorRepository.getReferenceById(auditorId) : null;
+        AuditorAction action = new AuditorAction(actionType, url, query, ip, auditor, servletPath);
+        AuditorActionHolder.setCurrentAction(action, this);                   // <3>
+        saveAction(action);
+    }
+
+    public void completeAction() { AuditorActionHolder.removeCurrentAction(); }
+
+    private void saveAction(AuditorAction action) {
+        actions.add(action);
+        if (actions.size() >= batchSize) {
+            executor.execute(() -> push());
+        }
+    }
+
+    private void push() {
+        Collection<AuditorAction> part = new ArrayList<>(batchSize + 100);
+        actions.drainTo(part);
+        try {
+            transactionTemplateBuilder.requiresNew().execute((s) -> {         // <4>
+                for (AuditorAction action : part) {
+                    entityManager.persist(action);
+                }
+                return true;
+            });
+        } catch (RuntimeException e) {
+            actions.addAll(part);                                             // <5>
+            throw e;
+        }
+    }
+}
+----
+<1> `@PreDestroy` flush ensures shutdown doesn't drop queued actions — the JVM's graceful-shutdown hook invokes this and any in-memory actions are persisted before the app exits. Kill -9 still loses them; budget for it.
+<2> `@Scheduled` with default cron `0 28 * * * *` (every hour at minute 28) — a safety valve for low-traffic environments where the batch threshold is never reached.
+<3> The ThreadLocal is set **before** the action is persisted. Downstream Envers revisions in the same request can reference it via `AuditorActionHolder.getCurrentAction()`, which (as shown above) force-saves the batch if needed.
+<4> `REQUIRES_NEW` — the flush runs in its own transaction so it doesn't participate in the user's request transaction. A rollback in user code never loses audit data.
+<5> On flush failure, the drained actions are **requeued**. Next flush attempt retries them. This can lose ordering on error (the requeued batch goes to the tail) — acceptable trade-off for an audit log.
+
+Configuration:
+
+[source,properties]
+----
+audit.action.enabled=true
+audit.action.batch-size=1000
+audit.action.cron=0 28 * * * *
+----
+
+=== AuditorLoginListener
+
+[source,java]
+----
+public class AuditorLoginListener
+        implements ApplicationListener<AuthenticationSuccessEvent> {
+
+    @Autowired private AuditorActionService actionService;
+
+    @Override
+    public void onApplicationEvent(AuthenticationSuccessEvent event) {
+        String ipAddress = null;
+        Object details = event.getAuthentication().getDetails();
+        if (details instanceof WebAuthenticationDetails) {
+            ipAddress = ((WebAuthenticationDetails) details).getRemoteAddress();
+        }
+
+        UUID auditorId = null;
+        Authentication authentication = event.getAuthentication();
+        if (authentication != null) {
+            Object principal = authentication.getPrincipal();
+            if (principal instanceof AuditorUser) {
+                auditorId = ((AuditorUser) principal).getAuditorId();
+            }
+        }
+
+        actionService.logActionBackOffice(null, ipAddress, ActionType.LOGIN, null,
+                                           auditorId, null);
+    }
+}
+----
+
+Listens for Spring Security's `AuthenticationSuccessEvent` and emits an `AuditorAction` with `actionType = LOGIN`. Why not piggy-back on the interceptor? Because the authentication filter runs **before** MVC interceptors — at the time `AuditorActionInterceptor.preHandle` fires for the POST `/login` request, the authentication hasn't yet succeeded. Catching the event separately ensures the login row captures the authenticated user's id, not null.
+
+NOTE: **Failed-login events are not captured by this listener.** Spring Security also publishes `AuthenticationFailureBadCredentialsEvent` etc. If your compliance scope requires failed-login audit, subscribe to those events separately and route them through the same service.
+
+=== AuditorAction Filters
+
+Two classes support admin screens that browse the audit log:
+
+[source,java]
+----
+public class AuditorActionFilter extends ListFilter {
+    @DateTimeFormat(pattern = ValidationUtils.PATTERN_DATEPICKER_FORMAT)
+    @Field(restriction = GE, value = "createdAt",
+           converter = Converter.InstantAtStartOfDay.class)
+    private LocalDate dateFrom;
+    @DateTimeFormat(pattern = ValidationUtils.PATTERN_DATEPICKER_FORMAT)
+    @Field(restriction = LE, value = "createdAt",
+           converter = Converter.InstantAtStartOfDay.class)
+    private LocalDate dateTo;
+
+    @Field(restriction = LIKE) private String ip;
+    @Field(restriction = LIKE) private String url;
+    @Field(restriction = EQ)   private ActionType actionType;
+}
+
+@Service
+public class AuditorActionFilterService extends FilterListService<AuditorAction, AuditorActionFilter> {
+}
+----
+
+The filter service is empty — the default `FilterListService` plus the annotated filter fields are all that's needed. See <<user-action-audit>> for the admin page that consumes these filters.
+
+=== Correlation With Envers Revisions
+
+The `aud.action_id` column (populated by `AuditRevisionListener` — see <<audit-module-sdk-reference-internals>>) joins revisions to actions:
+
+[source,sql]
+----
+-- "What entity changes did this HTTP request cause?"
+SELECT ae.entity_id, ae.rev_type, aud.timestamp
+FROM my_entity_aud ae
+JOIN aud ON ae.rev = aud.id
+WHERE aud.action_id = 12345;
+
+-- "What request did this revision come from?"
+SELECT a.url, a.ip, a.action_type, a.created_at, uaa.full_name
+FROM user_account_action a
+JOIN aud ON aud.action_id = a.id
+JOIN user_account_auditor uaau ON uaau.id = aud.auditor_id
+JOIN user_account uaa ON uaa.id = uaau.user_account_id
+WHERE aud.id = 67890;
+----
+
+This is the fundamental value of the `AuditorAction` table — it turns "John changed this entity at 14:02" into "John's PUT to /api/credit/123 at 14:02:47 with body `{...}` changed these seven entities atomically."
+
+[[user-management-admin-web-controllers]]
+== Admin Web Controllers
+
+Two shipped controllers drive the admin UI for user management: the user list/detail page (`/user`) and the activity-log viewer (`/audit`). Both are minimal `ViewableFilterController` / `WebFilterController` subclasses — all heavy lifting lives in the filter classes and the form services above.
+
+=== UserAccountController
+
+[source,java]
+----
+@Controller
+@RequestMapping("/user")
+@MenuItem(order = 200_200, name = "user", group = "security")
+public class UserAccountController
+        extends ViewableFilterController<UUID, UserAccount, UserAccountFilter> {
+}
+----
+
+Key points:
+
+* **Empty body** — list, filter, detail page, note endpoints (since `UserAccount implements HasNotes`), and Excel export all come from `ViewableFilterController`. See <<web-infrastructure-entity-view-controllers>>.
+* **Derived roles `USER_VIEW` / `USER_EDIT`** (from path `/user`) — plus `USER_NOTES` because the entity implements `HasNotes`. All three are registered with `<<user-roles>>` automatically.
+* **`@MenuItem(group = "security", order = 200_200)`** — the page sits in the **Security** menu group alongside roles, activity log, and any project-specific security pages.
+* **The filter class `UserAccountFilter`** (in the `structure` module) carries the searchable fields — email, full name, role, active, login-attempts, etc. Filter behavior follows the shared <<list-filters-annotation-driven-jpa-query-dsl>> conventions.
+
+Edits go through `UserAccountForm` + `UserAccountFormService` (<<form-pipeline-useraccountform-mapper-service>>); the controller picks those up via the standard `EntityFormService` wiring built into `ViewableFilterController`. Password reset, activation link generation, and forced-logout operations are exposed as separate entity actions (see <<entity-actions>>) rather than custom endpoints on this controller.
+
+=== AuditorActionController
+
+Read-only log page at `/audit` — consumes the `AuditorActionFilter` documented above:
+
+[source,java]
+----
+@Controller
+@RequestMapping("/audit")
+@MenuItem(order = 200_300, name = "activityLog", group = "security")
+public class AuditorActionController
+        extends WebFilterController<AuditorAction, AuditorActionFilter> {
+    public static final String PATH = "/audit";
+}
+----
+
+Key points:
+
+* **Extends `WebFilterController`, not `ViewableFilterController`** — there is no entity detail page. Every meaningful field is in the list row (URL, IP, action type, timestamp, auditor), and drill-down goes to the *correlated entity's* page via `action_id` joins rather than to an `AuditorAction` detail view. See <<web-infrastructure-entity-view-controllers>> for the difference between the two base classes.
+* **Derived role: just `ACTIVITY_LOG_VIEW`** (from the menu item name mapped through role derivation — see <<web-infrastructure-advanced-patterns>>). No `*_EDIT` role because the log is append-only from the UI side; writes happen exclusively through `AuditorActionFilter.handler()` on every HTTP request (<<auditoraction-infrastructure>>).
+* **`@MenuItem(group = "security", order = 200_300)`** — right after `UserAccountController` in the Security menu; the ordering matches the typical support flow (find user → see what they did).
+* **`public static final String PATH = "/audit"`** — the constant is exposed so other code (link builders, tests, `EntityControllerMapping`) can reference it without string duplication. Several SDK controllers in this package follow the same convention.
+
+Excel export and filter-persistence work transparently via the `WebFilterController` base class — no custom endpoints needed here.
+
+== Advanced Patterns
+
+=== System Writes Without a Logged-in User
+
+Background jobs (schedulers, message consumers, Flyway data loaders) need audit attribution but don't have an HTTP principal:
+
+[source,java]
+----
+@Component
+public class NightlyAccrualJob {
+
+    @Autowired private AuditorRepository auditorRepository;
+
+    @Scheduled(cron = "0 0 2 * * *")
+    public void run() {
+        Auditor systemAuditor = auditorRepository.getReferenceById(SYSTEM_AUDITOR_ID);
+        Authentication sysAuth = new PreAuthenticatedAuthenticationToken(
+            new SystemAuditorUser(systemAuditor.getId()), null, List.of());
+        SecurityContextHolder.getContext().setAuthentication(sysAuth);
+        try {
+            /* do work — createdBy/updatedBy populate from the system auditor */
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+
+    private static class SystemAuditorUser implements AuditorUser {
+        private final UUID id;
+        SystemAuditorUser(UUID id) { this.id = id; }
+        @Override public UUID getAuditorId() { return id; }
+    }
+}
+----
+
+Create a dedicated `Auditor` subclass (e.g., `SystemAuditor @DiscriminatorValue("SYSTEM")`) for the system account so audit logs don't show a fake user.
+
+=== Capturing Action ID in Async Work
+
+The `ThreadLocal` doesn't propagate. If an async handler writes entities that should correlate back to the triggering request, copy the action explicitly:
+
+[source,java]
+----
+@Service
+public class CreditIngestionService {
+
+    @Autowired private TaskExecutor executor;
+
+    public void ingest(UUID creditId) {
+        AuditorAction action = AuditorActionHolder.getCurrentAction();       // capture in caller
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        executor.execute(() -> {
+            SecurityContextHolder.getContext().setAuthentication(auth);
+            // Note: there's no public setter on AuditorActionHolder from outside;
+            // the current action stays null in the async thread. Revisions will
+            // have action_id = null. Accept and document, or introduce a project-
+            // local wrapper that re-binds action via reflection.
+            try { /* work */ } finally { SecurityContextHolder.clearContext(); }
+        });
+    }
+}
+----
+
+=== Custom AuditorUser for Impersonation
+
+Admin-impersonates-user flows need the principal to claim the target user's auditor id while preserving the impersonator's identity for audit:
+
+[source,java]
+----
+public class ImpersonatingAuditorUser implements AuditorUser {
+
+    private final UUID impersonatorAuditorId;
+    private final UUID targetAuditorId;
+
+    @Override
+    public UUID getAuditorId() {
+        return impersonatorAuditorId;                                        // <1>
+    }
+
+    public UUID getTargetAuditorId() { return targetAuditorId; }
+}
+----
+<1> **Use the impersonator's id** for audit revisions — the audit trail must truthfully show who made the change. UI permissions and row-level filters can still use `getTargetAuditorId()` to scope the session.
+
+=== Forcing a Password Reset on Next Login
+
+Set `passwordSingleUse = true` manually and the login flow will redirect the user to "change password" on next authentication:
+
+[source,java]
+----
+@Transactional
+public void forcePasswordRotation(UUID userId) {
+    UserAccount user = repository.getReferenceById(userId);
+    user.setPasswordSingleUse(true);                                          // <1>
+    user.setPasswordSetupAt(Instant.now().minus(Duration.ofDays(999)));      // <2>
+}
+----
+<1> `passwordSingleUse = true` signals "must change before proceeding".
+<2> Backdating `passwordSetupAt` additionally flags the password as expired, so any expiration-based login guard also triggers.
+
+=== Bulk Disable by Role
+
+When decommissioning a role:
+
+[source,java]
+----
+@Transactional
+public int disableAllWithRole(UUID roleId) {
+    List<UserAccount> users = repository.findAll(
+        (root, cq, cb) -> cb.equal(root.get(UserAccount_.role).get(UserRole_.id), roleId));
+    int count = 0;
+    for (UserAccount u : users) {
+        if (u.isActive()) {
+            u.setActive(false);
+            count++;
+        }
+    }
+    return count;
+}
+----
+
+Dirty-checked on commit. No explicit save needed. Each flipped flag produces an Envers revision — audit trail shows who ran the bulk disable.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Go through `UserAccountService` for every password operation** — direct `user.setPassword(raw)` bypasses bcrypt and the event pipeline; users would never receive notifications and their plaintext would hit the DB
+* {ok} **Implement `AuditorUser` on your Spring Security principal** — otherwise `aud.auditor_id` and `user_account_action.created_by` stay `null` and audit trails become worthless
+* {ok} **Cache `auditorId` on the principal as a final `UUID`** — dereferencing `userAccount.getActionAuditor()` at each audit stamp is a lazy-load hot path; pre-resolve once at login
+* {ok} **Declare your `AuditorAware<Auditor>` bean and smoke-test it in integration tests** — silent `null` in `createdBy` is the single most common audit bug
+* {ok} **Use `UserAccountService.disable()` instead of `repository.delete()`** — foreign keys from `aud.auditor_id` prevent hard-delete anyway; `active = false` is the supported path
+* {ok} **Set `audit.action.enabled=true` in production profiles** — Envers revisions without action_id can be attributed to a user but not to a specific request, halving forensic value
+* {ok} **Size `audit.action.batch-size` based on traffic** — for a back office seeing 100 req/s, the default 1000 flushes every ~10s; lower it to 200 if you want tighter MTTR for forensic queries
+* {ok} **Register a distinct Auditor subclass for every non-user write source** — `SchedulerAuditor`, `WebhookAuditor`, `MigrationAuditor`; audit logs should never show "system" for two semantically different actors
+* {ok} **Treat `EMAIL_UNIQUE_CONSTRAINT` / `LOGIN_UNIQUE_CONSTRAINT` constants as API** — your DB migrations must keep the index names in sync; breaking them silently degrades form error messages
+* {ok} **Template `USER_CREATED` and `USER_RESET_PASSWORD` with short TTL attribution** — temporary passwords should expire; include `passwordSetupAt` context in the email so the user sees when the clock started
+* {ok} **Populate `SecurityContext` in `@Scheduled` and `@Async` methods** before any `@Audited` write — otherwise revisions stamp `auditor_id = null`
+* {ok} **Use `TransactionUtils.afterTransaction` to emit side-effect events** — `UserAccountService.resetPassword` is the canonical example; never dispatch notifications inside the write transaction
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Calling `user.setPassword(rawText)` and saving directly** — stores plaintext, bypasses bcrypt, skips the event pipeline; a single line of code can compromise your entire authentication system
+* {bad} **Using `Random` in a replacement `generatePassword`** without reviewing — the SDK's `java.util.Random` is non-crypto; fine for a 12-char one-time password but audit-flagged in regulated environments. Upgrade to `SecureRandom` when needed.
+* {bad} **Forgetting to implement `AuditorUser` on your `UserDetails`** — every audit stamp silently falls back to null; discovered only when compliance asks "who changed this" and the answer is "we don't know"
+* {bad} **Calling `UserAccountService.resetPassword` without an active transaction** — `Propagation.MANDATORY` throws `IllegalTransactionStateException`; discovered at runtime the first time an admin clicks "reset"
+* {bad} **Hard-deleting `UserAccount`** — foreign keys from historical `aud.auditor_id` make it a constraint-violation exercise; the schema assumes soft-delete
+* {bad} **Enabling `audit.action.enabled` in dev without raising `audit.action.cron` frequency** — writes accumulate in memory; a slow dev test can trigger the batch flush and swamp the DB
+* {bad} **Reading `AuditorActionHolder.getCurrentAction()` in hot-path business code** — each call triggers a queue flush via `pair.getSecond().save()`; intended only for the audit listener, not for general "what's my current request" lookups
+* {bad} **Ignoring the `UserAccount.auditor` one-to-one back-reference in custom queries** — fetch the `UserAccountAuditor` via `@OneToOne(mappedBy = "userAccount")` and you'll get N+1 on list views; prefer joining through `UserAccountAuditor` when the context allows
+* {bad} **Changing `UserAccount` passwords via MapStruct form mapping** — the mapper has `password` at `ignore = true` precisely to prevent this; removing the ignore wipes the hash on every edit
+* {bad} **Assuming `AuditorActionInterceptor` runs for login POST requests** — the authentication filter runs earlier and can short-circuit; use `AuditorLoginListener` for login events instead
+* {bad} **Relying on the in-memory action queue surviving a `kill -9`** — graceful shutdown flushes; forced kill does not; don't build tamper-evidence guarantees on the raw queue
+* {bad} **Setting `passwordSingleUse = false` manually after `insertPassword`** — defeats the first-login-change workflow; if you want to skip forced rotation for one flow, model that flow separately rather than mutating the flag
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `UserAccount` schema migrated (table + unique indexes named per `EMAIL_UNIQUE_CONSTRAINT` / `LOGIN_UNIQUE_CONSTRAINT`)
+* {todo} `user_account_auditor` and `user_account_notification_subscription` tables created
+* {todo} `auditor` discriminator column contains at least the `USER` value; application-specific discriminators (`SYSTEM`, `WEBHOOK`, etc.) added as needed
+* {todo} `AuditorAware<Auditor>` `@Bean` registered and returns the logged-in `AuditorUser.getAuditorId()`
+* {todo} `@EnableJpaAuditing` present on a `@Configuration` class
+* {todo} Project's Spring Security principal implements `AuditorUser` and the id is resolved at login (not lazy)
+* {todo} `UserAccountHolder.setUserDetailsService` is wired (the SDK's `UserAccountService.@PostConstruct` handles this automatically when the bean is present)
+* {todo} `audit.action.enabled=true` in every non-dev profile; `audit.action.batch-size` and `audit.action.cron` tuned for traffic
+* {todo} `AuditorActionInterceptor` registered in a `WebMvcConfigurer.addInterceptors()` call — the bean alone is inert
+* {todo} `aud.action_id` column exists in the Envers revision entity schema and is indexed
+* {todo} `user_account_action(created_at)` and `user_account_action(created_by)` indexed — forensic queries filter on both
+* {todo} Notification templates configured for all three event types: `USER_CREATED`, `USER_CHANGE_PASSWORD`, `USER_RESET_PASSWORD`
+* {todo} Template retention / masking policy defined — temporary passwords should not linger in an outbox indefinitely
+* {todo} `@Scheduled` jobs and `@Async` message consumers populate `SecurityContext` before any `@Audited` write
+* {todo} Failed-login auditing configured (SDK doesn't ship it — subscribe to `AuthenticationFailureBadCredentialsEvent` if compliance requires)
+* {todo} Integration test: create user via `UserAccountFormService` → confirm `UserCreatedEvent` fires and notification enqueues
+* {todo} Integration test: admin-reset password → confirm `UserResetPasswordEvent` only fires after commit, and rollback suppresses it
+* {todo} Integration test: `UserAccount.exists(permission)` returns `true` for `god` role regardless of permission set (see <<user-roles>>)
+* {todo} Monitoring alert: rate of `aud` rows with `auditor_id = null` — a spike signals a write path missing `SecurityContext` setup
+* {todo} Monitoring alert: `user_account_action` queue lag (difference between now and oldest queued action) exceeding batch-cron interval
+* {todo} Admin UI page for browsing `user_account_action` filtered by user/date/url (via `AuditorActionFilter`)
+* {todo} Permission checks use `UserAccount.exists(permission)` via the role module — never hard-code role name comparisons
+
+---
+
+**Related:** <<user-roles>>, <<entity-module-sdk-reference-hierarchy>>, <<audit-module-sdk-reference-internals>>, <<user-action-audit>>, <<notifications>>, <<password-management>>
+
+**Next:** <<user-roles>>, <<password-management>>

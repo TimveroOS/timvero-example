@@ -1,0 +1,1150 @@
+[[flowable-internals]]
+= Flowable Internals — execution, facts, definitions
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The Flowable extension (`com.timvero.flowable.internal`) is the SDK layer that wraps the external Flowable BPMN engine into a persistent, auditable, domain-modelled workflow subsystem. It owns three cleanly separated subdomains — **execution** (what's running, what finished), **facts** (the decisions a process emits), and **definitions** (the deployed BPMN processes the system knows about). This document covers the CORE domain model of those three subsystems — entities, repositories, services, state machines, and extension points. For the user-facing tutorial on how to enable workflows on your entity (adding `ProcessEntity` / `HasPendingDecisions`, wiring `EntityChecker`, reading pending decisions), see <<workflow-integration>>.
+
+== What You Need to Know
+
+The module has **three subsystems** that together answer three different questions. Understand each subsystem's purpose before wiring business code against it.
+
+[cols="1,3,3", options="header"]
+|===
+|Subsystem |Question It Answers |Public API
+
+|**Execution** (`internal.execution`)
+|"What process instances are running or have run, against which subject, in which mode, and with what result?" Persists a `ProcessExecution` row per BPMN instance, tracks a six-state lifecycle (`CREATED` -> `PROCESSING` -> `STARTED` -> `COMPLETED` / `FAILED` / `INTERRUPTED`), and holds the embedded `ProcessExecutionResult` (typed variables + emitted facts).
+|`ProcessExecution`, `ProcessExecutionRepository`, `ProcessExecutionStatus`, `ProcessExecutionMode`, `ProcessExecutionResult`, `TypedValue`, `ProcessEntity`, `ProcessExecutionViewService`
+
+|**Fact** (`internal.fact`)
+|"What concrete decisions did a process emit, and how does an administrator describe those decisions in the UI?" Two parallel entities — `DecisionFact` (runtime, emitted by a process, paired with a `CustomEnum` value) and `FixedDecisionFact` (pre-configured, carries static metadata — DeclineReason, DecisionDepartment, FormSchema). An admin-side pipeline (`DecisionFactDetails` + form/controller/filter) lets operators describe every fact code with a localizable description plus `DecisionMakerType`.
+|`DecisionFact`, `DecisionFactValue`, `FixedDecisionFact`, `FixedFactValue`, `DecisionFactService`, `DecisionFactFormService`, `DecisionFactDetailsRepository`, `DecisionFactDetailsChangeEvent`
+
+|**Definition** (`internal.definition`)
+|"Which BPMN process definitions has the engine deployed, in what version, and in which lifecycle state (PENDING / ACTIVE / PAST)?" Owns the `ProcessSpecification` entity (one row per deployed definition) plus the deployment-sync service that fetches the list from the external engine (Flowable REST `/api/workflow/exportable` or the legacy diagram endpoint) and integrates new definitions as `PENDING`. Actions (`Enable` / `Disable` / `Past`) move each spec through its three-state lifecycle.
+|`ProcessSpecification`, `ProcessDefinitionRepository`, `ProcessDefinitionStatus`, `ProcessDefinitionController`, `EnableProcessDefinitionAction`, `DisableProcessDefinitionAction`, `PastProcessDefinitionAction`, `ProcessDeploymentService`
+|===
+
+Key cross-cutting characteristics:
+
+- **Subject-oriented**, not process-oriented — `ProcessExecution.ownerId` points at a `ProcessEntity` (the person/asset/subject under evaluation), not the business process that triggered it. This is the same philosophy called out in <<workflow-integration>>: the framework evaluates subjects, application code starts evaluations.
+- **Mode-segregated** — every execution is either `TEST` or `REAL` (`ProcessExecutionMode`). The repository's queries cut on mode so that validation runs from the admin UI never contaminate production-fact aggregations.
+- **Two-fact design** — `DecisionFact` (dynamic, process-emitted, `CustomEnum` value) and `FixedDecisionFact` (pre-configured, enum value, carries structural metadata) are **not** polymorphic. They live in separate tables and are aggregated independently inside the same `ProcessExecutionResult`. See <<flowable-internals-fact-vs-fixed,Fact vs FixedFact>> for why.
+- **External-engine authoritative for BPMN, SDK authoritative for state** — the Flowable / workflow REST endpoint owns the BPMN XML and deployment; the SDK owns the `ProcessSpecification` wrapper, lifecycle status, version, and cross-reference to executions and mappings. `ProcessDeploymentService.syncWithEngine()` reconciles the two.
+- **Eventing at the admin edge** — mutating `DecisionFactDetails` fires `DecisionFactDetailsChangeEvent`, which the notifications subsystem consumes to rebuild subscriber routing. See <<notifications>>.
+
+== Architecture Overview
+
+[source]
+----
+                     ┌──────────────────────────────────────┐
+                     │   External BPMN engine               │
+                     │   (Flowable / Workflow service)      │
+                     └────────────────┬─────────────────────┘
+                                      │ REST: /api/workflow/exportable
+                                      │       /api/workflow/{id}
+                                      ▼
+                     ┌──────────────────────────────────────┐
+      sync           │  ProcessDeploymentService            │
+      (admin click,  │  .syncWithEngine()                   │
+       cron, etc.)   │     → create(id, key, version)       │
+                     │     → status = PENDING               │
+                     └────────────────┬─────────────────────┘
+                                      ▼
+                     ┌──────────────────────────────────────┐
+      definition     │  ProcessSpecification                │  table: process_definition
+      subsystem      │  { processDefinitionId, key, name,   │
+                     │    version, status }                 │
+                     │                                      │
+                     │  lifecycle (admin actions):          │
+                     │    PENDING ⇄ ACTIVE  /  PENDING → PAST│
+                     └────────────────┬─────────────────────┘
+                                      │ referenced by ManyToOne
+                                      ▼
+                     ┌──────────────────────────────────────┐
+      execution      │  ProcessExecution                    │  table: process_execution
+      subsystem      │  { processInstanceId (UUID),         │
+                     │    ownerId (ProcessEntity id),       │
+                     │    processSpecification,             │
+                     │    mode (TEST | REAL),               │
+                     │    processType (CustomEnum),         │
+                     │    status (6-state enum),            │
+                     │    result (embedded) }               │
+                     │                                      │
+                     │  lifecycle: CREATED → PROCESSING →   │
+                     │    STARTED → COMPLETED | FAILED      │
+                     │    ( INTERRUPTED at any point)       │
+                     └────────────────┬─────────────────────┘
+                                      │ ProcessExecutionResult (embedded)
+                                      │   ├─ Map<String, TypedValue> values
+                                      │   ├─ List<DecisionFact>
+                                      │   └─ List<FixedDecisionFact>
+                                      ▼
+                     ┌──────────────────────────────────────┐
+      fact           │  DecisionFact                        │  table: decision_fact
+      subsystem      │  { code (String),                    │
+                     │    value (DecisionFactValue         │
+                     │    — CustomEnum) }                   │
+                     │                                      │
+                     │  FixedDecisionFact                   │  table: decision_fact_fixed
+                     │  { code, factValue (enum),           │
+                     │    declineReason?, department?,      │
+                     │    schema? }                         │
+                     │                                      │
+                     │  + admin pipeline:                   │
+                     │    DecisionFactDetails (code + desc +│
+                     │    decisionMakerTypes)               │
+                     └──────────────────────────────────────┘
+
+                     events: DecisionFactDetailsChangeEvent ─► notifications / subscriptions
+----
+
+Read the diagram top-to-bottom: the external engine dictates *what* BPMN exists, the SDK wraps each deployed definition in a `ProcessSpecification`, a process run of that spec against a subject produces one `ProcessExecution`, and that execution's result embeds typed variables plus the two flavors of decision fact.
+
+== Execution Subsystem
+
+The execution subsystem is **the persistent journal of every BPMN instance** the SDK has started — including ones that failed before the engine ever picked them up. It answers "what ran, against whom, when, with what result."
+
+=== ProcessExecution — the core entity
+
+`ProcessExecution` is a `Persistable<UUID>`-keyed JPA entity. Its primary key (`processInstanceId`) matches the BPMN engine's own process-instance ID so the two systems can correlate without a translation table.
+
+[source,java]
+----
+@Entity
+@Table(name = "process_execution")
+@EntityListeners(AuditingEntityListener.class)
+@HideInDocs
+public class ProcessExecution implements Persistable<UUID> {
+
+    @Id @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID processInstanceId;
+
+    @Column(nullable = false)
+    private UUID ownerId;                                   // <1>
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "process_definition_id", updatable = false)
+    private ProcessSpecification processSpecification;      // <2>
+
+    @Embedded
+    private ProcessExecutionResult processExecutionResult;  // <3>
+
+    @Column(nullable = false, updatable = false)
+    private ProcessExecutionMode mode;                      // <4>
+
+    @Column(name = "process_type", nullable = false)
+    @Type(CustomEnumType.class)
+    private DecisionProcessType<? extends ProcessEntity> processType;  // <5>
+
+    @Column(nullable = false)
+    @Enumerated(EnumType.STRING)
+    private ProcessExecutionStatus status = ProcessExecutionStatus.CREATED;
+
+    @Column(columnDefinition = "text")
+    private String failureReason;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    private ExceptionEntity executionException;            // <6>
+
+    @CreatedDate  private Instant createdAt;
+    @LastModifiedDate private Instant updatedAt;
+    /* ... */
+}
+----
+<1> The subject's id. Always points at a `ProcessEntity` — a person, asset, application, or other `FeaturedSubject`. Not the business process that triggered the run.
+<2> The spec that was active when the run was enqueued. `updatable = false` — spec never changes mid-flight. If the spec is deprecated while an instance is running, the execution still references the old version.
+<3> Embedded — the result lives in the same row plus `execution_data_value` and `decision_fact` / `decision_fact_fixed` collection tables.
+<4> Final at creation (`updatable = false`). Test runs never become real runs and vice versa.
+<5> `DecisionProcessType` is a `CustomEnum` naming the process family (e.g., `CREDIT_CHECK`, `KYC`). Stored via `CustomEnumType` so new types can be registered without migrations. Generic bound `<? extends ProcessEntity>` ties the process type to the subject class it evaluates.
+<6> Optional link to `ExceptionEntity` (from `com.timvero.base.exception`) — when a run fails with a technical exception, the structured stack trace is pinned here so the admin UI can render it without log scraping.
+
+`ownerId` extends the module far beyond credit scoring: anything that `implements ProcessEntity` (`extends FeaturedSubject`) can be the target of an execution. That's why `ProcessEntity` itself is empty — it's a marker interface, not a contract:
+
+[source,java]
+----
+package com.timvero.flowable.internal.execution;
+
+public interface ProcessEntity extends FeaturedSubject {
+}
+----
+
+See <<entity-module-sdk-reference-hierarchy>> for where `FeaturedSubject` sits in the entity class hierarchy.
+
+=== ProcessExecutionStatus — the lifecycle state machine
+
+Six states, one terminal set, one orthogonal "interrupted" transition. Legal transitions:
+
+[source]
+----
+          ┌────────────┐
+          │  CREATED   │  ← inserted by DecisionProcessStarter
+          └─────┬──────┘    (queue row, engine not yet called)
+                │
+                │ dispatch to engine
+                ▼
+          ┌────────────┐
+          │ PROCESSING │  ← engine start RPC in flight
+          └─────┬──────┘    (nothing confirmed yet)
+                │
+                │ engine callback: instance started
+                ▼
+          ┌────────────┐
+          │  STARTED   │  ← BPMN execution observable in engine
+          └─────┬──────┘
+                │
+       ┌────────┴────────┐
+       │                 │
+       ▼                 ▼
+ ┌───────────┐     ┌──────────┐
+ │ COMPLETED │     │  FAILED  │  (terminal — no further transitions)
+ └───────────┘     └──────────┘
+
+ ─── at ANY state (except terminal) ───
+                ▼
+          ┌─────────────┐
+          │ INTERRUPTED │  (node crash, operator cancel, stale-sweep)
+          └─────────────┘
+----
+
+Status definitions (from the enum):
+
+[cols="1,3", options="header"]
+|===
+|Status |Meaning
+
+|`CREATED`
+|In queue, not yet dispatched to the engine. Persisted so that a crash between "user clicked start" and "engine accepted the request" is still recoverable.
+
+|`PROCESSING`
+|Sent to the BPMN engine, waiting for the start confirmation callback. The engine may or may not already be running the process.
+
+|`STARTED`
+|Engine confirmed — the process instance exists in the engine's runtime. This is the normal long-lived state for asynchronous flows.
+
+|`COMPLETED`
+|Terminal. BPMN reached an end event without error. `processExecutionResult` is populated.
+
+|`FAILED`
+|Terminal. Process threw; `failureReason` contains the operator-facing message, `executionException` the structured exception.
+
+|`INTERRUPTED`
+|Terminal. Node crashed mid-run, user cancelled, or the stale-process sweep ran. Distinguishable from `FAILED` because no BPMN error boundary ever fired.
+|===
+
+The distinction between `CREATED` and `PROCESSING` is load-bearing: the stale-sweep query (see below) only targets `CREATED` rows older than a threshold — rows the system never managed to hand to the engine. `PROCESSING` rows require engine-side health checks to distinguish genuine in-flight work from a lost callback.
+
+=== ProcessExecutionMode — test vs real, always
+
+[source,java]
+----
+public enum ProcessExecutionMode {
+    TEST, REAL;
+}
+----
+
+Two values, no "staging," no "dry-run." A run is either an admin validation (test) or a production evaluation (real). Mode is queried in three places:
+
+- Repository filters — `getExecutions(ownerId, type, mode)` and `findByProcessSpecificationId(specId, mode)` always take a mode argument, so test runs never show up in production aggregations.
+- `anyLastFailedExecution(ownerId)` uses `mode = 1` inline — that's the ordinal of `REAL`. Production status dashboards ignore test failures.
+- `ProcessDefinitionViewService.assembleViewModel` groups test executions per `processType` and per subject for the admin validation UI.
+
+Store test runs the same way as production runs; the repository is the boundary that keeps them segregated.
+
+=== ProcessExecutionResult — typed values + facts in one embedded object
+
+[source,java]
+----
+@Embeddable @HideInDocs
+public class ProcessExecutionResult {
+
+    @ElementCollection(fetch = FetchType.LAZY)
+    @CollectionTable(name = "execution_data_value",
+        joinColumns = @JoinColumn(name = "process_instance_id", nullable = false))
+    @MapKeyColumn(name = "name")
+    private Map<String, TypedValue> values;
+
+    @OneToMany(cascade = CascadeType.ALL)
+    @JoinColumn(name = "process_instance_id", nullable = false, updatable = false)
+    private List<DecisionFact> decisionFacts;
+
+    @OneToMany(cascade = CascadeType.ALL)
+    @JoinColumn(name = "process_execution_id", nullable = false, updatable = false)
+    private List<FixedDecisionFact> fixedDecisionFacts;
+    /* getters with lazy-init fallback */
+}
+----
+
+Three collections, three purposes:
+
+- `values` — free-form process variables the BPMN wants to persist beyond its own runtime. Keys are variable names (minus the system/hidden ones filtered by `ProcessExecutionViewService`), values are `TypedValue` wrappers.
+- `decisionFacts` — runtime decisions emitted by this specific run. Discussed at length below.
+- `fixedDecisionFacts` — pre-configured facts attached at result creation, typically used to pin declines with a structured reason set.
+
+Note the **two join columns**: `execution_data_value` and `decision_fact` join on `process_instance_id`, but `decision_fact_fixed` joins on `process_execution_id`. Historical naming — same owner, different column names.
+
+=== TypedValue — polymorphic variable storage
+
+[source,java]
+----
+@Embeddable
+public class TypedValue {
+
+    @Column(name = "data_type", nullable = false)
+    @Enumerated(EnumType.STRING)
+    private FeatureDataType dataType;
+
+    @Column(name = "raw_content", length = 4000, nullable = false)
+    private String rawContent;
+
+    @Transient
+    public Object getContent()      { return dataType.parse(rawContent); }
+    @Transient
+    public void setContent(Object c){ this.rawContent = dataType.serialize(c); }
+
+    public static TypedValue of(Object object) {
+        FeatureDataType type = FeatureDataType.resolveDataType(object);
+        return new TypedValue(type, type.serialize(object));
+    }
+}
+----
+
+`FeatureDataType` (from `com.timvero.loan.feature`) is the polymorphic discriminator — it knows how to serialize and parse `String`, `BigDecimal`, `LocalDate`, `Boolean`, enums, and collection types. The static `of()` factory auto-resolves the type from a raw object, which is how engine-emitted variables land in the DB without per-variable configuration.
+
+The 4000-char `rawContent` limit is the tightest constraint to remember when deciding whether something is a "variable" or a "document" — large JSON payloads will overflow. Use storage (<<storage>>) for those.
+
+=== ProcessExecutionRepository
+
+Two families of queries: owner-scoped reads and queue maintenance.
+
+[source,java]
+----
+public interface ProcessExecutionRepository
+    extends JpaRepository<ProcessExecution, UUID>,
+            SynchronousAccessRepository<ProcessExecution, UUID> {
+
+    Collection<ProcessExecution> findAllByOwnerId(UUID ownerId);
+
+    @Query("from ProcessExecution where ownerId = :ownerId and processType = :processType and mode = :executionMode")
+    Collection<ProcessExecution> getExecutions(UUID ownerId, DecisionProcessType<?> processType,
+        ProcessExecutionMode executionMode);
+
+    @Query("... order by updatedAt desc limit 1")
+    Optional<ProcessExecution> getLastExecution(UUID ownerId, DecisionProcessType<?> processType,
+        ProcessExecutionMode executionMode);
+
+    @Query("from ProcessExecution where processSpecification.processDefinitionId = :id and mode = :mode")
+    Collection<ProcessExecution> findByProcessSpecificationId(String processSpecificationId,
+        ProcessExecutionMode executionMode);
+
+    // Queue maintenance
+    long countByStatus(ProcessExecutionStatus status);
+
+    @Query("SELECT pe.processInstanceId FROM ProcessExecution pe WHERE pe.status = :status "
+         + "ORDER BY pe.createdAt ASC")
+    List<UUID> findIdsByStatusOrderByCreatedAtAsc(
+        ProcessExecutionStatus status, Pageable pageable);
+
+    @Modifying
+    @Query("UPDATE ProcessExecution SET status = :newStatus, failureReason = :failureReason, "
+         + "updatedAt = CURRENT_TIMESTAMP "
+         + "WHERE status = :oldStatus AND updatedAt < :staleThreshold")
+    int markStaleProcesses(ProcessExecutionStatus oldStatus, ProcessExecutionStatus newStatus,
+                          Instant staleThreshold, String failureReason);
+}
+----
+
+Three patterns worth calling out:
+
+- **`SynchronousAccessRepository`** — additional base that adds `forUpdate(id)` (pessimistic lock). Required because the status transitions race: an engine callback can arrive while a stale-sweep is trying to mark the same row `INTERRUPTED`.
+- **`markStaleProcesses`** is a `@Modifying` bulk update — single SQL statement, no entity hydration. Scheduled jobs call it with `(CREATED, INTERRUPTED, now - 10min, "stale")` and `(PROCESSING, INTERRUPTED, now - 30min, "dispatch lost")`.
+- **`anyLastFailedExecution` / `anyLastExecution`** use a native window-function query — for each `processType`, look at the most recent execution in REAL mode and see whether it failed. The SDK's launchpad (<<launchpad>>) uses this to surface a "there are failing processes" banner without loading rows.
+
+=== ProcessExecutionViewService — pulling variables from the engine
+
+This service doesn't touch the database — it calls the external engine's execution-history REST endpoints:
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty("process.engine.url")
+public class ProcessExecutionViewService {
+
+    public static final String HIDDEN_VARIABLES_PREFIX = "$_";
+    public static final String[] SYSTEM_VARIABLES = {
+        "_processInstanceId", "_applicationServerUrl", "initiator"
+    };
+
+    public Activity[] getActivities(UUID executionId) {
+        // GET /execution-history/{id}/activities
+    }
+
+    public Map<String, String> getVariables(UUID executionId) {
+        return queryVariables(executionId).entrySet().stream()
+            .filter(e -> !e.getKey().startsWith(HIDDEN_VARIABLES_PREFIX))
+            .filter(e -> !Lang.value(e.getKey()).in(SYSTEM_VARIABLES))
+            .collect(/* to map */);
+    }
+
+    public record Activity(String name, String description,
+                           Map<String, String> variables, List<Activity> children) { }
+}
+----
+
+Two filters strip the "implementation details" out of what the UI sees:
+
+- Variables prefixed with `$_` (`HIDDEN_VARIABLES_PREFIX`) — the engine uses that prefix for internal scratch state it doesn't want operators to see.
+- System variables `_processInstanceId`, `_applicationServerUrl`, and `initiator` — always present, always meaningless to end users.
+
+`@ConditionalOnProperty("process.engine.url")` means this service is only registered in the admin (full-stack) module — background / servicing modules that don't need the admin-side execution timeline don't pay the bean cost.
+
+== Fact Subsystem
+
+Facts are the *output side* of the domain model — the concrete "what was decided" the process leaves behind. The subsystem has two parallel entity lines (runtime `DecisionFact` vs. configured `FixedDecisionFact`), a small admin pipeline for editing fact metadata, and one event.
+
+[[flowable-internals-fact-vs-fixed]]
+=== DecisionFact vs FixedDecisionFact — why two entities?
+
+Both represent "a fact the process emitted," yet they live in separate tables with different column sets. The distinction is **where the value comes from** and **what structured metadata the fact carries**.
+
+[cols="1,3,3", options="header"]
+|===
+|Aspect |`DecisionFact` |`FixedDecisionFact`
+
+|Table
+|`decision_fact`
+|`decision_fact_fixed`
+
+|Value type
+|`DecisionFactValue` — open-ended `CustomEnum` (new values at runtime, no migration)
+|`FixedFactValue` — closed Java `enum` with three members: `ALERT`, `WARNING`, `INFO`
+
+|Who emits it
+|The BPMN process does, at a service-task call. Unbounded set of codes.
+|Wired at application configuration time. Bounded, known at compile time.
+
+|Extra metadata
+|None — just `code` + `value`
+|Optional `DeclineReason` (for ALERT), `DecisionDepartment` + `FormSchema` (for WARNING). Linked foreign keys.
+
+|Entity base
+|`UndeletableEntity<Long>` — soft-delete flag, can't be physically removed
+|`BasePersistable<Long>` — standard persistable, no soft-delete
+
+|Typical use
+|"Customer had a bankruptcy filing" / "Income verification passed"
+|"Decline: SSN invalid" (ALERT + DeclineReason), "Needs manual review via form X in dept Y" (WARNING + DecisionDepartment + FormSchema)
+|===
+
+The three factory methods on `FixedDecisionFact` make the intended usage explicit:
+
+[source,java]
+----
+public static FixedDecisionFact info(String code)                                         { ... }
+public static FixedDecisionFact warning(String code, DecisionDepartment dept,
+                                        FormSchema schema)                                { ... }
+public static FixedDecisionFact alert(String code, DeclineReason reason)                  { ... }
+----
+
+A WARNING without a department + schema or an ALERT without a decline reason is meaningless in the UI — the factories enforce the coupling at creation.
+
+=== DecisionFact — the runtime entity
+
+[source,java]
+----
+@Entity @Table(name = "decision_fact") @HideInDocs
+public class DecisionFact extends UndeletableEntity<Long> {
+
+    @Column(name = "code", nullable = false)
+    private String code;                          // <1>
+
+    @Column(name = "value", nullable = false)
+    @Type(CustomEnumType.class)
+    private DecisionFactValue value;              // <2>
+
+    public DecisionFact(String code, DecisionFactValue value) { /* ... */ }
+}
+----
+<1> The fact identifier the process picked — typically an all-caps snake-cased label like `BANKRUPTCY_FILED` or `EMPLOYMENT_VERIFIED`. Joined against `DecisionFactDetails.code` for description lookups.
+<2> `DecisionFactValue` is a `CustomEnum<DecisionFactValue>`. New value names register at runtime (no schema change) via `values(DecisionFactValue.class)`.
+
+Because both sides of the pair are open-ended (`code` is an unconstrained String, `value` is a `CustomEnum`), the domain model places no structural guardrails on what processes emit. That's intentional — BPMN-side decisions shouldn't require a Java deploy. The **`DecisionFactDetails`** admin pipeline (below) exists to give each code a human-facing description and decision-maker routing without coupling that metadata to the fact rows themselves.
+
+=== DecisionFactDetails — the admin description for a fact code
+
+[source,java]
+----
+@Entity @Table(name = "decision_fact_details")
+@Audited @EntityListeners(AuditingEntityListener.class) @HideInDocs
+public class DecisionFactDetails implements Persistable<String>, NamedEntity {
+
+    @Id
+    private String code;                                 // <1>
+
+    @Column(nullable = false)
+    private String description;
+
+    @ElementCollection
+    @CollectionTable(name = "decision_maker_type")
+    @Type(CustomEnumType.class)
+    private Set<DecisionMakerType> decisionMakerTypes;   // <2>
+
+    /* createdAt/createdBy/updatedAt/updatedBy via AuditingEntityListener */
+}
+----
+<1> **String-keyed entity.** The fact code *is* the primary key. A `DecisionFact` with `code = "BANKRUPTCY_FILED"` and a `DecisionFactDetails` with `id = "BANKRUPTCY_FILED"` are joined by string equality — no foreign key, no cascade, because `DecisionFact` rows predate their details (a process can emit a new code, then an admin fills in the description after the fact).
+<2> `DecisionMakerType` is another `CustomEnum` — the set of roles/departments that can act on facts of this code (e.g., `UNDERWRITER`, `RISK_OFFICER`). Notifications (<<notifications>>) use this to route.
+
+`@Audited` — the details table is versioned by Envers, so the audit module (<<audit-module-sdk-reference-internals>>) can show when a description changed and by whom.
+
+=== DecisionFactDetailsRepository
+
+Minimal — `JpaRepository` + `JpaSpecificationExecutor`. Specifications are used by the list filter infrastructure.
+
+[source,java]
+----
+public interface DecisionFactDetailsRepository
+    extends JpaRepository<DecisionFactDetails, String>,
+            JpaSpecificationExecutor<DecisionFactDetails> { }
+----
+
+=== DecisionFactService — runtime DTO assembly
+
+[source,java]
+----
+@Service
+public class DecisionFactService {
+
+    @Transactional(readOnly = true)
+    public List<DecisionFactDTO> getExecutionFacts(UUID executionId) {
+        DecisionFactDTOMapper mapper = new DecisionFactDTOMapper(
+            decisionFactDetailsRepository.findAll());               // <1>
+
+        ProcessExecution execution = processExecutionService
+            .findByProcessInstanceId(executionId);
+        return execution.getExecutionResult().getDecisionFacts().stream()
+            .map(mapper::toDTO)
+            .toList();
+    }
+
+    public record DecisionFactDTO(String code, String value, String description) { }
+
+    @Transactional
+    public void delete(String code) {
+        decisionFactDetailsRepository.deleteById(code);
+    }
+}
+----
+<1> Loads **all** details in one pass and builds a `Map<String, DecisionFactDetails>` inside the mapper. That's fine because the details table is intentionally small (hundreds of rows at most) and read only for this purpose. Don't introduce per-fact lookups — that's an N+1 in disguise.
+
+The DTO intentionally joins the runtime fact (code + value) with the admin description by `code` string match. Facts without a matching `DecisionFactDetails` get `description = null` — the UI renders just the code. That's the correct fallback for codes that a process emitted before anyone defined them.
+
+=== DecisionFactDetailsChangeEvent
+
+[source,java]
+----
+public class DecisionFactDetailsChangeEvent extends EntityEvent {
+    private final String factCode;
+    public DecisionFactDetailsChangeEvent(String factCode) { this.factCode = factCode; }
+    public String getFactCode() { return factCode; }
+}
+----
+
+Fired by `DecisionFactFormService` after a successful save. The notifications module listens and re-materializes subscriber routing maps — this is how updating the description / decision-maker types of a fact takes effect without a restart. See <<notifications>>.
+
+=== The admin form pipeline (form + mapper + service + actions + controller + filter)
+
+Six small classes, one familiar pattern — the SDK's standard `EntityFormService`-based admin CRUD. This is the same pipeline covered in <<form-classes-setup-and-usage>>; it shows up verbatim here because the fact-details admin UI is the canonical example of that pattern applied to a third-party-keyed entity (primary key is a `String`, not a generated id).
+
+[source,java]
+----
+// 1. The form
+public class DecisionFactForm {
+    @NotEmpty private String code;
+    @NotEmpty private String description;
+    private Set<DecisionMakerType> decisionMakerTypes;
+}
+
+// 2. MapStruct — details → form
+@Mapper
+public interface DecisionFactFormMapper
+    extends EntityToFormMapper<DecisionFactDetails, DecisionFactForm> { }
+
+// 3. The form service — save + event + uniqueness check
+@Service
+public class DecisionFactFormService
+    extends EntityFormService<DecisionFactDetails, DecisionFactForm, String> {
+
+    @Override
+    protected void assembleEditModel(DecisionFactDetails details,
+                                     DecisionFactForm form, Map<String, Object> model) {
+        model.put("form", form);
+        model.put("active", details != null);
+        model.put("decisionMakerTypes", DecisionMakerType.values());
+    }
+
+    @Override
+    public String save(String s, DecisionFactForm form) throws ValidationException {
+        if (s == null || !s.equals(form.getCode())) {
+            if (repository.existsById(form.getCode())) {                 // <1>
+                ValidationException.binding()
+                    .rejectValue("code", "decision.fact.code.exists",
+                                 "Code is already defined")
+                    .throwIfNotEmpty();
+            }
+        }
+        String code = super.save(s, form);
+        eventService.fire(new DecisionFactDetailsChangeEvent(code));      // <2>
+        return code;
+    }
+}
+
+// 4+5. Action controllers
+@Controller
+public class CreateDecisionFactAction
+    extends EntityCreateController<String, DecisionFactDetails, DecisionFactForm> { /* ... */ }
+
+@Controller
+public class EditDecisionFactAction
+    extends EditEntityActionController<String, DecisionFactDetails, DecisionFactForm> { /* ... */ }
+
+// 6. The list/view controller — ViewableFilterController pattern
+@Controller @RequestMapping("/decision-fact")
+public class DecisionFactController
+    extends ViewableFilterController<String, DecisionFactDetails, DecisionFactFilter> {
+
+    @GetMapping("/execution/{executionId}")
+    @ResponseBody
+    public List<DecisionFactDTO> executionDecisionFacts(@PathVariable UUID executionId) {
+        return decisionFactService.getExecutionFacts(executionId);
+    }
+
+    @PostMapping("/{code}/delete")
+    @ResponseBody
+    public Redirect delete(@PathVariable String code) { /* ... */ }
+}
+----
+<1> **Rename-safe uniqueness check.** When the id is `null` (create) or the id differs from the form code (rename), verify no other row owns the target code before persist. The string-keyed primary key forces this manual check — for generated-id entities the framework handles it.
+<2> Fires the change event only on successful save — not inside the try of `super.save()`. Subscribers can trust that if they got the event, the row is committed.
+
+=== The five "subpackages" of `internal.fact`
+
+Already covered piece-by-piece above; here's the 1-line summary so you can map the code quickly:
+
+- **`entity/`** — the four JPA entities + two custom enums (`DecisionFact`, `DecisionFactDetails`, `DecisionFactValue`, `FixedDecisionFact`, `FixedFactValue`, `DecisionMakerType`) + `DecisionFactDetailsRepository`. The domain model.
+- **`form/`** — the admin form triple (`DecisionFactForm`, `DecisionFactFormMapper`, `DecisionFactFormService`). Standard `EntityFormService` pipeline.
+- **`action/`** — the two `@Controller` entry points (`CreateDecisionFactAction`, `EditDecisionFactAction`). One-liners that redirect back to the list page. See <<entity-actions>>.
+- **`controller/`** — `DecisionFactController`, the list/view/delete/execution-facts endpoint under `/decision-fact`.
+- **`filter/`** — `DecisionFactFilter` (empty marker — inherits all ListFilter paging/sort) + `DecisionFactFilterService`. The list is currently unfiltered; adding criteria is a zero-code change in the filter service thanks to the annotation-driven DSL (<<list-filters-annotation-driven-jpa-query-dsl>>).
+
+Top-level package (outside subpackages): `DecisionFactService` (the runtime DTO service) and `DecisionFactDetailsChangeEvent` (the event class). They sit at the root because they're the *runtime* surface — entity, action, controller, filter, form are *admin* surfaces.
+
+== Definition Subsystem
+
+Where the fact subsystem is about output, the definition subsystem is about input: which BPMN definitions does the SDK know about, in what state, and how do admins transition them through the deploy-publish-retire lifecycle?
+
+=== ProcessSpecification — the core entity
+
+[source,java]
+----
+@Entity
+@Table(name = "process_definition",
+    uniqueConstraints = @UniqueConstraint(columnNames = ProcessSpecification_.PROCESS_DEFINITION_ID))
+@HideInDocs
+public class ProcessSpecification extends BaseEntity<Long> implements NamedEntity {
+
+    @Column(nullable = false, updatable = false)
+    private String processDefinitionId;          // <1>
+
+    @Column(nullable = false) private String key;
+    @Column(nullable = false) private String name;
+    @Column(nullable = false) private int version;
+
+    @Column(nullable = false) @Enumerated(EnumType.STRING)
+    private ProcessDefinitionStatus status;
+    /* getters / setters; getDisplayedName() returns name */
+}
+----
+<1> **Unique**. The engine-side process definition id is the business key — uniqueness is enforced at the DB level, so the sync routine can use "insert on conflict do nothing" semantics without fear of duplicates.
+
+The table is called `process_definition` but the class is `ProcessSpecification` — historical mismatch. Treat the entity class as canonical.
+
+Four fields describe "which BPMN":
+
+- `processDefinitionId` — engine-scoped unique id (UUID-ish string produced by the engine at deploy time).
+- `key` — the BPMN `key` attribute. Stays constant across versions of the same logical definition.
+- `name` — human label for the admin UI. Defaults to `key` when sync creates the row.
+- `version` — integer version assigned by the engine.
+
+Plus `status` (see below), `createdAt`, `updatedAt` (from `BaseEntity`).
+
+=== ProcessDefinitionStatus — three-state lifecycle
+
+[source]
+----
+               ┌─────────┐   enable      ┌────────┐
+ (sync from    │ PENDING │ ────────────► │ ACTIVE │
+  engine)      │         │ ◄──────────── │        │
+               └────┬────┘   disable     └────────┘
+                    │
+                    │ past
+                    ▼
+               ┌────────┐
+               │  PAST  │
+               └────────┘
+----
+
+[cols="1,3", options="header"]
+|===
+|Status |Meaning
+
+|`PENDING`
+|Newly synced from the engine. The SDK knows about the definition but won't use it for production runs. Admin must review and enable.
+
+|`ACTIVE`
+|Published. `findActive(key)` returns it; `DecisionProcessStarter` will dispatch real executions against it.
+
+|`PAST`
+|Archived. Will never run again. Kept for historical integrity — old `ProcessExecution` rows still reference it.
+|===
+
+Transitions are enforced at the action level — there is no `ACTIVE → PAST` direct path. You must `DisableProcessDefinitionAction` (→ PENDING) first, then `PastProcessDefinitionAction` (→ PAST).
+
+=== ProcessDefinitionRepository
+
+[source,java]
+----
+public interface ProcessDefinitionRepository
+    extends JpaRepository<ProcessSpecification, Long>,
+            JpaSpecificationExecutor<ProcessSpecification> {
+
+    Optional<ProcessSpecification> findByProcessDefinitionId(String processDefinitionId);
+
+    default List<ProcessSpecification> findActive() {
+        return findAll((root, query, cb) ->
+            cb.equal(root.get(ProcessSpecification_.STATUS), ACTIVE));
+    }
+
+    default List<ProcessSpecification> findActive(String treeKey) {
+        return findAll((root, query, cb) -> cb.and(
+            cb.equal(root.get(ProcessSpecification_.KEY), treeKey),
+            cb.equal(root.get(ProcessSpecification_.STATUS), ACTIVE)));
+    }
+}
+----
+
+`findActive(treeKey)` is the hot path for `DecisionProcessStarter`: given the tree/process key that the business code knows, return every active spec matching it. More than one match is legal — **multiple active specs with the same key coexist** (different versions, e.g., during a blue/green rollout). Starter logic picks by version or by additional criteria.
+
+=== ProcessDeploymentService — the external-engine bridge
+
+Abstract base + two concrete implementations, picked by Spring configuration depending on which engine endpoint the deployment uses.
+
+[source,java]
+----
+public abstract class ProcessDeploymentService {
+
+    @Autowired protected ProcessDefinitionRepository processDefinitionRepository;
+
+    @Transactional
+    public void create(String processDefinitionId, String treeKey, int version) {
+        ProcessSpecification pd = new ProcessSpecification();
+        pd.setProcessDefinitionId(processDefinitionId);
+        pd.setKey(treeKey);
+        pd.setName(treeKey);
+        pd.setVersion(version);
+        pd.setStatus(ProcessDefinitionStatus.PENDING);          // <1>
+        processDefinitionRepository.save(pd);
+    }
+
+    @Transactional public void enable(Long id)  { /* → ACTIVE  */ }
+    @Transactional public void disable(Long id) { /* → PENDING */ }
+    @Transactional public void past(Long id)    { /* → PAST    */ }
+
+    public abstract void syncWithEngine();
+}
+----
+<1> **New specs always land as `PENDING`.** There is no path that creates an already-active spec — admin review is mandatory.
+
+Two concrete subclasses:
+
+[source,java]
+----
+// Flowable-specific — talks to Flowable REST /process-definitions
+public class FlowableProcessDeploymentService extends ProcessDeploymentService {
+
+    @Autowired private ProcessDefinitionService processDefinitionService;
+    @Autowired private ServerConfigProperties serverConfigProperties;
+
+    @Override @Transactional
+    public void syncWithEngine() {
+        ServerConfig config = serverConfigProperties
+            .getByEndpointType(EndpointType.PROCESS).get(0);
+        int total; int loaded = 0;
+        do {
+            JsonNode page = processDefinitionService.listProcessDefinitions(
+                config, Map.of("size", new String[]{"1000"},
+                              "start", new String[]{String.valueOf(loaded)}),
+                false);
+            total = page.get("total").intValue();
+            loaded += page.get("size").intValue();
+            page.get("data").forEach(this::integrateDefinition);
+        } while (loaded < total);
+    }
+}
+
+// Workflow-service variant — calls /api/workflow/exportable
+public class WorkflowProcessDeploymentService extends ProcessDeploymentService {
+
+    @Autowired private WorkflowApi workflowApi;
+
+    @Override @Transactional
+    public void syncWithEngine() {
+        workflowApi.fetchDefinitionsList().forEach(this::integrateDefinition);
+    }
+}
+----
+
+`integrateDefinition()` is identical in both — "is this id already known? if not, `create(id, key, version)`." Existing rows are never updated. That's deliberate: once a spec is imported, status is owned by the admin, not by the engine.
+
+`WorkflowApi` is the thin `RestClient` wrapper that provides `fetchDefinitionsList()` and `fetchDefinition(id)`.
+
+=== The three action controllers
+
+[source,java]
+----
+@Controller @RequestMapping("/enable")
+public class EnableProcessDefinitionAction
+    extends SimpleActionController<Long, ProcessSpecification> {
+
+    @Autowired private ProcessDeploymentService deploymentService;
+
+    @Override
+    protected EntityAction<? super ProcessSpecification, Object> action() {
+        return when(pd -> pd.getStatus().equals(PENDING))                 // <1>
+            .then((entity, form, user) -> deploymentService.enable(entity.getId()));
+    }
+}
+
+@Controller @RequestMapping("/disable")
+public class DisableProcessDefinitionAction ... {
+    return when(pd -> !pd.getStatus().equals(PENDING))                    // <2>
+        .then((entity, form, user) -> deploymentService.disable(entity.getId()));
+}
+
+@Controller @RequestMapping("/past")
+public class PastProcessDefinitionAction ... {
+    return when(pd -> pd.getStatus().equals(PENDING))                     // <3>
+        .then((entity, form, user) -> deploymentService.past(entity.getId()));
+}
+----
+<1> Enable: only valid from PENDING.
+<2> Disable: valid from anything except PENDING (i.e., from ACTIVE or PAST — bringing a retired spec back for re-review is allowed).
+<3> Past: only from PENDING. That's why the two-step transition `ACTIVE → PENDING → PAST` exists — you can't skip the disable.
+
+Each action is a four-line class. The heavy lifting (`SimpleActionController`, `when(...)`, `then(...)` — visibility, authorization, audit tagging) is inherited from the entity-actions framework; see <<entity-actions>>.
+
+=== ProcessDefinitionController — the admin hub
+
+The view controller has four responsibilities beyond the standard list/view that `ViewableFilterController` provides:
+
+[source,java]
+----
+@Controller @RequestMapping(ProcessDefinitionController.PATH)
+@MenuItem(order = 900_710, name = "processDefinition", group = "setting")
+public class ProcessDefinitionController
+    extends ViewableFilterController<Long, ProcessSpecification, ProcessDefinitionListFilter> {
+
+    public static final String PATH = "/process-definition";
+
+    // 1. Tab navigation (generic tab/fragment pattern)
+    @GetMapping({"/tabs/{tab}/{fragment}", "/tabs/{tab}"})
+    public String tab(@PathVariable String tab,
+                      @PathVariable(required = false) String fragment, Model model) {
+        viewService.assembleModel(model);
+        return tabPath(tab, fragment);
+    }
+
+    // 2. Tree-validation tab
+    @GetMapping({"/{id}/tree", "/{id}/{entityType}/tree"})
+    public String tab(@PathVariable Long id,
+                      @PathVariable Optional<DecisionProcessType<?>> entityType, Model model) {
+        // ... assemble view model, optionally seed ValidationData
+    }
+
+    // 3. Autocomplete for the validation picker
+    @GetMapping(value = "/entities", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<?, String> getData(@RequestParam String search,
+                                  @RequestParam DecisionProcessType<?> task) { ... }
+
+    // 4. Trigger a test run against a chosen subject
+    @PostMapping("/{treeId}/validate/{entityId}/{entityType}")
+    @ResponseBody
+    public UUID validate(...) {
+        return viewService.validate(treeId, entityType, entityId);
+    }
+
+    // 5. Engine sync button
+    @GetMapping("/sync-definitions")
+    public String syncDefinitions() {
+        processDeploymentService.syncWithEngine();
+        return getFilterPage();
+    }
+}
+----
+
+Everything is `@PreAuthorize("hasRole(this.viewRole)")`. The menu entry `processDefinition`, group `setting`, order 900710 places it in the Settings section of the admin sidebar.
+
+=== ProcessDefinitionListFilter + ProcessDefinitionFilterService
+
+Same empty-marker pattern as `DecisionFactFilter`:
+
+[source,java]
+----
+public class ProcessDefinitionListFilter extends ListFilter { }
+
+@Service
+public class ProcessDefinitionFilterService
+    extends FilterListService<ProcessSpecification, ProcessDefinitionListFilter> { }
+----
+
+Zero configuration — standard paging/sort through the annotation-driven DSL (<<list-filters-annotation-driven-jpa-query-dsl>>).
+
+=== ProcessDefinitionViewService — the real view layer
+
+This is where per-definition detail assembly lives — test-mode executions grouped per process type and per subject, plus lazily-computed tree lists for the tab page.
+
+[source,java]
+----
+@Service
+public class ProcessDefinitionViewService {
+
+    public static final Collector<ProcessExecution, ?, ProcessExecution> LATEST_EXECUTION_COLLECTOR =
+        Collectors.collectingAndThen(
+            Collectors.maxBy(Comparator.comparing(ProcessExecution::getCreatedAt)),
+            Optional::orElseThrow);
+
+    @Transactional(readOnly = true)
+    public void assembleViewModel(ProcessSpecification entity, Model model) {
+        model.addAttribute("process", entity);
+        model.addAttribute("validationData", new ValidationData());
+        model.addAttribute("validationAvailable",
+            DecisionProcessType.values().length != 0);
+        model.addAttribute("validationProcesses", DecisionProcessType.values());
+
+        Collection<ProcessExecution> specExecutions = executionService
+            .findByProcessSpecificationId(entity.getProcessDefinitionId(),
+                                          ProcessExecutionMode.TEST);      // <1>
+
+        model.addAttribute("validationExecutions", specExecutions.stream()
+            .collect(Collectors.groupingBy(ProcessExecution::getProcessType,
+                     Collectors.groupingBy(this::getProcessEntity,
+                                           LATEST_EXECUTION_COLLECTOR))));  // <2>
+        /* ... entityTypes map for the type picker ... */
+    }
+
+    @Transactional(readOnly = true)
+    public void assembleModel(Model model) {
+        model.addAttribute("activePendingTrees", Lazy.of(getTrees(ACTIVE, PENDING)));
+        model.addAttribute("activeTrees",        Lazy.of(getTrees(ACTIVE)));
+        model.addAttribute("pastTrees",          Lazy.of(getTrees(PAST)));   // <3>
+    }
+
+    public <A extends ProcessEntity> UUID validate(Long treeId, DecisionProcessType<A> type,
+                                                   String stringId) {
+        UUID entityId = searchServices.loadEntity(type.getEntityClass(), stringId).get().getId();
+        return decisionProcessStarter.test(treeId, type, entityId);          // <4>
+    }
+}
+----
+<1> **Only TEST-mode executions.** Production runs never pollute the validation tab.
+<2> Nested groupingBy: first by `processType`, then by the `ProcessEntity` subject, keeping only the latest per bucket. The admin sees "the last time each process type ran against each subject in test mode."
+<3> `Lazy.of(...)` — Thymeleaf only triggers the `getTrees(...)` query when the fragment actually renders. Landing on the "active" tab doesn't fetch PAST trees.
+<4> Validation kicks off a test run via `DecisionProcessStarter.test(...)` — the only path in the admin UI that creates a `ProcessExecution` with `mode = TEST`.
+
+=== ValidationData — tiny DTO, significant role
+
+[source,java]
+----
+public class ValidationData {
+    private DecisionProcessType<?> process;
+    public ValidationData() { }
+    public ValidationData(DecisionProcessType<?> process) { this.process = process; }
+    /* getter / setter */
+}
+----
+
+A single-field DTO the controller passes to the template to seed the "pick a process type" dropdown on the validation tab. When the URL explicitly includes an entity type (`/{id}/{entityType}/tree`), the controller builds a pre-populated `ValidationData(type)`; otherwise it passes an empty instance and the dropdown starts blank.
+
+It's a "view model bag," not a form — there's no `@Valid` binding, no save. Kept as a class (not a record) because Thymeleaf `th:object` requires setters.
+
+=== The five "subpackages" of `internal.definition`
+
+- **`entity/`** — the root domain: `ProcessSpecification`, `ProcessDefinitionStatus`, `ProcessDefinitionRepository`.
+- **`service/`** — the deployment bridge and HTTP clients: `ProcessDeploymentService` (abstract), `FlowableProcessDeploymentService`, `WorkflowProcessDeploymentService`, `WorkflowApi`.
+- **`action/`** — the three `SimpleActionController` state-transition actions (enable/disable/past).
+- **`controller/`** — `ProcessDefinitionController`, the admin hub.
+- **`filter/`** — `ProcessDefinitionListFilter`, `ProcessDefinitionFilterService`, **`ProcessDefinitionViewService`** (despite its name — lives in the `filter` package because the same service owns both the list filter model assembly and the per-entity view model), and `ValidationData`.
+
+== Advanced Patterns
+
+=== Pattern 1 — defining new DecisionFactValue / DecisionMakerType values at runtime
+
+Both are `CustomEnum`s. Register new values from a `@Configuration`:
+
+[source,java]
+----
+@Configuration
+public class FactValuesConfig {
+
+    public static final DecisionFactValue APPROVED         = new DecisionFactValue("APPROVED");
+    public static final DecisionFactValue DECLINED         = new DecisionFactValue("DECLINED");
+    public static final DecisionFactValue MANUAL_REVIEW    = new DecisionFactValue("MANUAL_REVIEW");
+
+    public static final DecisionMakerType UNDERWRITER      = new DecisionMakerType("UNDERWRITER");
+    public static final DecisionMakerType RISK_OFFICER     = new DecisionMakerType("RISK_OFFICER");
+}
+----
+
+`CustomEnum`'s constructor registers the instance into a static registry keyed by (Class, name). `DecisionFactValue.values()` reflects the registry contents at call time — no migration, no restart-only behavior.
+
+Use this pattern for every new value that a BPMN process might emit; otherwise `CustomEnumType` deserialization throws when the process writes an unknown name.
+
+=== Pattern 2 — consuming ProcessExecution results from a `HistoryEventSupplier`
+
+The canonical consumer of execution results in a customer project is the per-entity history tab, which joins `ProcessExecution` + `DecisionFact` + `DecisionFactDetails` and renders them as timeline events:
+
+[source,java]
+----
+include::{sourcedir}/participant/history/ParticipantProcessExecutionsHistorySupplier.java[]
+----
+
+Patterns worth adopting:
+
+- Filter by `getStatus() == COMPLETED` — in-flight and failed runs shouldn't surface on the entity timeline until terminal.
+- Group facts by `value.name()` — templates render "fact values" (approve / decline / escalate buckets), not individual fact codes.
+- Use `DecisionFactService.getExecutionFacts(executionId)` to get the already-joined DTOs; don't reach into the repository directly.
+
+See <<audit-module-sdk-reference-internals>> for the supplier aggregation machinery.
+
+=== Pattern 3 — multi-version active specs (blue/green rollout)
+
+`findActive(treeKey)` returns a **list**. Mid-migration, both v3 (existing ACTIVE) and v4 (newly enabled) may share the same `key`. `DecisionProcessStarter` resolves by additional criteria — typically picking the highest `version`.
+
+Migration playbook:
+
+. Deploy BPMN v4 to the engine.
+. Admin clicks "sync definitions" — v4 row lands as PENDING.
+. Smoke-test v4 via the validate tab (TEST-mode executions).
+. Admin enables v4 — now both v3 and v4 are ACTIVE.
+. Let traffic drain at `version = max` — starter picks v4 for new runs; v3 finishes existing runs.
+. Admin clicks Disable on v3 → v3 goes PENDING; Past → v3 goes PAST.
+
+Because `ProcessExecution.processSpecification` is `updatable = false`, runs that started under v3 finish under v3 even after v4 goes active.
+
+=== Pattern 4 — queue-health monitoring via the repository
+
+The stale-process plumbing exists for a reason; wire a scheduled job to trigger it:
+
+[source,java]
+----
+@Component
+public class ProcessQueueSweeper {
+
+    @Autowired private ProcessExecutionRepository repository;
+
+    @Scheduled(fixedDelay = 60_000)
+    @Transactional
+    public void sweep() {
+        Instant now = Instant.now();
+
+        // never-dispatched CREATED rows → INTERRUPTED after 10 minutes
+        repository.markStaleProcesses(
+            ProcessExecutionStatus.CREATED,
+            ProcessExecutionStatus.INTERRUPTED,
+            now.minus(Duration.ofMinutes(10)),
+            "queue.stale.never_dispatched");
+
+        // dispatched but no engine callback → INTERRUPTED after 30 minutes
+        repository.markStaleProcesses(
+            ProcessExecutionStatus.PROCESSING,
+            ProcessExecutionStatus.INTERRUPTED,
+            now.minus(Duration.ofMinutes(30)),
+            "queue.stale.callback_lost");
+    }
+}
+----
+
+Pair with `countByStatus` to emit metrics; a sustained queue of `CREATED` rows signals the dispatcher is down, a sustained queue of `PROCESSING` rows signals the callback channel is broken.
+
+=== Pattern 5 — `ProcessEntity` as a domain marker
+
+The example project's `Participant` is a production `ProcessEntity`:
+
+[source,java]
+----
+include::{sourcedir}/participant/entity/Participant.java[tags=class]
+----
+
+Key points:
+
+- Implements `ProcessEntity` (marker) plus `HasPendingDecisions` (UI contract — see <<launchpad>>).
+- Also wears `DocusignSigner`, `HasMetric`, and the standard audit interfaces — the entity accretes capabilities, each adding a pipeline.
+- `getPrimaryId()` (from `FeaturedSubject`) is the external-system correlation id (SSN, VIN, tax id) the BPMN engine uses to fetch data.
+
+Never make a transient / DTO class a `ProcessEntity` — the executions link by `ownerId = <entity.id>`, which has to survive the lifetime of the slowest possible run.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Keep `ProcessEntity` implementations persistent** — `ProcessExecution.ownerId` is just a UUID; if the entity disappears, your history / launchpad wiring goes stale silently
+* {ok} **Use `DecisionFactValue` as a `CustomEnum`** registered in a `@Configuration` — new fact outcomes land without a schema migration
+* {ok} **Always filter repository reads by `ProcessExecutionMode.REAL`** in production aggregations — test runs leak into dashboards if you don't
+* {ok} **Treat `ProcessSpecification` as a read-mostly reference** — never write to `processDefinitionId` / `version` / `key` after sync; only `status` and `name` are user-editable
+* {ok} **Handle the empty-details case** in the fact UI — facts can legitimately exist without a `DecisionFactDetails` row when a process emits a new code before it's been described
+* {ok} **Use `FixedDecisionFact.alert(...)` / `.warning(...)` / `.info(...)` factories** rather than the all-args constructor — they enforce the metadata coupling (ALERT needs DeclineReason, WARNING needs department + schema)
+* {ok} **Wire a scheduled stale-sweep** (`markStaleProcesses`) for both `CREATED` and `PROCESSING` — uncleaned queue rows never become consistent on their own
+* {ok} **Let `ProcessDefinitionStatus` transitions go through the action controllers** — `SimpleActionController.when(...).then(...)` performs authorization + audit tagging; repository-level status writes bypass both
+* {ok} **Listen to `DecisionFactDetailsChangeEvent` from notification-routing code only** — it fires on every fact-details save; treating it as a "fact was emitted" signal is wrong
+* {ok} **Correlate `ProcessExecution.processInstanceId` with external logs** — it's the same UUID the engine uses; grep friendly
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Mutating `ProcessExecutionResult.decisionFacts` outside the BPMN run** — the list is cascaded on save, but adding rows by hand skips the engine's idempotency tracking and double-counts facts
+* {bad} **Using `DecisionFact` to store more than code + value** — extending the entity with extra columns breaks the runtime emission path (the engine only populates `code` and `value`). Put structural metadata on `FixedDecisionFact` or on a new entity.
+* {bad} **Reading `ProcessExecution.processExecutionResult.getValues()` for payloads larger than 4 KB** — `TypedValue.rawContent` is `VARCHAR(4000)`; oversize data silently truncates or throws depending on DB
+* {bad} **Writing `ProcessSpecification` rows directly from application code** — always go through `ProcessDeploymentService.create(...)`. Manual inserts skip the PENDING default and the unique-constraint retry logic
+* {bad} **Using `@Enumerated(EnumType.ORDINAL)` on the `mode` column** — the repository's native query `mode = 1` pins the ordinal; changing the enum order silently swaps REAL and TEST in queue-health dashboards
+* {bad} **Bulk-deleting `DecisionFactDetails` via SQL** — skips `DecisionFactDetailsChangeEvent`; notification routing keeps stale entries until the next restart
+* {bad} **Calling `ProcessExecutionViewService.getVariables(...)` from a non-admin module** — the service is `@ConditionalOnProperty("process.engine.url")`; in modules without that property it's not registered, and autowiring will fail at startup
+* {bad} **Confusing `ProcessExecution.processType` with `ProcessSpecification.key`** — both are identifier-like strings, but `processType` is a `DecisionProcessType` enum name (Java-side taxonomy) and `key` is the BPMN-side definition key. They're not interchangeable
+* {bad} **Using `DecisionFactService.delete(code)` to retire a fact code** — it deletes only the details; `DecisionFact` rows with that code remain, and `DecisionFactDTOMapper` silently falls back to `description = null`. Intentional, but frequently misread as "delete the fact"
+* {bad} **Fetching `ProcessExecution` by owner without mode segregation in an admin metric** — the test tab's latest-execution grouping works because of `findByProcessSpecificationId(..., TEST)`; copying that pattern to a production context without changing the mode inverts the meaning
+* {bad} **Skipping the PENDING → PAST transition** by writing `ProcessDefinitionStatus.PAST` directly — there is no `ACTIVE → PAST` action precisely because disabling first surfaces in the audit trail as an explicit operator decision
+
+== Production Checklist
+
+[.unstyled]
+* {todo} Every `ProcessEntity` implementation is an `@Audited` persistent entity with a stable UUID id
+* {todo} `DecisionFactValue` and `DecisionMakerType` constants live in a `@Configuration` class loaded at startup; the BPMN engine only emits names from this set
+* {todo} `DecisionFactDetails` rows exist for every fact code the business cares about (missing rows are allowed but mean `description` shows blank in the UI)
+* {todo} `ProcessDeploymentService` bean is configured — either `FlowableProcessDeploymentService` or `WorkflowProcessDeploymentService`, not both
+* {todo} Admin role has access to `/process-definition/sync-definitions` so operators can pull new versions without a redeploy
+* {todo} A scheduled job calls `ProcessExecutionRepository.markStaleProcesses(...)` for both `CREATED → INTERRUPTED` and `PROCESSING → INTERRUPTED` with sensible thresholds
+* {todo} `countByStatus(CREATED)` and `countByStatus(PROCESSING)` are exported as metrics and alert when they exceed steady-state
+* {todo} `anyLastFailedExecution(ownerId)` is surfaced on the launchpad (<<launchpad>>) so operators see failing subjects at login
+* {todo} The `ExampleDataProcessor` (or equivalent) feeding BPMN variables respects the `TypedValue` 4 KB limit; large payloads go through the storage module (<<storage>>)
+* {todo} `process.engine.url` is set in every admin module and **not** set in servicing / headless modules (to avoid loading `ProcessExecutionViewService` in the wrong context)
+* {todo} `DecisionFactDetailsChangeEvent` has at least one consumer (typically the notifications module); un-consumed, fact-details changes won't propagate
+* {todo} `ProcessSpecification` lifecycle actions are wired to the admin UI buttons with `SimpleActionController.when(...)` predicates matching the enum rules
+* {todo} `ProcessExecutionViewService` REST calls have a timeout configured — the default `RestTemplate` can hang indefinitely on engine outages
+* {todo} History suppliers consuming executions filter by `status == COMPLETED`; in-flight / failed runs stay off the user-facing timeline
+* {todo} A blue/green rollout policy is documented: sync → test → enable v4, then disable → past v3, never the reverse order
+
+---
+
+**Related:** <<workflow-integration>>, <<entity-module-sdk-reference-hierarchy>>, <<audit-module-sdk-reference-internals>>, <<entity-actions>>, <<form-classes-setup-and-usage>>, <<list-filters-annotation-driven-jpa-query-dsl>>, <<launchpad>>, <<notifications>>, <<validation-search>>
+
+**Next:** <<workflow-integration>>, <<launchpad>>

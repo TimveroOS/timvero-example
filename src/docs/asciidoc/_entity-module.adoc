@@ -1,0 +1,1081 @@
+[[entity-module]]
+[[entity-module-sdk-reference-hierarchy]]
+= Entity Base Classes — SDK reference & hierarchy
+
+:sourcedir: ../../main/java/com/timvero/example/admin
+
+The entity module (`com.timvero.base.entity`) is the foundation every persistent class in a Pumpkin project inherits from: base persistable superclasses, audit-field mixins, soft-delete support, the `Auditor` entity, the default repository base with pessimistic-lock access, and global JPA converters for `CurrencyUnit` and `Period`. This guide explains the hierarchy, what each class adds, and which one to pick for a given entity.
+
+== What You Need to Know
+
+**Two parallel hierarchies** descend from Spring Data's `Persistable<PK>`:
+
+[cols="1,3", options="header"]
+|===
+|Branch |Meaning
+
+|`BasePersistable<PK>` → `BaseEntity<ID>` → `UndeletableEntity<ID>`
+|Generic ID type. Use for non-UUID identifiers (typically `Long` for transaction tables, `String` for natural keys).
+
+|`UUIDPersistable` → `AbstractAuditable` / `AbstractOwnable` / `Auditor`
+|Fixed UUID id via `@UUIDPersistableGen`. Used by the vast majority of business entities in a Pumpkin project.
+|===
+
+They are **not interchangeable** — `AbstractAuditable` is NOT `BaseEntity<UUID>`. Both add the same audit fields, but the class hierarchies are separate.
+
+Key characteristics:
+
+- **`AbstractAuditable` has no generic parameter** — despite examples in older docs that write `AbstractAuditable<UUID>`. The ID is fixed to `UUID` by the parent `UUIDPersistable`.
+- **Spring Data JPA auditing** powers `createdAt` / `updatedAt` / `createdBy` / `updatedBy` through `AuditingEntityListener` and an application-provided `AuditorAware<Auditor>` bean.
+- **UUID generation is assigned-or-auto** — `UUIDPersistableGenerator` overrides Hibernate's default to `allowAssignedIdentifiers() = true`, so you can either pre-set the id yourself or let Hibernate generate one.
+- **Soft delete is opt-in via `UndeletableEntity`** — it adds `active` and the `@Undeletable(propertyName = "active")` marker so framework code can discover the field reflectively.
+- **JPA converters are global** — `CurrencyUnitConverter` and `PeriodConverter` both use `@Converter(autoApply = true)`; any `CurrencyUnit` / `Period` field anywhere is converted automatically.
+
+== Class Hierarchy
+
+[source]
+----
+ org.springframework.data.domain.Persistable<PK>    (Spring Data interface)
+        │
+        │
+ BasePersistable<PK>          @MappedSuperclass
+        │    @Id @GeneratedValue IDENTITY + equals/hashCode + isNew
+        │    @CompositeTypeRegistration(MonetaryAmount → MonetaryAmountType)
+        │
+        ├── BaseEntity<ID>                    @MappedSuperclass
+        │         │    + createdAt / updatedAt / createdBy / updatedBy
+        │         │
+        │         └── UndeletableEntity<ID>   @MappedSuperclass
+        │                   + active (boolean, default true)
+        │                   @Undeletable(propertyName = "active")
+        │
+        └── ImmutableEntity<ID>               DEPRECATED — use @Immutable directly
+
+ UUIDPersistable              @MappedSuperclass
+        │    @Id @UUIDPersistableGen → UUIDPersistableGenerator
+        │    (allowAssignedIdentifiers = true)
+        │
+        ├── AbstractAuditable                 @MappedSuperclass + @EntityListeners(AuditingEntityListener)
+        │         + createdAt / updatedAt / createdBy / updatedBy
+        │         (NO generic — id is always UUID)
+        │
+        ├── AbstractOwnable                   @MappedSuperclass + @EntityListeners(AuditingEntityListener)
+        │         + createdAt / createdBy + ownerId (UUID)
+        │         (no updatedAt/updatedBy — ownable entities are append-only)
+        │
+        └── Auditor                           @Entity @Table("auditor")
+                 @Inheritance(SINGLE_TABLE), @DiscriminatorColumn("auditor_type")
+                 @Cache(READ_ONLY), @NotTrackable
+                 abstract getName() / getEntity()
+                 └── UserAccountAuditor       @DiscriminatorValue("USER")   — SDK-provided
+----
+
+=== Decision Guide — Which Base To Extend
+
+[cols="2,3", options="header"]
+|===
+|Requirement |Extend
+
+|UUID id + automatic audit fields (the common case)
+|`AbstractAuditable`
+
+|UUID id, no audit fields (immutable reference data)
+|`UUIDPersistable`
+
+|Long/String/custom id + audit fields (legacy tables, high-volume transactions)
+|`BaseEntity<ID>`
+
+|Soft delete required (toggle `active` instead of `DELETE`)
+|`UndeletableEntity<ID>`
+
+|Append-only log with owner attribution (audit events, history records)
+|`AbstractOwnable`
+
+|Fully custom id strategy (composite key, assigned UUID without generator)
+|`BasePersistable<PK>` directly
+
+|New `Auditor` subclass (system accounts, integrations, batch jobs)
+|`Auditor`
+|===
+
+== Foundation: BasePersistable & UUIDPersistable
+
+=== BasePersistable<PK>
+
+The root `@MappedSuperclass` for non-UUID entities. Provides id + identity semantics:
+
+[source,java]
+----
+@MappedSuperclass
+@CompositeTypeRegistration(embeddableClass = MonetaryAmount.class, userType = MonetaryAmountType.class)   // <1>
+public abstract class BasePersistable<PK extends Serializable> implements Persistable<PK> {
+
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)                                              // <2>
+    private @Nullable PK id;
+
+    @Override public @Nullable PK getId() { return id; }
+    protected void setId(@Nullable PK id) { this.id = id; }
+
+    @Transient                                                                                            // <3>
+    @Override public boolean isNew() { return null == getId(); }
+
+    @Override public boolean equals(Object obj) { /* ProxyUtils.getUserClass — see below */ }             // <4>
+    @Override public int hashCode() { /* id-based */ }
+}
+----
+<1> Registers `MonetaryAmountType` as the Hibernate composite type for `javax.money.MonetaryAmount` **globally** — every entity in the application can declare a `MonetaryAmount` field without per-entity `@Type` annotations.
+<2> `IDENTITY` generation — database assigns the id. For Long/auto-increment this is the common case. Override in subclasses if you need a different strategy.
+<3> `isNew()` is `@Transient` because Spring Data `Persistable` requires a setter that JPA doesn't have; marking the method transient tells JPA providers to skip the reflection-based check.
+<4> `equals()` uses `ProxyUtils.getUserClass(obj)` to handle Hibernate-proxied objects correctly — comparing `SomeEntity` to its `SomeEntity$HibernateProxy$xxx` doesn't break equality.
+
+=== UUIDPersistable
+
+Fixed-UUID variant — the foundation for every UUID-based entity:
+
+[source,java]
+----
+@MappedSuperclass
+public abstract class UUIDPersistable implements Persistable<UUID> {
+
+    @Id
+    @UUIDPersistableGen
+    private UUID id;
+
+    @Override public UUID getId() { return id; }
+    protected void setId(UUID id) { this.id = id; }
+
+    @Transient
+    @Override public boolean isNew() { return id == null; }
+
+    /* equals/hashCode same pattern as BasePersistable — class comparison via ProxyUtils */
+}
+----
+
+Real-world example — used directly when audit fields aren't needed:
+
+[source,java]
+----
+include::{sourcedir}/scheduled/ExampleCreditCondition.java[lines=22..25]
+----
+
+`ExampleCreditCondition` is marked `@Immutable` — once created, it never changes (it captures frozen offer terms). No need for `updatedAt` / `updatedBy`, so `UUIDPersistable` is a better fit than `AbstractAuditable`.
+
+=== UUIDPersistableGen & UUIDPersistableGenerator
+
+Custom Hibernate id-generator wrapper. The annotation is applied to the `id` field in `UUIDPersistable`:
+
+[source,java]
+----
+@IdGeneratorType(UUIDPersistableGenerator.class)
+@Retention(RUNTIME)
+@Target({FIELD, METHOD})
+public @interface UUIDPersistableGen {
+    Style style() default Style.AUTO;                                              // <1>
+    Class<? extends UuidValueGenerator> algorithm() default UuidValueGenerator.class;
+}
+----
+<1> `Style.AUTO` resolves to the Hibernate default — typically version-4 random UUIDs. Can be overridden at the field level if a specific UUID style is required (e.g., `Style.TIME` for v1, `Style.RANDOM` for v4).
+
+The generator itself is a subclass of Hibernate's standard `UuidGenerator` with one important override:
+
+[source,java]
+----
+public class UUIDPersistableGenerator extends org.hibernate.id.uuid.UuidGenerator {
+
+    public UUIDPersistableGenerator(UUIDPersistableGen config, Member idMember,
+                                    CustomIdGeneratorCreationContext creationContext) {
+        super(convert(config), idMember, creationContext);
+    }
+
+    @Override
+    public boolean allowAssignedIdentifiers() {
+        return true;                                                                // <1>
+    }
+}
+----
+<1> Returning `true` means Hibernate will **respect a pre-assigned id** rather than generating a new one. Useful for imports, seed data, and tests where the id must be deterministic. If the id is `null`, the standard generator runs.
+
+== Auditable Entities
+
+=== AbstractAuditable — The UUID + Audit Default
+
+The most common base class. Extends `UUIDPersistable` and adds four audit fields:
+
+[source,java]
+----
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public class AbstractAuditable extends UUIDPersistable {
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    @CreatedDate
+    private Instant createdAt;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "created_by", nullable = true, updatable = false)
+    @CreatedBy
+    private Auditor createdBy;
+
+    @Column(name = "updated_at", nullable = false)
+    @LastModifiedDate
+    private Instant updatedAt;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "updated_by", nullable = true)
+    @LastModifiedBy
+    private Auditor updatedBy;
+}
+----
+
+Real-world usage:
+
+[source,java]
+----
+include::{sourcedir}/participant/entity/Participant.java[lines=44..47]
+----
+
+[source,java]
+----
+include::{sourcedir}/client/entity/Client.java[lines=18..22]
+----
+
+[source,java]
+----
+include::{sourcedir}/application/entity/Application.java[lines=33..36]
+----
+
+WARNING: **Don't write `AbstractAuditable<UUID>`.** The class has no generic parameter. Examples in some older docs show `extends AbstractAuditable<UUID>` — this compiles only because Java silently accepts unused type arguments on non-generic classes, but it's misleading and a rename could break it later. Real code in `timvero-example` all writes `extends AbstractAuditable` without generics (see `Participant`, `Client`, `Application` above).
+
+=== BaseEntity<ID> — Non-UUID Audit
+
+Same audit fields as `AbstractAuditable`, but the id type is a generic parameter:
+
+[source,java]
+----
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public abstract class BaseEntity<ID extends Serializable> extends BasePersistable<ID> {
+    /* same 4 audit fields as AbstractAuditable */
+}
+----
+
+When to use:
+
+- Legacy tables with `Long` primary keys
+- High-volume transaction tables where UUIDs bloat indexes
+- Tables joining external systems that dictate the id type
+
+Not used directly in `timvero-example`, but `UndeletableEntity<Long>` (below) descends from it.
+
+=== Spring Data Auditing Machinery
+
+The four audit fields work via Spring Data JPA's auditing machinery:
+
+[source]
+----
+  @Transactional write path
+           │
+           ▼
+  AuditingEntityListener.touchForCreate / .touchForUpdate
+           │
+           │  @CreatedDate / @LastModifiedDate → Instant.now()
+           │  @CreatedBy / @LastModifiedBy     → currentAuditor()
+           │
+           ▼
+  AuditorAware<Auditor> bean   (you provide this)
+           │
+           │  typically reads SecurityContextHolder.getContext()
+           │  .getAuthentication().getPrincipal() → AuditorUser
+           │  → UserAccountAuditor
+           │
+           ▼
+  createdBy / updatedBy fields populated
+----
+
+Requirements for audit fields to populate correctly:
+
+- `@EnableJpaAuditing` on a `@Configuration` class
+- A `@Bean` of type `AuditorAware<Auditor>` that resolves the current user
+- An authenticated `AuditorUser` in the `SecurityContext` at the moment of save/update
+
+In background jobs, schedulers, and tests, you must either populate `SecurityContext` explicitly or accept that `createdBy` / `updatedBy` will be `null`.
+
+== Auditor Entity
+
+=== Auditor — Abstract Superclass
+
+The polymorphic entity all audit references point to:
+
+[source,java]
+----
+@Entity
+@Table(name = "auditor")
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@Cache(usage = CacheConcurrencyStrategy.READ_ONLY)              // <1>
+@DiscriminatorColumn(name = "auditor_type", discriminatorType = DiscriminatorType.STRING)
+@NotTrackable                                                    // <2>
+public abstract class Auditor extends UUIDPersistable {
+
+    @Column(name = "auditor_type", insertable = false, updatable = false)
+    private String type;
+
+    public String getType() { return type; }
+
+    public abstract String getName();                            // <3>
+    public abstract Persistable<?> getEntity();                  // <4>
+}
+----
+<1> `READ_ONLY` L2 cache — auditors are effectively immutable; caching hits every `@ManyToOne Auditor createdBy` lookup
+<2> `@NotTrackable` prevents the reload/tracking framework from monitoring this entity — auditors don't participate in change tracking
+<3> Display name for UI (e.g., "John Doe", "Scheduler", "Import Job")
+<4> Underlying source object — `UserAccount` for users, potentially `SystemAgent` for automated writes
+
+=== SDK-Provided Subclass: UserAccountAuditor
+
+[source,java]
+----
+@Entity
+@DiscriminatorValue(value = "USER")
+public class UserAccountAuditor extends Auditor {
+
+    @OneToOne(fetch = FetchType.LAZY)
+    @Fetch(FetchMode.SELECT)
+    @JoinColumn(name = "user_account_id", updatable = false, unique = true)
+    private UserAccount userAccount;
+
+    public UserAccountAuditor(UserAccount userAccount) {
+        super();
+        this.userAccount = userAccount;
+    }
+
+    @Override public String getName() { return getUserAccount().getFullName(); }
+    @Override public Persistable<?> getEntity() { return getUserAccount(); }
+}
+----
+
+This is the default — every logged-in user's writes carry a `UserAccountAuditor` in `createdBy` / `updatedBy`.
+
+=== AuditorRepository
+
+[source,java]
+----
+public interface AuditorRepository extends JpaRepository<Auditor, UUID> {}
+----
+
+Minimal — exists only to give Spring Data a typed repository for `Auditor`. No custom methods; `JpaRepository.findById(UUID)` is enough for most use cases.
+
+=== Custom Auditor Types — When to Add One
+
+Extend `Auditor` with a new `@DiscriminatorValue` when writes originate from a non-user source that deserves attribution:
+
+- **System schedulers** — a `SchedulerAuditor` for cron jobs
+- **External integrations** — a `WebhookAuditor` for incoming webhook-triggered writes
+- **Data migrations** — a `MigrationAuditor` for Flyway-driven changes
+
+Without a subclass, such writes either produce `createdBy = null` or borrow whatever user happens to be in `SecurityContext`, which is misleading.
+
+== Soft Delete: Undeletable / UndeletableEntity
+
+=== @Undeletable Annotation
+
+A class-level marker that declares which boolean field represents "alive":
+
+[source,java]
+----
+@Target({TYPE})
+@Retention(RUNTIME)
+@Inherited
+public @interface Undeletable {
+    String propertyName();
+}
+----
+
+Framework code reads this annotation (via reflection) to discover the soft-delete flag without hard-coding "active". This enables consistent handling across the SDK — UI filters, permission checks, and `@SQLRestriction` defaults all use it.
+
+=== UndeletableEntity<ID>
+
+Ready-made soft-delete base. Extends `BaseEntity<ID>`:
+
+[source,java]
+----
+@MappedSuperclass
+@Undeletable(propertyName = UndeletableEntity_.ACTIVE)
+public abstract class UndeletableEntity<ID extends Serializable> extends BaseEntity<ID> {
+
+    @Column(name = "active", nullable = false)
+    private boolean active = true;
+
+    public boolean isActive() { return active; }
+
+    // made protected because of unwanted implementation of soft-delete by Hibernate
+    protected void setActive(boolean active) {                     // <1>
+        this.active = active;
+    }
+
+    public void setIdNull() {                                       // <2>
+        this.setId(null);
+    }
+}
+----
+<1> `setActive` is **intentionally protected** — if it were public, callers could casually flip the flag from anywhere, and Hibernate event listeners for soft-delete would fire unexpectedly. Instead, subclasses expose domain-specific methods (e.g., `Additive.deactivate()`).
+<2> `setIdNull()` is used during the "copy" pattern — you copy an existing entity, clear its id, and save as a new record.
+
+=== Interaction With @SQLRestriction
+
+The soft-delete flag is only useful if collection mappings exclude inactive children. Pattern from the SDK:
+
+[source,java]
+----
+@OneToMany(mappedBy = CreditProductAdditive_.PRODUCT, fetch = FetchType.LAZY)
+@SQLRestriction("active = true")
+private List<CreditProductAdditive> additives;
+----
+
+The parent's `product.getAdditives()` returns only `active = true` rows. Direct Envers queries and explicit repository methods can still see inactive rows — `@SQLRestriction` applies only to mapped collections.
+
+== HistoryEntity — Immutable History Pattern
+
+`HistoryEntity` (from `com.timvero.structure.additional.history`) is a third "history" pattern in the SDK, distinct from the other two:
+
+[cols="2,2,3", options="header"]
+|===
+|Pattern |Class |Mechanic
+
+|**Soft delete**
+|`UndeletableEntity<ID>` (above)
+|`active` flag; row stays, `UPDATE active = false` on delete
+
+|**Audit trail**
+|`EntityNote` + `EntityNoteChange` (see <<has-notes>>)
+|Each edit appends a new row to a **separate** change-history table; current text on the entity
+
+|**Immutable history**
+|`HistoryEntity`
+|The entity itself is the history — every version is a row sharing one `lineage_id`; only one is `active` at a time
+|===
+
+Use `HistoryEntity` when you need **version-by-version auditable editing** and can tolerate an INSERT per edit (product templates, rate cards, contracts — things you refer back to by version).
+
+=== The Entity
+
+[source,java]
+----
+@MappedSuperclass
+@Undeletable(propertyName = HistoryEntity_.ACTIVE)
+public class HistoryEntity extends AbstractAuditable {
+
+    @Column(name = "active", nullable = false)
+    private boolean active = true;                                      // <1>
+
+    @Column(name = "lineage_id", updatable = false)
+    private UUID lineageId;                                             // <2>
+
+    protected void setActive(boolean active) { this.active = active; }  // <3>
+}
+----
+<1> Only one row per `lineageId` should be active at a time; `HistoryEntityFormService` maintains the invariant on every save
+<2> Shared UUID across all versions of the same logical record. Immutable after insert (`updatable = false`) — the row's own `id` changes, the `lineageId` doesn't
+<3> `protected` to prevent accidental flips — go through the service's `save` / `activate`
+
+Subclass it when your business entity needs versioning:
+
+[source,java]
+----
+@Entity
+@Table(name = "interest_rate_card")
+public class InterestRateCard extends HistoryEntity {
+    private CurrencyUnit currency;
+    private BigDecimal baseRate;
+    private String formula;
+    // ... business fields
+}
+----
+
+Each save produces a new row in `interest_rate_card`; the service wires up lineage.
+
+=== HistoryEntityFormService — Save Flow
+
+`HistoryEntityFormService<E extends HistoryEntity, F>` extends `EntityFormService<E, F, UUID>` and overrides `save`:
+
+[source]
+----
+save(id, form) {
+    if (id == null) {
+        lineageId = UUID.randomUUID()           // brand-new logical entity
+    } else {
+        oldEntity = getSync(id)                 // PESSIMISTIC_WRITE lock
+        lineageId = oldEntity.getLineageId()
+        inactivateOld(lineageId)                // batch UPDATE: all rows with this lineage → active=false
+    }
+    entity = mapper.createEntity(form)          // always creates a NEW row
+    entity.setLineageId(lineageId)
+    entity = saveEntity(entity)                 // persist
+    return entity.getId()                       // new entity id (not lineageId)
+}
+----
+
+Key consequences:
+
+- **No UPDATE of existing rows for business fields** — edits always INSERT. The entity `id` returned from `save` differs between calls; clients holding an old id see a stale (inactive) version
+- **Exactly one active row per lineage after save** — `inactivateOld` batch-updates all rows in the lineage to `active=false`, then the new row is inserted `active=true`
+- **Pessimistic lock on the old version** — `LockUtils.lock(id, PESSIMISTIC_WRITE)` prevents concurrent saves from producing two active versions
+
+=== Reactivating a Past Version
+
+`HistoryEntityFormService.activate(UUID id)` makes any past version active again:
+
+[source,java]
+----
+@Transactional
+public void activate(UUID id) {
+    E entity = getSync(id);
+    UUID lineageId = entity.getLineageId();
+    inactivateOld(lineageId);              // all off
+    activate(id, lineageId);               // then flip this one on
+}
+----
+
+Use for rollbacks and "restore v3 of this rate card" flows. The row isn't re-inserted; its own `active` flag is flipped back to `true` while everything else in the lineage goes to `false`.
+
+=== Querying All Versions
+
+`findAllVersions(UUID lineageId)` returns all rows (active + inactive) sharing a lineage — for history UIs, compliance exports, or diff views:
+
+[source,java]
+----
+List<InterestRateCard> versions = formService.findAllVersions(lineageId);
+// returns all versions chronologically (no explicit order — add if needed)
+versions.sort(Comparator.comparing(HistoryEntity::getCreatedAt));
+----
+
+=== When to Use vs Alternatives
+
+[cols="2,3,3", options="header"]
+|===
+|Scenario |Pattern |Why
+
+|Deletions must be reversible, no version history needed
+|`UndeletableEntity`
+|Simpler — one row per entity
+
+|Comments / notes with audit trail of who wrote what
+|`EntityNote` + `EntityNoteChange`
+|Audit text changes without touching the business entity
+
+|Business entity with version-by-version editing, rollback, diff
+|`HistoryEntity`
+|Every version is a first-class row, referable forever
+
+|Append-only log (events, transactions)
+|`AbstractOwnable`
+|No "edit" semantics at all
+|===
+
+Common trap: using `HistoryEntity` for high-churn entities. Every save INSERTs; a row edited 1000 times produces 1000 rows. Fine for product configs / rate cards (dozens of edits per lifetime); questionable for user-profile fields updated every login.
+
+== Ownable Entities: AbstractOwnable
+
+Similar to `AbstractAuditable` but purpose-built for append-only records:
+
+[source,java]
+----
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public class AbstractOwnable extends UUIDPersistable {
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    @CreatedDate
+    private Instant createdAt;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "created_by", nullable = true, updatable = false)
+    @CreatedBy
+    private Auditor createdBy;
+
+    @Column(nullable = false)
+    private UUID ownerId;                                           // <1>
+
+    protected AbstractOwnable() {}
+    protected AbstractOwnable(UUID ownerId) { this.ownerId = ownerId; }
+}
+----
+<1> `ownerId` is the UUID of the entity this record belongs to — a participant, credit, application. Denormalized on purpose: queries like "all events for participant X" hit a direct index rather than a join.
+
+When to use:
+
+- **Audit event logs** — entries should never be retroactively updated
+- **Notifications / messages** — once sent, immutable
+- **History records** — append-only by design
+
+Fundamental difference from `AbstractAuditable`: no `updatedAt` / `updatedBy`. If you find yourself "updating" an `AbstractOwnable` row, you're using the wrong base class.
+
+== Repositories
+
+=== PumpkinBaseRepository<T, ID>
+
+The framework's repository base — extends Spring Data's `SimpleJpaRepository` with write-locking and streaming:
+
+[source,java]
+----
+public class PumpkinBaseRepository<T, ID> extends SimpleJpaRepository<T, ID>
+        implements SynchronousAccessRepository<T, ID> {
+
+    private final EntityManager em;
+    private final Class<T> entityClass;
+
+    @Override
+    public T getSync(ID id) {
+        T entity = LockUtils.lock(id, entityClass, LockModeType.PESSIMISTIC_WRITE, em);   // <1>
+        if (entity == null) {
+            throw new EntityNotFoundException("Entity of class " + entityClass + " with id " + id + " is not found");
+        }
+        return entity;
+    }
+
+    public Stream<T> streamAll(Specification<T> specification, Sort sort) {              // <2>
+        return getQuery(specification, sort).getResultStream();
+    }
+}
+----
+<1> `PESSIMISTIC_WRITE` — a row-level exclusive lock for the duration of the transaction. Competing transactions block until this one commits. Essential for write paths that read-then-modify, where lost-update bugs are unacceptable (payment allocation, credit balance updates).
+<2> `streamAll` returns a streaming JDBC cursor — use it for large result sets where loading everything into memory would OOM. Must be consumed inside the same transaction that started the stream.
+
+=== SynchronousAccessRepository<T, ID>
+
+A single-method marker interface that application repositories extend to expose `getSync`:
+
+[source,java]
+----
+public interface SynchronousAccessRepository<T, ID> {
+    T getSync(ID id);
+}
+----
+
+Real usage — three repositories in `timvero-example` implement it:
+
+[source,java]
+----
+include::{sourcedir}/participant/entity/ParticipantRepository.java[lines=8..12]
+----
+
+[source,java]
+----
+include::{sourcedir}/transaction/entity/BorrowerTransactionRepository.java[lines=11..13]
+----
+
+Client-side calls look like:
+
+[source,java]
+----
+@Transactional
+public void updateStatus(UUID participantId, ParticipantStatus status) {
+    Participant p = repository.getSync(participantId);    // <1>
+    p.setStatus(status);
+    // no explicit save() — Hibernate flushes on commit
+}
+----
+<1> Other transactions trying to modify the same participant wait until this one commits. Prevents two concurrent updates from silently overwriting each other.
+
+=== Wiring PumpkinBaseRepository As the Default
+
+To make `PumpkinBaseRepository` the base for all Spring Data repositories in your project:
+
+[source,java]
+----
+@Configuration
+@EnableJpaRepositories(
+    basePackages = "com.timvero.example",
+    repositoryBaseClass = PumpkinBaseRepository.class     // <1>
+)
+public class JpaConfig {}
+----
+<1> Every repository interface automatically gains `streamAll()` and satisfies `SynchronousAccessRepository` without explicitly declaring the marker interface — but the marker is still recommended because it documents the intent on the repository interface.
+
+== ImmutableEntity — Deprecated
+
+[source,java]
+----
+@Immutable
+@Deprecated(forRemoval = true)
+public abstract class ImmutableEntity<ID extends Serializable> extends BasePersistable<ID> {}
+----
+
+Do not use in new code. Instead, annotate your entity class directly:
+
+[source,java]
+----
+@Entity
+@Immutable                   // from org.hibernate.annotations
+public class ExampleCreditCondition extends UUIDPersistable implements CreditCondition { /* ... */ }
+----
+
+The inline annotation is cleaner and doesn't tie the entity to a forced superclass. This section exists only because the class is still in the SDK — existing code may reference it until full removal.
+
+== CustomEnum — Dynamic Enum Pattern
+
+The SDK's `com.timvero.ground.entity.enums.CustomEnum<E>` is a drop-in replacement for Java's standard `enum` when you need to **add values without a schema or code redeploy**. Used throughout the SDK and domain code — `CreditType`, `EntityDocumentType`, `SignableDocumentType`, `ProcuringType`, and many others.
+
+=== When to Use CustomEnum vs Standard Enum
+
+[cols="2,2,2", options="header"]
+|===
+|Need |Standard `enum` |`CustomEnum<E>`
+
+|Fixed set of values known at compile time
+|{ok} Use standard enum
+|{bad} Overkill
+
+|New values added at runtime / configuration
+|{bad} Impossible
+|{ok} Just create new instance
+
+|Values stored in DB as string
+|{ok} Works with `@Enumerated(STRING)`
+|{ok} Works with `CustomEnumType` / `CustomEnumConverter`
+
+|Exhaustive `switch` required
+|{ok} Compile-time check
+|{bad} Values can be added outside your control
+
+|Project-specific extensions to SDK enum
+|{bad} Can't extend `enum`
+|{ok} Subclass or add values to parent class
+|===
+
+A `CustomEnum` instance is an **object** (not a language-level enum), stored in a per-class registry. The SDK's runtime lookup (`CustomEnum.values(Class)` / `valueOf`) returns all registered instances.
+
+=== CustomEnum<E> — The Base Class
+
+[source,java]
+----
+@JsonDeserialize(using = CustomEnumDeserializer.class)
+public abstract class CustomEnum<E extends CustomEnum<E>> implements Serializable {
+
+    private final String name;
+
+    protected CustomEnum(String name) {
+        this.name = name;
+        addValue(this, this.getClass());              // <1>
+    }
+
+    @JsonValue
+    public String name() { return name; }
+
+    @SafeVarargs
+    public final boolean in(E... values) { /* varargs identity match */ }     // <2>
+
+    public static <T extends CustomEnum<T>> T[] values(Class<T> clazz) { /* ... */ }
+    public static <T extends CustomEnum<T>> T valueOf(Class<T> clazz, String name) { /* ... */ }
+
+    // equals/hashCode based on name only                                    // <3>
+}
+----
+<1> **Auto-registration** — constructor adds the new instance to a static `ConcurrentHashMap` keyed by the class (and every parent class up the CustomEnum chain). This is why instances must be created at application startup, not lazily.
+<2> `.in(X, Y, Z)` — convenient identity check (`status.in(ACTIVE, PENDING)`). Uses `==` reference equality; safe because each value is a singleton in its class's registry.
+<3> `equals` compares by `name` string — two instances with the same name from the same class are equal. Keeps JPA dirty-checking and cache behavior sane.
+
+=== Defining CustomEnum Values
+
+The critical pattern: **define constants in a `@Configuration` class**.
+
+[source,java]
+----
+@Configuration
+public class DomainCreditTypes {
+    public static final CreditType PERSONAL     = new CreditType("PERSONAL");
+    public static final CreditType MORTGAGE     = new CreditType("MORTGAGE");
+    public static final CreditType AUTO         = new CreditType("AUTO");
+}
+----
+
+Why `@Configuration`:
+
+- Spring instantiates the class at startup → **triggers static-field initialization**
+- Each `new CreditType(...)` call hits the `CustomEnum` constructor → registers the value
+- Without Spring instantiation, static fields may never initialize (e.g., if the class is only referenced reflectively or via a string)
+
+WARNING: **Without `@Configuration` (or an equivalent eager-instantiated Spring bean), `CreditType.values(CreditType.class)` returns an empty array** — the class is never loaded, static initialization never runs. This is the single most common `CustomEnum` bug. Alternative triggers: `@Component` on the class, or referencing a constant directly from other `@Configuration` code at startup.
+
+=== CustomCoddedEnum — Adding Integer Codes
+
+Variant that pairs each value with a unique `int` code — useful when you need a compact DB representation or interop with legacy systems using numeric codes:
+
+[source,java]
+----
+public abstract class CustomCoddedEnum<E extends CustomCoddedEnum<E>>
+        extends CustomEnum<E> implements Codded {
+
+    protected CustomCoddedEnum(String name, int code) {
+        super(name);
+        if (!codes.computeIfAbsent(this.getClass(), c -> new HashSet<>()).add(code))
+            throw new IllegalArgumentException("Code '" + code + "' exists");   // <1>
+    }
+
+    @Override public int getCode() { return code; }
+}
+----
+<1> **Duplicate code throws at instantiation time** — the validation is at the registration level, so a bad duplicate in a `@Configuration` class crashes startup. Better than silent data corruption.
+
+The `Codded` interface (`int getCode()`) is defined separately so types other than `CustomEnum` can also declare codes.
+
+=== InEnum — `.in(...)` for Standard Enums
+
+`InEnum<T>` is a tiny interface that adds the same `.in(X, Y, Z)` convenience to standard Java enums:
+
+[source,java]
+----
+public enum SignatureStatus implements InEnum<SignatureStatus> {
+    GENERATION_FAILED, PENDING_SIGNATURE, REFUSE, SIGNED, REVOKE
+}
+
+// Usage:
+if (doc.getStatus().in(SignatureStatus.SIGNED, SignatureStatus.REFUSE)) { /* ... */ }
+----
+
+Purely syntactic sugar — the default method does a linear scan via `.equals()`. Use for expressive call sites; for hot paths, a `Set.of(...)` lookup is faster.
+
+=== Persistence & Serialization
+
+[cols="2,3", options="header"]
+|===
+|Class |Role
+
+|`CustomEnumConverter`
+|Spring `GenericConverter` — auto-registered via `@Component`. Converts `String ↔ CustomEnum` in request binding and `@Value` injection. Also used with `@ConfigurationPropertiesBinding` for `@ConfigurationProperties` classes that reference CustomEnum types.
+
+|`CustomEnumDeserializer`
+|Jackson deserializer. Context-aware via `ContextualDeserializer` — reads the target field's type from the Jackson context and calls `CustomEnum.valueOf(targetClass, name)`. Registered by `@JsonDeserialize` on `CustomEnum` itself — every subclass gets it automatically.
+
+|`CustomEnumType` (in `com.timvero.ground.hibernate.type`)
+|Hibernate `UserType` for persistence. Declare on a field with `@Type(CustomEnumType.class)`. See `EntityDocument.documentType` in <<document-management>> for a real usage.
+|===
+
+Example — persisting `CreditType` in an entity:
+
+[source,java]
+----
+@Entity
+public class ExampleCreditProduct {
+    @Column(name = "credit_type")
+    @Type(CustomEnumType.class)
+    private CreditType creditType;
+}
+----
+
+Example — deserializing from JSON payload:
+
+[source,json]
+----
+{ "creditType": "PERSONAL" }
+----
+
+Jackson calls `CustomEnumDeserializer`, which calls `CreditType.valueOf(CreditType.class, "PERSONAL")`, which looks up the registered constant. Fails with `IllegalArgumentException("No enum constant ...")` for unknown values — map to a 400 Bad Request in your exception handler.
+
+=== Best Practices for CustomEnum
+
+[.unstyled]
+* {ok} **Define values in a `@Configuration` class** — ensures Spring triggers static-initializer registration at startup
+* {ok} **Use `CustomEnum.values(Class)` and `valueOf(Class, name)`** — don't build parallel reflection-based lookups
+* {ok} **Mark value constants `public static final`** — instances are singletons and reference-stable
+* {ok} **Persist via `@Type(CustomEnumType.class)`** — cleaner than manual converters on every field
+* {ok} **Use `CustomCoddedEnum` when numeric codes matter** — e.g., interop with external systems, compact storage
+
+=== Anti-Patterns for CustomEnum
+
+[.unstyled]
+* {bad} **Defining values outside a Spring-managed class** — `values()` returns empty until the class is loaded; timing is unpredictable
+* {bad} **Creating `CustomEnum` instances dynamically from user input** — each instance auto-registers; user-controlled values become persistent pollution in the registry (and potentially a DoS vector)
+* {bad} **Mixing `@Enumerated(STRING)` with `CustomEnum`** — `@Enumerated` expects a Java `enum`; the entity won't even start up
+* {bad} **Using duplicate names within one CustomEnum subclass** — throws `IllegalArgumentException` at second registration
+* {bad} **Relying on exhaustive `switch`** — values can be added in other modules you don't control; use a default branch
+
+== JPA Converters
+
+=== CurrencyUnitConverter
+
+[source,java]
+----
+@Converter(autoApply = true)                                       // <1>
+public class CurrencyUnitConverter implements AttributeConverter<CurrencyUnit, String> {
+
+    @Override
+    public String convertToDatabaseColumn(CurrencyUnit attribute) {
+        return attribute != null ? attribute.getCurrencyCode() : null;
+    }
+
+    @Override
+    public CurrencyUnit convertToEntityAttribute(String dbData) {
+        return MonetaryUtil.getCurrency(dbData);
+    }
+}
+----
+<1> `autoApply = true` — every entity field typed as `javax.money.CurrencyUnit` is converted automatically. Database column type should be `VARCHAR(3)` (ISO 4217 code).
+
+Declare currency fields naturally, no per-field annotation needed:
+
+[source,java]
+----
+@Entity
+public class ExampleCreditProduct extends CreditProduct {
+    @Column(updatable = false)
+    private CurrencyUnit currency;     // converts to "USD", "EUR", etc.
+}
+----
+
+=== PeriodConverter
+
+[source,java]
+----
+@Converter(autoApply = true)
+public class PeriodConverter implements AttributeConverter<Period, String> {
+
+    @Override
+    public String convertToDatabaseColumn(Period attribute) {
+        return attribute != null ? attribute.toString() : null;      // <1>
+    }
+
+    @Override
+    public Period convertToEntityAttribute(String dbData) {
+        return Period.parse(dbData);
+    }
+}
+----
+<1> Uses ISO-8601 period format: `P30D` (30 days), `P1Y2M3D` (1 year, 2 months, 3 days). Parsing is strict — the string must be valid ISO-8601.
+
+=== MonetaryAmount Composite Type
+
+Not a `@Converter`, but part of the same global-mapping picture. Registered at `BasePersistable` via `@CompositeTypeRegistration`:
+
+[source,java]
+----
+@MappedSuperclass
+@CompositeTypeRegistration(embeddableClass = MonetaryAmount.class, userType = MonetaryAmountType.class)
+public abstract class BasePersistable<PK extends Serializable> { /* ... */ }
+----
+
+Because every entity descends from `BasePersistable` (directly or via `UUIDPersistable`'s sibling hierarchy... actually `UUIDPersistable` does **not** extend `BasePersistable`), the registration **does not** propagate to `UUIDPersistable` descendants automatically.
+
+[NOTE]
+====
+**Gotcha**: The `@CompositeTypeRegistration` is declared on `BasePersistable` but `UUIDPersistable` does not extend it. In practice, the registration is still applied project-wide via Hibernate's global type registry at boot, not via class-inheritance propagation. If you see `MonetaryAmount` mapping failures in a project that only uses `UUIDPersistable` descendants, check that the module containing `BasePersistable` is on the classpath and its types are scanned.
+====
+
+== Advanced Patterns
+
+=== Populating Auditor in SecurityContext
+
+For async jobs / schedulers that write audited entities:
+
+[source,java]
+----
+@Component
+public class ScheduledCreditUpdate {
+
+    @Autowired private ExampleCreditRepository creditRepo;
+    @Autowired private AuditorRepository auditorRepo;
+
+    @Scheduled(cron = "0 0 * * * *")
+    @Transactional
+    public void run() {
+        Authentication sysAuth = new PreAuthenticatedAuthenticationToken(
+            new AuditorUser(getSystemAuditor()), null, List.of());
+        SecurityContextHolder.getContext().setAuthentication(sysAuth);
+        try {
+            /* ... do writes — createdBy/updatedBy will point to system auditor ... */
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+}
+----
+
+Without this, `createdBy` / `updatedBy` resolve to whatever `AuditorAware` returns for an empty context — usually `null`, which shows up as "system" or blank in the UI.
+
+=== Avoiding LazyInitializationException on createdBy / updatedBy
+
+Both `createdBy` and `updatedBy` are `@ManyToOne(fetch = LAZY)`. Accessing them outside an active Hibernate session throws `LazyInitializationException`.
+
+**Safe patterns:**
+
+- Access inside a `@Transactional` method
+- Use a DTO mapper that dereferences the auditor while the session is open
+- Declare a view-layer `@Query` with `JOIN FETCH createdBy, updatedBy` when rendering
+- For read-only UI, consider `@Fetch(FetchMode.SELECT)` with `@BatchSize(size = 50)` to avoid per-row N+1
+
+**Unsafe:**
+
+- Returning the raw entity from a REST controller without eager-fetching — Jackson triggers lazy loads after the transaction closed
+
+=== Custom ID Types
+
+When you need a type that isn't `Long` / `UUID`:
+
+[source,java]
+----
+@Entity
+@Table(name = "external_reference")
+public class ExternalReference extends BasePersistable<String> {    // <1>
+
+    @Id                                                              // <2>
+    @Column(length = 64)
+    private String id;
+
+    /* business fields */
+}
+----
+<1> Using generic parameter `String`
+<2> You shadow the parent's `@Id` field with your own — required because the parent uses `IDENTITY` generation which isn't valid for strings. Declare your own id field + set it explicitly before persist.
+
+== Best Practices
+
+[.unstyled]
+* {ok} **Use `AbstractAuditable` for UUID business entities** — the overwhelming default
+* {ok} **Never write `AbstractAuditable<UUID>`** — the class is not generic; the `<UUID>` is silently ignored
+* {ok} **Use `BaseEntity<Long>` for high-volume transaction tables** — UUID indexes are 2-3x larger than BIGINT
+* {ok} **Use `UndeletableEntity` instead of hard `DELETE`** — preserves history and prevents FK cascade surprises
+* {ok} **Use `AbstractOwnable` for append-only records** — log entries, events, notifications
+* {ok} **Use `SynchronousAccessRepository.getSync()` on write paths** where two concurrent updates would cause data corruption
+* {ok} **Populate `SecurityContext` with an `AuditorUser` before any `@Transactional` write** — including async jobs, schedulers, message consumers
+* {ok} **Declare `CurrencyUnit` and `Period` fields directly** — `autoApply = true` means no `@Convert` annotation is needed
+* {ok} **Add custom `Auditor` subclasses** for non-user write sources so `createdBy` in audit logs is meaningful
+* {ok} **Wire `PumpkinBaseRepository` as the repository base** — every repository gains `streamAll` + implicit `SynchronousAccessRepository`
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **`AbstractAuditable<UUID>` with generic** — compiles but is misleading; real class has no type parameter
+* {bad} **Flipping `active` directly via a public setter** — `setActive` is protected precisely to prevent this; expose domain methods like `deactivate()` instead
+* {bad} **Using `ImmutableEntity`** — deprecated; use `@Immutable` annotation directly on your entity
+* {bad} **Duplicating `createdAt` / `updatedAt` in a subclass** — already present in `AbstractAuditable` / `BaseEntity` / `UndeletableEntity`; duplicating breaks the audit listener
+* {bad} **Forgetting to register an `AuditorAware<Auditor>` bean** — `createdBy` / `updatedBy` silently stay `null` on every write
+* {bad} **Mixing `BaseEntity<UUID>` with `AbstractAuditable`** — they're parallel hierarchies; choose one per entity
+* {bad} **Accessing `createdBy` / `updatedBy` outside a transaction** — `LazyInitializationException`, because the `@ManyToOne` is `FetchType.LAZY`
+* {bad} **Relying on `AbstractOwnable` for updatable records** — it has no `updatedAt` / `updatedBy`; use `AbstractAuditable` instead
+* {bad} **Skipping `UndeletableEntity` and implementing your own `active` flag** — framework code discovers the flag via `@Undeletable` reflection; your custom flag is invisible to UI filters and `@SQLRestriction` defaults
+* {bad} **Calling `getSync()` outside `@Transactional`** — pessimistic lock requires a transaction; without one, the lock is acquired and immediately released, defeating the purpose
+
+== Production Checklist
+
+[.unstyled]
+* {todo} All UUID-based business entities extend `AbstractAuditable` (no `<UUID>` generic parameter)
+* {todo} Long/String-id entities with audit extend `BaseEntity<ID>`
+* {todo} Soft-deletable entities extend `UndeletableEntity<ID>`; `setActive` access restricted to domain methods
+* {todo} Append-only entities extend `AbstractOwnable`
+* {todo} `AuditorAware<Auditor>` bean registered and integration-tested
+* {todo} `@EnableJpaAuditing` present on a `@Configuration` class
+* {todo} All write paths populate `SecurityContext` with an `AuditorUser` (HTTP via Spring Security, async via explicit wiring)
+* {todo} `Auditor` subclasses exist for every non-user write source (scheduler, integrations, migrations)
+* {todo} Custom repositories implement `SynchronousAccessRepository` where write-locking is required
+* {todo} `@EnableJpaRepositories(repositoryBaseClass = PumpkinBaseRepository.class)` configured
+* {todo} Currency fields typed as `javax.money.CurrencyUnit` (no manual `@Convert`)
+* {todo} Period fields typed as `java.time.Period` (no manual `@Convert`)
+* {todo} `@Immutable` annotation used directly on immutable entities, not the deprecated `ImmutableEntity`
+* {todo} DTO mappers dereference `createdBy` / `updatedBy` inside the transaction boundary to avoid `LazyInitializationException`
+* {todo} Soft-delete parent collections use `@SQLRestriction("active = true")` to hide inactive children
+* {todo} `auditor` table indexed on `auditor_type` if discriminator queries are frequent
+
+---
+
+**Related:** <<entity-history>>, <<audit-module-sdk-reference-internals>>, <<credit-product-module-entity-model-lifecycle-rates>>, <<data-model-setup>>
+
+**Next:** <<data-model-setup>>, <<audit-module-sdk-reference-internals>>

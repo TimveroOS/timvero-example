@@ -1,3 +1,5 @@
+[[offer-engine]]
+[[offer-engine-credit-products]]
 = Offer Engine & Credit Products
 :sourcedir: ../../main/java
 
@@ -848,10 +850,601 @@ if (profile.creditScore >= 700) {
 }
 ```
 
+[[procuring-sdk-internals]]
+== Procuring SDK Internals
+
+The preceding sections walked through the user-facing story of wiring a secured offer into your project. This section is the SDK reference: it enumerates every class that lives in `com.timvero.application.procuring`, the contracts they impose, and how they are discovered and wired at runtime. Read this when you need to understand _why_ a particular shape is required — not _how_ to add another procuring type.
+
+The subsystem is intentionally small: one interface (`ProcuringEngine`), one service (`ProcuringEngineService`), one `CustomEnum` key (`ProcuringType`), one `@MappedSuperclass` entity (`SecuredOffer`), and three integration points for tabs/actions/views. That is the entire SDK surface — everything else is in your project.
+
+=== ProcuringEngine — The Extension Point
+
+`ProcuringEngine` is the sole extension point. Every engine declares which `ProcuringType` it handles and knows how to expand a `ProductOffer` into zero or more `SecuredOffer` instances.
+
+[source,java]
+----
+public interface ProcuringEngine {
+
+    ProcuringType procuringType();
+
+    Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer productOffer);
+}
+----
+
+Contract rules:
+
+* `procuringType()` MUST return a stable, non-null `ProcuringType` — it is used as a `Map` key at startup, so two engines reporting the same type will cause the last one registered to silently shadow the other.
+* `generateSecuredOffers(ProductOffer)` MAY return an empty collection when no secured variant applies (e.g. participant has no eligible collateral). The caller treats an empty result as "show only the unsecured offer".
+* Implementations are expected to be stateless Spring beans — the `ProcuringEngineService` holds a single instance per type for the lifetime of the application context.
+* The method is called on every tab render and every view assembly (see `AbstractSecuredOffersTab` and `ProductOfferViewService` below), so it MUST be cheap. Do not perform remote calls inside `generateSecuredOffers` — cache results on the offer or pre-compute during workflow.
+
+Real implementation in this project (generates one `PenaltySecuredOffer` per offer):
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/procuring/PenaltyProcuringEngine.java[lines=15..27]
+----
+
+=== ProcuringEngineService — Orchestrator
+
+`ProcuringEngineService` is not abstract and not overridable. It is a simple dispatcher that discovers every `ProcuringEngine` bean in the context and indexes them by type:
+
+[source,java]
+----
+public ProcuringEngineService(Collection<ProcuringEngine> procuringEngines) {
+    this.procuringEngineMap = procuringEngines.stream()
+        .collect(Collectors.toMap(ProcuringEngine::procuringType, Function.identity()));
+}
+
+public Collection<? extends SecuredOffer> generateSecuredOffers(ProductOffer offer) {
+    ProcuringType procuringType = offer.getProductAdditive().getProcuringType();
+    ProcuringEngine procuringEngine = procuringEngineMap.get(procuringType);
+    return procuringEngine.generateSecuredOffers(offer);
+}
+
+public SecuredOffer findSecuredOffer(ProductOffer productOffer, String securedOfferKey) {
+    return generateSecuredOffers(productOffer).stream()
+        .filter(secured -> secured.getOfferKey().equals(securedOfferKey))
+        .collect(Lang.exactlyOne());
+}
+----
+
+Key behaviours:
+
+* **Dispatch is driven by the product additive.** The engine is chosen by `offer.getProductAdditive().getProcuringType()` — not by a participant attribute, not by a runtime switch. See <<credit-product>> for how the additive stores this field.
+* **`findSecuredOffer` uses `Lang.exactlyOne()`.** This is a hard assertion — if the engine returned zero matches, or more than one offer with the same key, the call throws. In practice this means every `SecuredOffer` an engine produces MUST have a unique `getOfferKey()` within the collection returned for a single `ProductOffer`.
+* **There is no fallback.** If the additive references a `ProcuringType` with no registered engine, `procuringEngine.generateSecuredOffers(offer)` is a `NullPointerException`. Treat "register engine" as a first-class deployment step whenever a new `ProcuringType` is added to configuration.
+
+=== ProcuringType & ProcuringTypeDeserializer
+
+`ProcuringType` extends `CustomEnum<ProcuringType>` — the same pattern used for participant status, application status, and other open-ended keys. See <<entity-module-sdk-reference-hierarchy>> for the full `CustomEnum` contract; the short version is that instances register themselves into a static registry at classloading time, and equality is by name.
+
+[source,java]
+----
+public class ProcuringType extends CustomEnum<ProcuringType> implements Comparable<ProcuringType> {
+    public ProcuringType(String name) { super(name); }
+    public static ProcuringType[] values() { return ProcuringType.values(ProcuringType.class); }
+}
+----
+
+Two consequences:
+
+* The `public static final ProcuringType PENALTY = new ProcuringType("PENALTY")` declaration is the registration — no `@PostConstruct`, no separate factory. Placing it on a `@Configuration` class guarantees the static initializer runs before anything else resolves procuring types.
+* `ProcuringType.values()` returns the registry snapshot. The example project's form service uses this to populate the dropdown shown while editing a credit product additive (see `ExampleCreditProductAdditiveFormServiceImpl`, line 41).
+
+`ProcuringTypeDeserializer` is the Jackson counterpart — plain string-to-enum lookup via the `CustomEnum` registry:
+
+[source,java]
+----
+public class ProcuringTypeDeserializer extends JsonDeserializer<ProcuringType> {
+    @Override
+    public ProcuringType deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        return ProcuringType.valueOf(ProcuringType.class, p.getText());
+    }
+}
+----
+
+Wire it with `@JsonDeserialize(using = ProcuringTypeDeserializer.class)` on any DTO field that carries a procuring type over the wire. Without it, Jackson's default enum handling will not locate your registered instances.
+
+=== SecuredOffer Entity Structure
+
+`SecuredOffer` is a `@MappedSuperclass` — it does not define a table on its own. Subclasses own the table, and the SDK imposes only two abstract methods:
+
+[source,java]
+----
+@MappedSuperclass
+public abstract class SecuredOffer extends BaseEntity<Long> {
+    public abstract ProductOffer getOriginalOffer();
+    public abstract String getOfferKey();
+}
+----
+
+Why `@MappedSuperclass` instead of `@Entity`:
+
+* Each project declares its own `originalOffer` relationship with a concrete `ProductOffer` subtype — the SDK cannot pick that type for you.
+* Each project typically wants JOINED inheritance keyed by `procuring_type` discriminator. The real base lives in the project, not the SDK.
+
+The project-level base in this codebase:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/offer/entity/ExampleSecuredOffer.java[tags=entity]
+----
+
+Note the shape:
+
+* `@Inheritance(InheritanceType.JOINED)` + `@DiscriminatorColumn("procuring_type")` — each concrete type gets its own table, but all share `secured_offer` for the common fields.
+* The `procuringType` column is _mapped by the discriminator_ (`insertable = false, updatable = false`). Hibernate fills it from the `@DiscriminatorValue` on the concrete class, so constructors must pass the matching constant explicitly or the column will diverge from the discriminator.
+* `@Audited` + `@AuditOverride(forClass = SecuredOffer.class)` — because the SDK base is a `@MappedSuperclass` without its own Envers configuration, the project base has to re-declare auditing for the inherited fields.
+
+The servicing side consumes the selected `SecuredOffer` through the `CreditCondition` it becomes attached to — see <<credit-servicing>>. That is the only cross-module contract: whatever your engine produces must be storable on your condition.
+
+=== AbstractSecuredOffersTab
+
+`AbstractSecuredOffersTab` is the only opinionated UI integration in the SDK. It renders the `"/application/tab/offers"` Thymeleaf template with a pre-built map of `ProductOffer` to its secured variants:
+
+[source,java]
+----
+public abstract class AbstractSecuredOffersTab<ID extends Serializable, E extends Persistable<ID>>
+        extends EntityTabController<ID, E> {
+
+    @Autowired
+    private ProcuringEngineService procuringEngineService;
+
+    @Override
+    protected String getTabTemplate(ID id, Model model) throws Exception {
+        E entity = loadEntity(id);
+        Map<ProductOffer, List<SecuredOffer>> existingSecuredOffers = getSecuredOffers(entity).stream()
+            .collect(Collectors.groupingBy(SecuredOffer::getOriginalOffer));
+
+        Map<? extends ProductOffer, List<? extends SecuredOffer>> allOffers = getInitialOffers(entity).stream()
+            .collect(Collectors.toMap(
+                Function.identity(),
+                offer -> existingSecuredOffers.getOrDefault(offer, Collections.emptyList())));
+
+        model.addAttribute("allOffers", allOffers);
+        return "/application/tab/offers";
+    }
+
+    protected abstract Collection<? extends ProductOffer> getInitialOffers(E entity);
+}
+----
+
+Integration points for your subclass:
+
+* **Implement `getInitialOffers(E entity)`** — return the raw `ProductOffer` list to expand. The base class will call the `ProcuringEngineService` for each.
+* **Override `getSecuredOffers(E)` only if you need pre-generated offers** — by default it regenerates on every render by iterating `getInitialOffers`. Override when you persist secured offers and want to show the stored set instead.
+* The template path `/application/tab/offers` is fixed — either ship a Thymeleaf template at that path or override `getTabTemplate` to point elsewhere.
+
+=== SelectConditionAction
+
+`SelectConditionAction` backs the "user picks this secured variant" flow. It resolves the `SecuredOffer` identified by the `securedOffer` query parameter and hands it to your concrete action:
+
+[source,java]
+----
+public abstract class SelectConditionAction<E extends ProductOffer, F>
+        extends EntityActionController<Long, E, F> {
+
+    public static final String SECURED_OFFER_PARAM = "securedOffer";
+
+    @Override
+    protected final String getActionTemplate(Long id, Model model, String actionPath) throws Exception {
+        String securedOfferKey = request.getParameter(SECURED_OFFER_PARAM);
+        Assert.hasLength(securedOfferKey, "No SecuredOffer key");
+        E productOffer = loadEntity(id);
+        SecuredOffer securedOffer = findSecuredOffer(productOffer, securedOfferKey);
+        model.addAttribute("productOffer", productOffer);
+        model.addAttribute("securedOffer", securedOffer);
+        return getActionTemplate(id, model, actionPath, productOffer, securedOffer);
+    }
+}
+----
+
+Request wiring:
+
+* The action template URL carries `?securedOffer=<offerKey>` — produced by the tab template using `SecuredOffer::getOfferKey`. The base class does the lookup via `ProcuringEngineService.findSecuredOffer`, which applies the `exactlyOne()` assertion described above.
+* `getActionTemplate(...)` is sealed (`final`) — your subclass implements the five-argument overload that receives the resolved `productOffer` and `securedOffer`.
+* The `action()` method (inherited from `EntityActionController`, see <<entity-actions>>) is where you persist the chosen condition. The example pattern is to read `form.getSecuredOfferKey()` on submit, re-resolve via `findSecuredOffer`, and attach the result to a new `CreditCondition`:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/offer/action/SelectRegularConditionAction.java[lines=56..90]
+----
+
+=== ProductOfferViewService / ProductOfferGeneral / OfferView
+
+These three classes are the view-layer helpers that turn raw offers into what the UI actually renders. None of them is required — a project can bypass them entirely and render from the tab map directly — but they encapsulate the common "group by product, compute min/max, sort empties last" logic once.
+
+`OfferView` is a plain record carrying display strings and range values:
+
+[source,java]
+----
+public record OfferView(String name, String minInterestRateExpression, String maxInterestRateExpression,
+    MonetaryAmount minAmount, MonetaryAmount maxAmount, Integer minTerm, Integer maxTerm, String details) {}
+----
+
+`ProductOfferGeneral` aggregates offers that share the same `CreditProduct` and carries pre-computed min/max ranges plus a `selectedOfferKey` for highlight rendering. Internally each entry is a `ProductOfferGeneral.Offer(productOffer, securedOffer, view)` — `securedOffer` is nullable so the unsecured case falls out naturally.
+
+`ProductOfferViewService` ties them together. The assembly loop is the non-obvious part: for each `ProductOffer`, it asks the engine service for secured variants and emits either one row with `securedOffer = null` (engine returned empty) or one row per variant. After assembly it folds min/max across every row in a group and re-orders the list so entries without a secured variant sink to the end:
+
+[source,java]
+----
+Collection<? extends SecuredOffer> securedOffers = procuringEngineService.generateSecuredOffers(productOffer);
+if (securedOffers.isEmpty()) {
+    general.getOffers().add(new Offer(productOffer, null, map(productOffer, locale)));
+} else {
+    for (SecuredOffer securedOffer : securedOffers) {
+        general.getOffers().add(new Offer(productOffer, securedOffer, map(securedOffer, locale)));
+        if (securedOffer.getOfferKey().equals(selectedOfferKey)) {
+            general.setSelectedOfferKey(selectedOfferKey);
+        }
+    }
+}
+----
+
+Subclasses implement the two `map` methods to produce `OfferView` rows — one for the bare `ProductOffer`, one for each `SecuredOffer`. The example implementation formats the localized procuring type into `details`:
+
+[source,java]
+----
+include::{sourcedir}/com/timvero/example/admin/application/ExampleProductOfferViewService.java[tags=view]
+----
+
+`loanRate(expression)` is the rate-expression evaluator hook — it defaults to calling `LoanRateService.getLoanRateValueByDate` for today, returning `-999` on evaluation failure (a sentinel that sorts to the front of min comparisons — use with care if you lean on it).
+
+=== ProcuringConfiguration
+
+`ProcuringConfiguration` is the Spring wiring. It is declared as a `@TimveroModule` (so it is picked up by the standard Pumpkin module scan) and conditionally creates the `ProcuringEngineService` bean only when at least one `ProcuringEngine` is present:
+
+[source,java]
+----
+@TimveroModule
+@ComponentScan
+public class ProcuringConfiguration {
+
+    @Bean
+    @ConditionalOnBean(ProcuringEngine.class)
+    ProcuringEngineService procuringEngineService(Collection<ProcuringEngine> procuringEngines) {
+        return new ProcuringEngineService(procuringEngines);
+    }
+}
+----
+
+Implications:
+
+* **Zero engines = no service bean.** If your project has no procuring engines at all, `@Autowired ProcuringEngineService` fails at context startup. Either register at least one engine, or gate the autowire with `@Autowired(required = false)`.
+* **`@ComponentScan` on this class is local** — it scans `com.timvero.application.procuring.**`. Your project engines live in your own package and are picked up by your project's component scan, not this one. The conditional bean sees all engines regardless of which scan registered them.
+* **Module load order** — `@TimveroModule` guarantees the class is processed during the Pumpkin module initialization phase, so `ProcuringEngineService` is available before any tab or action that autowires it.
+
+=== Anti-Patterns
+
+Specific to the procuring subsystem:
+
+* {bad} **Registering two `ProcuringEngine` beans with the same `procuringType()`** — the second silently overwrites the first in `procuringEngineMap`. There is no collision check. Split into distinct types instead.
+* {bad} **Returning `SecuredOffer` instances with colliding `getOfferKey()` values** from a single engine call — `findSecuredOffer` uses `Lang.exactlyOne()` and will throw on submit. Always embed the `ProductOffer` UUID _and_ the variant tag in the key (pattern: `uuid + ":VARIANT"`).
+* {bad} **Performing I/O inside `generateSecuredOffers`** — the method is called on every tab render and every view assembly pass. Pre-compute during workflow execution and cache on the offer.
+* {bad} **Referencing a `ProcuringType` in a `CreditProductAdditive` with no registered engine** — produces a runtime NPE on the first offer view. Treat type registration and engine registration as a single atomic deployment step.
+* {bad} **Making `SecuredOffer` an `@Entity` directly in your project base** — the SDK class is `@MappedSuperclass` specifically so your concrete base can own the `@Inheritance` strategy and discriminator column. Wrapping it in a second `@Entity` layer is not supported.
+
+=== Production Checklist
+
+* {todo} Every `ProcuringType` constant declared in the project has a corresponding `@Component` `ProcuringEngine` registered
+* {todo} `getOfferKey()` for every concrete `SecuredOffer` embeds the original offer UUID to guarantee uniqueness across products
+* {todo} `generateSecuredOffers` does not call the database, a remote service, or a rate engine — it reads pre-computed fields only
+* {todo} DTOs that transport `ProcuringType` over the wire use `@JsonDeserialize(using = ProcuringTypeDeserializer.class)`
+* {todo} The project-level `SecuredOffer` base declares `@AuditOverride(forClass = SecuredOffer.class)` if Envers auditing is enabled
+* {todo} Tabs extending `AbstractSecuredOffersTab` ship a Thymeleaf template at `/application/tab/offers` or override `getTabTemplate`
+
+[[offer-subsystem-sdk-internals]]
+== Offer Subsystem — SDK Internals
+
+This section is the companion reference to the user tutorial above. Everything earlier answers "how do I configure offers for my product" — this section answers "how is the offer subsystem wired internally, and what exactly can I extend". Read this when you are subclassing `ProductOffer`, registering a new `OfferEngineDataProcessor`, writing scripts that bind unusual objects, or diagnosing why a descriptor is not being picked up.
+
+Scope: the `com.timvero.loan.offer` package (23 files, 8 subpackages) plus the external `com.timvero.loan.offer_engine_input` marker (1 file). The procuring subsystem — a related but separate extension axis — is documented in <<procuring-sdk-internals>>; do not confuse `OfferEngine` (the generator of `ProductOffer` instances) with `ProcuringEngine` (the per-offer variant expander). An `OfferEngine` runs once per product/additive/profile combination; a `ProcuringEngine` runs on each already-generated `ProductOffer` to materialize collateral-bound variants.
+
+The offer subsystem is the bridge between <<credit-product>> (product/additive templates) and <<credit-servicing>> (the `CreditCondition` consumed at servicing time). Scripts executed here can read facts produced during <<flowable-internals>> workflows and consume metrics from the <<feature-service>>.
+
+=== ProductOffer — The Entity
+
+`ProductOffer` is the concrete output of the generation pipeline. It is a `@MappedSuperclass`, not an `@Entity`:
+
+[source,java]
+----
+@MappedSuperclass
+public abstract class ProductOffer extends BaseEntity<Long> {
+
+    @ManyToOne(fetch = FetchType.EAGER, optional = false)
+    @JoinColumn(name = "product_additive", nullable = false)
+    @Audited(targetAuditMode = RelationTargetAuditMode.NOT_AUDITED)
+    private CreditProductAdditive productAdditive;
+
+    protected ProductOffer() { }
+
+    @Transient
+    public CreditProduct getCreditProduct() {
+        return getProductAdditive().getProduct();
+    }
+
+    @Override
+    public abstract String toString();
+}
+----
+
+Non-obvious facts:
+
+* **It is abstract _and_ a `@MappedSuperclass`.** Your project must declare a concrete `@Entity` subclass — typically one per credit product family. The SDK never persists `ProductOffer` directly; see <<entity-module-sdk-reference-hierarchy>> for the base hierarchy.
+* **`toString()` is abstract.** This is a deliberate contract: the bean wrapper in `OfferEngine.fillOffer` and several UI views call `toString()` for log lines and ActionHistory entries. An offer with the default `Object.toString()` produces useless identity hashes in the audit log.
+* **`productAdditive` is eagerly fetched and non-nullable.** The engine sets it in `produceOffers` before the script runs — scripts observe an offer that already has its additive wired, which is why `offer.productAdditive.product` is legal inside a script.
+* **`@Audited(targetAuditMode = NOT_AUDITED)`** — Envers records the FK value but does not snapshot the full `CreditProductAdditive` tree. If you audit the additive separately it is double-counted; if you do not, you still see which additive was chosen at offer time.
+* **ID type is `Long`, not `UUID`.** Offers are cheap row-per-generation artifacts; UUIDs are reserved for long-lived or externally-referenced entities. Do not try to "upgrade" the ID type — several downstream queries (procuring, credit conversion) are keyed by `Long` offer IDs.
+
+The pattern for a project subclass:
+
+[source,java]
+----
+@Entity
+@Table(name = "mortgage_offer")
+@DiscriminatorValue("MORTGAGE")
+@AuditOverride(forClass = ProductOffer.class)
+public class MortgageOffer extends ProductOffer {
+
+    @Column(name = "amount")
+    private MonetaryAmount amount;
+    @Column(name = "interest_rate", precision = 10, scale = 6)
+    private BigDecimal interestRate;
+    // ... other fields driven by the script
+
+    @Override
+    public String toString() {
+        return "%s @ %s for %d months".formatted(amount, interestRate, termMonths);
+    }
+}
+----
+
+The concrete class also needs a `createOffer()` factory on the matching `CreditProductAdditive` subclass — that is the method `OfferEngine` invokes, not a constructor.
+
+=== OfferEngine — The Extension Point
+
+`OfferEngine` is the orchestrator — a `@Service` with two public entry points. The contract:
+
+[source,java]
+----
+@Transactional(propagation = Propagation.MANDATORY)
+public <ID, E extends Persistable<ID>> Collection<? extends ProductOffer> generateOffers(
+    OfferEngineDataProcessor<ID, E> processor,
+    Collection<? extends CreditProduct> products,
+    E entity) throws OfferGenerationException;
+
+@Transactional(rollbackFor = OfferGenerationException.class)
+public <ID, E extends Persistable<ID>> List<Object> testOffers(
+    Expression expression, UUID productId, Long additiveId,
+    ExecutionResultType resultType, String entityId) throws OfferGenerationException;
+----
+
+`generateOffers` is what the origination workflow calls; `testOffers` is what the descriptor "Evaluate" button calls.
+
+Non-obvious facts:
+
+* **`Propagation.MANDATORY` on `generateOffers`.** It **will throw** if you call it without an outer transaction. The workflow service task that invokes it is responsible for opening the transaction — if you are calling it from a Quartz job or a custom controller, wrap it in `@Transactional` yourself.
+* **Product → engine resolution is by `ExecutionResultType`, not by product.** `product.getOfferEngineTypes()` is a set; the engine iterates additives and picks the descriptor whose `executionResultType` matches. A single product can participate in multiple offer pipelines keyed by different result types (e.g. `ORIGINATION` vs `RENEWAL`).
+* **`findEngineDescriptor` queries by `lineageId + executionResultType + active = true`.** The additive stores `offerEngines: Map<ExecutionResultType, UUID>` where the UUID is the _lineage_ id (stable across versions), not the current descriptor's primary key. Saving a new descriptor version keeps the additive's pointer valid — that is why descriptor editing is non-breaking.
+* **Script result shapes.** `produceOffers` accepts three shapes from the script:
+  ** `return offer;` (the bound `offer` object, mutated) — returned as-is.
+  ** `return { amount: 1000, term: 12 };` — keys set via `BeanWrapper` reflection on the offer.
+  ** `return null;` or anything else — treated as "no offer for this profile", silently skipped.
+* **`MonetaryAmount` coercion is a special case.** `fillOffer` hard-codes this: if the target property is `MonetaryAmount`, the source is a `Number`, and the offer itself implements `CurrencySupplier`, it wraps the number in the offer's currency. Scripts that set amounts as plain numbers only work when the offer exposes a currency.
+* **`OfferGenerationException` wraps the cause twice.** It stores the original exception both as the `Throwable` cause and as a separately-accessible `getException()` field, so the controller's exception handler can show the root message without walking `getCause()`. Do not throw it directly from a script — the engine will catch any `ScriptException` or generic `Exception` and wrap it with the descriptor id/name.
+
+=== Offer Script Execution
+
+Scripts run under `ScriptManager` (a separate SDK) but the bindings are controlled entirely by `OfferEngine.getBindings`:
+
+[source,java]
+----
+private Map<String, Object> getBindings(Map<String, Object> profile, CreditProductAdditive additive,
+    ProductOffer offer, Object entity, boolean persist) {
+    Map<String, Object> bindings = new LinkedHashMap<>();
+    bindings.put("product", additive.getProduct());
+    bindings.put("productAdditive", additive);
+    bindings.put("offer", offer);
+    bindings.put("profile", profile);
+    bindings.put("entity", entity);
+    if (entity instanceof HasMetric subject) {
+        bindings.put("metrics", new MetricContainer(subject, metricService, persist));
+    }
+    return Collections.unmodifiableMap(bindings);
+}
+----
+
+The five always-present bindings and the conditional `metrics` binding are the full surface area a script sees. Non-obvious details:
+
+* **`metrics` binding only appears when the entity implements `HasMetric`.** A script that references `metrics.get(...)` for a non-`HasMetric` entity fails with a binding lookup error, not a null pointer. This is the gate between an origination entity and the <<feature-service>>.
+* **`MetricContainer.get(mappingName)` is cached per call.** Multiple lookups of the same metric inside one script invocation hit the in-memory `ConcurrentHashMap`, not the DB. But the cache is per-container, so each script run on each profile pays the first-lookup cost once.
+* **`persist` is `false` in `testOffers`, `true` in `generateOffers`.** The "Evaluate" button in the descriptor UI computes metrics transiently, so you can experiment without creating audit-visible metric rows. The production pipeline persists.
+* **Exception metrics throw through the script.** If a metric's `dataType` is `FeatureDataType.EXCEPTION`, `MetricContainer.get` throws a `RuntimeException` with the metric's content. The engine catches it, wraps it in `OfferGenerationException`, and aborts the additive — not the whole product. Other additives still generate.
+* **`product` and `productAdditive` are live JPA entities.** Scripts can navigate lazy associations _inside_ the script's transaction (generation is `Propagation.MANDATORY`), but storing a reference in a long-lived object will cause `LazyInitializationException` later.
+* **The bindings map is `unmodifiableMap`.** Scripts cannot add their own bindings; all mutation must go through the `offer` object.
+
+The script engine itself is chosen at descriptor creation time (JS via GraalVM, SpEL, or any other registered `ScriptEngineConfigurator`). See `InterestRateServiceConfigurator` below for how a function is exposed to both engines simultaneously.
+
+[[offer-engine-data-processor]]
+=== OfferEngineDataProcessor — Entity-to-Profile Bridge
+
+`OfferEngineDataProcessor` is the SPI that teaches `OfferEngine` how to turn an origination entity into a _collection_ of script profiles:
+
+[source,java]
+----
+public abstract class OfferEngineDataProcessor<ID, A extends Persistable<ID>>
+    extends EntityProcessor<ID, A> {
+
+    public abstract ExecutionResultType getResultType();
+    public abstract Collection<Map<String, Object>> mapToData(A entity);
+    protected void fillOffer(ProductOffer offer, Map<String, Object> data) {}
+}
+----
+
+Three concrete obligations:
+
+* **`getResultType()`** — the `ExecutionResultType` this processor handles. The engine builds a `Map<ExecutionResultType, OfferEngineDataProcessor>` at startup and **throws on duplicate types**. Two processors for the same type is a hard error.
+* **`mapToData(entity)`** — returns a `Collection<Map<String, Object>>`. Each map becomes one `profile` binding, and produces _at most one_ offer (the script can return empty to drop it). A single `generateOffers` call can therefore emit N offers per additive where N = `profiles × valid script results`. Use this to fan out offers — e.g. one per term duration, one per borrower, one per scenario.
+* **`fillOffer(offer, data)` (optional hook)** — called _after_ the script evaluates and before the offer is added to the result list. Use this to copy profile-identifying fields onto the offer (e.g. which scenario produced it) that you do not want the script author to be responsible for setting.
+
+The `EntityProcessor` superclass also provides `getEntityClass()` which the engine uses to look up the entity via `ValidationEntitySearchService.loadEntity` during "test offer" evaluation.
+
+Binding order: `mapToData` → `createOffer` → `script.eval(bindings)` → `fillOffer` (script-mutation) → `processor.fillOffer` (post-processing) → collect. If your script sets a field and the processor's `fillOffer` also sets it, the processor wins.
+
+=== OfferEngineDescriptor — The Persisted Script
+
+`OfferEngineDescriptor` is the DB row users edit in the `/offer-engine-descriptor` UI. It extends `HistoryEntity`, which means descriptors are versioned by `lineageId`:
+
+[source,java]
+----
+@Entity
+@Table(name = "offer_engine_descriptor")
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+@HideInDocs
+public class OfferEngineDescriptor extends HistoryEntity implements NamedEntity {
+    private String name;
+    @Embedded private Expression expression;
+    @Type(value = NamedParameterType.class)
+    private ExecutionResultType executionResultType;
+}
+----
+
+Non-obvious facts:
+
+* **`@HideInDocs`** — the generated data-model documentation _skips_ this entity. It is a runtime concern, not a model concern.
+* **Second-level cache is `READ_WRITE`.** The descriptor is hit on every offer generation; cache it or the engine hammers the DB. `DisableOfferEngineDescriptorAction` explicitly calls `emf.getCache().evict(...)` after deletion because of this.
+* **Versioning via `HistoryEntity`.** `findByLineageIdAndExecutionResultTypeAndActiveTrue` is the primary lookup — the current "active" version of a descriptor lineage. Editing through `OfferEngineDescriptorFormService` creates a new row and flips the active flag; old rows remain for audit.
+* **`executionResultType` is immutable after creation.** `OfferEngineDescriptorFormService.save` enforces this with a `ValidationException` on update attempts. If you need to change the type, create a new descriptor — the additive's pointer will need to be re-aimed.
+* **The `Expression` is embedded, not a relation.** `Expression` from `com.timvero.loan.risk.scripting.expression.entity` holds the script body + engine name inline; there is no separate expression table.
+
+Repository extras:
+
+* `existsByLineageIdAndExecutionResultTypeAndActiveTrue` — pre-flight check used by the product additive form to validate the user's selection.
+* `findByExecutionResultType(Collection<ExecutionResultType>)` — bulk lookup via criteria API, filtered to `active = true`. Used when rendering drop-downs.
+* `getNameByLineageId` — a native query that fetches the most recent name without loading the full row. Used in audit trails and log lines where only the human-readable name matters.
+
+=== OfferEngineInput — The External Marker
+
+The `com.timvero.loan.offer_engine_input` module contains exactly one file:
+
+[source,java]
+----
+package com.timvero.loan.offer_engine_input;
+
+public class OfferEngineInput {
+}
+----
+
+This is intentionally empty. It is a _module boundary marker_: the package exists as a separate Maven module so that code wishing to produce inputs for an offer engine can depend on `offer_engine_input` without pulling in the full `origination` module. In practice:
+
+* {ok} Domain modules that expose facts consumable by offer scripts (metrics, external data providers, workflow outputs) declare a dependency on `offer_engine_input` and place their input-DTO classes in this package.
+* {ok} The `origination` module, which contains `OfferEngine` itself, has `offer_engine_input` as a compile-time dependency — the runtime bindings map (`entity`, `profile`, etc.) can reference types declared downstream.
+* {bad} Putting your project's entity classes here "to make them available to the engine" — the engine does not scan this package. The binding mechanism is reflection on the script's namespace, not classpath scanning. You do not need to put anything here unless you are splitting your monorepo into offer-input and offer-consumer modules.
+
+Treat `OfferEngineInput.java` as a sentinel: its presence confirms the module is loaded, and its package is where shared input-DTO contracts belong. It is not intended to be extended or instantiated.
+
+=== Action Layer — action/ subpackage
+
+Four controllers wire the descriptor entity into the standard Pumpkin entity-action framework:
+
+* **`CreateOfferEngineDescriptorAction`** — `EntityCreateController`. `isOwnPage()` returns `true`, so create lives on its own route rather than inside a modal.
+* **`EditOfferEngineDescriptorAction`** — `EditEntityActionController`. `BTN_SUCCESS` highlight.
+* **`ActivationOfferEngineDescriptorAction`** at `/activation`, order `16700`. Guard: `when(template -> !template.isActive())`. Activation is delegated to `formService.activate(id)` — the `HistoryEntityFormService` base handles the "deactivate old version, activate new" atomic flip.
+* **`DisableOfferEngineDescriptorAction`** at `/disable`, order `29001`. Guard: `when(OfferEngineDescriptor::isActive)`. It deletes the row via the repository and **manually evicts** `OfferEngineDescriptor` from the second-level cache via `emf.getCache().evict(OfferEngineDescriptor.class, id)`. This manual eviction is the safeguard; JPA's cascade-evict is not guaranteed to fire on `delete`. Shows a `yes-no` confirmation template.
+
+Non-obvious: there is no separate "create draft and submit" flow — activation is a first-class action separate from edit. A descriptor is created inactive, edited freely, then activated atomically.
+
+=== Form Layer — form/ subpackage
+
+Three pieces:
+
+* **`OfferEngineDescriptorForm`** — plain DTO. `@NotBlank name`, `@Valid @NotNull expression`, `@NotNull executionResultType`.
+* **`OfferEngineDescriptorFormMapper`** — MapStruct mapper between form ↔ entity. Explicitly ignores `lineageId` on update so the version chain is never accidentally broken through the form.
+* **`OfferEngineDescriptorFormService`** extends `HistoryEntityFormService`. Three notable behaviors:
+  ** `assembleEditModel` defaults a new form's engine to `JSScriptEngine.NAME` so the UI opens on JS (most common choice).
+  ** It populates `executionResultTypes`, `creditProducts` (filtered to state = ACTIVE), `engineNames`, and `entityTypes` for the form. `entityTypes` maps result type → entity class so the UI can show which entity each script operates on.
+  ** `save(id, form)` **enforces `executionResultType` immutability** as described above — changing it on an existing descriptor rejects the form with `offerEngineDescriptor.unmodifiableField`.
+  ** `additiveByProduct(productId)` returns the list of additive IDs for a given product — used by the cascading dropdown in the "Evaluate" panel.
+  ** `getOfferEngineDescriptorVersions(descriptor)` returns the full version chain sorted by `createdAt` descending — backs the history tab.
+
+=== Controller — controller/ subpackage
+
+`OfferEngineDescriptorController` at `/offer-engine-descriptor`, registered in the settings menu (`@MenuItem(order = 900_120, name = "offerEngineDescription", group = "setting")`):
+
+* **`POST /evaluate-expression`** — the "try it" endpoint. Takes an `OfferEngineEvaluationForm` (product, additive, result type, entity id, expression body), runs `offerEngine.testOffers`, and returns a `List<String>` human-readable renderings. Offers are serialized via `BeanWrapper` introspection with `productAdditive` _explicitly_ filtered out (otherwise the Jackson roundtrip would blow up on the bidirectional association).
+* **`GET /additiveByProduct/{productId}`** — feeds the cascading dropdown.
+* **`GET /entities?search=...&resultType=...`** — search-as-you-type endpoint for picking a test entity. Gated by `@PreAuthorize("hasRole(this.viewRole)")`.
+* **`@ExceptionHandler(OfferGenerationException.class)`** — returns `412 Precondition Failed` with the localized message. The evaluation UI expects this specific status and renders the message inline instead of as a global toast.
+
+=== Filter, Tab — filter/ + tab/ subpackages
+
+Minimal infrastructure:
+
+* **`OfferEngineDescriptorFilter`** extends `ListFilter`. Only one filter field: `@Field(restriction = EQ, value = "active")`, defaulting to `true`. So the list view shows active descriptors by default; toggle the filter to see the archive.
+* **`OfferEngineDescriptorFilterService`** — empty subclass of `FilterListService`, registered as `@Service` so DI picks it up.
+* **`DescriptorDetailsTab`** at `/details`, order `1000`. Always visible. It populates `engineNames`, `descriptor`, `history`, and `isNoneActiveVersionExist` (true when no version of this lineage is currently active — drives the "activate" button visibility).
+
+=== Export — export/ subpackage
+
+Five classes implement the import/export of descriptors (used for environment promotion and project templates):
+
+* **`OfferEngineDescriptorExporter`** — `@Service`, `@Order(7300)`, extends `AbstractHistoryEntityExporter`. Version string is `"1"`; bumping this invalidates older export files.
+* **`OfferEngineDescriptorToDtoMapper`** — MapStruct mapper to/from `OfferEngineDescriptorExportData`. Ignores `lineageId` on import (a fresh lineage is minted in the target environment).
+* **`OfferEngineDescriptorExportData`** — the export shape. Includes `name`, `expression` (as `ExpressionForm`, not the embedded entity — fewer JPA concerns on deserialize), and `executionResultType`.
+* **`ExecutionResultTypeDeserializer`** / **`ExecutionResultTypeKeyDeserializer`** — Jackson hooks that reconstruct `ExecutionResultType` from a plain string. `ExecutionResultType` is a value-class wrapper around a name; without these, Jackson would try to treat it as a bean. The _key_ variant exists because additives expose `Map<ExecutionResultType, UUID> offerEngines`, which JSON encodes as an object whose keys must be deserialized separately from the values.
+
+=== InterestRateServiceConfigurator — Script Function Exposure
+
+`InterestRateServiceConfigurator` is a `@Component` that implements both `PolyglotScriptEngineConfigurator` (for GraalVM/JS) and `SpelScriptEngineConfigurator` (for SpEL) to expose a single function, `interestRate(expression, date)`, to all scripts:
+
+[source,java]
+----
+@Override
+public void configContext(StandardEvaluationContext context) {
+    context.registerFunction("interestRate", interestRateMethod);
+}
+
+@Override
+public void configContext(SimpleBindings globalBindings) {
+    globalBindings.put("interestRate", interestRateFunction);
+}
+----
+
+Non-obvious:
+
+* **The date type differs per engine.** SpEL gets a plain `LocalDate`; GraalVM JS passes a polyglot `Value` (often a JS `Date`), so the configurator wraps the function in `toLocalDate(date)` conversion. Write scripts assuming `interestRate(rateName, date)` works without thinking about dates — the configurator handles both calls transparently.
+* **Errors are wrapped in a `RuntimeException`.** A `RateEvaluationException` from `LoanRateService` becomes a generic runtime error in the script; the script engine catches it, and the `OfferEngine` wraps it in `OfferGenerationException`. If a rate name is missing, the engine halts that additive only.
+* **This is the integration point with the rate curve system.** If you need to expose more functions globally to every offer script (e.g. a tax calculator, a fee lookup), add a `@Component` that implements the two configurator interfaces and registers the function. There is no other approved extension point.
+
+=== Anti-Patterns
+
+Specific to the offer subsystem (additional to the procuring list above):
+
+* {bad} **Registering two `OfferEngineDataProcessor` beans with the same `ExecutionResultType`** — `OfferEngine.setDataServices` throws on duplicate types. Split the type instead of overloading one.
+* {bad} **Calling `OfferEngine.generateOffers` outside a transaction** — the `MANDATORY` propagation means no outer TX = immediate exception. Wrap the caller in `@Transactional` or invoke it from a workflow service task (which already runs transactionally).
+* {bad} **Putting I/O or remote calls inside `OfferEngineDataProcessor.mapToData`** — it runs on every offer generation pass, once per product × additive. Pre-compute into the origination entity and only _read_ here.
+* {bad} **Scripts that return a `Map` with keys not present on the offer** — `BeanWrapper.getPropertyDescriptor(key)` returns `null`, causing an NPE. The engine does not silently ignore unknown fields; validate keys match offer properties.
+* {bad} **Storing an `OfferEngineDescriptor` reference in a field of another entity** — the descriptor's second-level cache and version flipping make aged references unreliable. Store the `lineageId` + `executionResultType` pair and resolve via the repository on demand.
+* {bad} **Extending `ProductOffer` without overriding `toString()`** — compiles fine because the abstract method is inherited; fails at audit-log time when the default `Object.toString()` is called.
+* {bad} **Changing `executionResultType` on an existing descriptor by editing the DB row directly** — the form service guards this in code; a DB-level edit bypasses the guard but leaves additive pointers dangling. Always create a new descriptor instead.
+
+=== Production Checklist
+
+Additional to the procuring checklist above:
+
+* {todo} Every concrete subclass of `ProductOffer` overrides `toString()` with a human-meaningful rendering
+* {todo} Every registered `OfferEngineDataProcessor` bean declares a unique `getResultType()` and is covered by an integration test that asserts no duplicate-type exception at context start
+* {todo} Scripts referencing `metrics.get(...)` operate on entities that implement `HasMetric` — the gate is compile-time in your project, not a runtime surprise
+* {todo} Every `MonetaryAmount` field on a concrete `ProductOffer` is backed by the offer implementing `CurrencySupplier`, or the script sets it as an already-constructed `MonetaryAmount` rather than a raw number
+* {todo} The offer descriptor `Expression` is exercised by at least one "Evaluate" run against a representative entity before activation — test data must exist for every `ExecutionResultType` in production
+* {todo} Envers `@AuditOverride(forClass = ProductOffer.class)` is present on each concrete offer subclass if Envers auditing is enabled in the project
+* {todo} `OfferEngineDescriptorExporter`'s `getVersion()` is bumped whenever `OfferEngineDescriptorExportData` schema changes to invalidate stale export bundles
+
 == Next Steps
 
 * **<<credit-management>>**: Convert selected offers into active credits
-* **<<workflow-integration>>**: Automate offer generation through workflows  
+* **<<workflow-integration>>**: Automate offer generation through workflows
 * **<<operations>>**: Handle offer-related operations and modifications
 * **<<payment-transactions>>**: Process payments for accepted offers
 

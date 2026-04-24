@@ -1,3 +1,4 @@
+[[docusign]]
 = Docusign Integration
 
 :sourcedir: ../../main/java/com/timvero/example
@@ -389,3 +390,504 @@ Configure webhooks in your DocuSign account:
 4. Select relevant events (e.g., "Envelope Completed")
 
 For detailed configuration instructions, see the https://developers.docusign.com/platform/webhooks/[DocuSign Webhooks Documentation].
+
+== SDK Internals — How It Works
+
+This section documents the internals of `com.timvero.integration.docusign` for developers who need to extend the integration, debug signing failures, or understand how envelopes, signatures, and webhooks flow through the system. The user-facing setup is covered above; this is the "what happens under the hood" reference.
+
+=== Signature Lifecycle Flow
+
+Every signed document goes through the same pipeline. The framework orchestrates DocuSign's embedded signing model — envelopes are created lazily (only when a signing URL is requested), and completion arrives via either webhook push or polling fallback.
+
+[source,text]
+----
+ ┌────────────────────┐
+ │  SignableDocument  │  status = PENDING_SIGNATURE
+ │  (no signature)    │  signature = null
+ └─────────┬──────────┘
+           │  getDocusignUrl(signer, doc, returnUrl)
+           │  → DocusignSignatureService.ensureEnvelopeCreated()
+           ▼
+ ┌────────────────────┐
+ │  JWT handshake     │  DocusignService.getSession()
+ │  (per-call, 3600s) │  RSA private key → OAuthToken → accountId
+ └─────────┬──────────┘
+           │
+           ▼
+ ┌────────────────────┐
+ │  Envelope created  │  POST /restapi/v2.1/accounts/{id}/envelopes
+ │  in DocuSign       │  HTML (Responsive) or PDF (base64) upload
+ └─────────┬──────────┘  returns envelopeId
+           │
+           ▼
+ ┌─────────────────────────────┐
+ │  DocusignDocumentSignature  │  persisted via JOINED inheritance
+ │  envelopeId = "xxx-yyy"     │  discriminator = "DOCUSIGN"
+ │  signableDocument.signature │
+ └─────────┬───────────────────┘
+           │  getSignUrl() → recipient view URL
+           │  user redirected to DocuSign-hosted signing UI
+           ▼
+ ┌────────────────────┐
+ │  User signs in     │  DocuSign handles routing order,
+ │  DocuSign UI       │  multi-party workflow, template fields
+ └─────────┬──────────┘
+           │  completion event
+           ▼
+ ┌──────────────────────────────────────────────┐
+ │  TWO completion paths (race-safe, idempotent)│
+ │                                              │
+ │  (A) Webhook push                            │
+ │      POST /callback/docusign/webhook         │
+ │      → DocusignWebhookController             │
+ │      → signDocumentByEnvelopeId(envId)       │
+ │                                              │
+ │  (B) Polling fallback                        │
+ │      getDocusignUrl() re-entered while       │
+ │      signature already exists                │
+ │      → getCompletedEnvelopesInfo()           │
+ │      → same signDocumentByEnvelopeId path    │
+ └─────────┬────────────────────────────────────┘
+           │
+           ▼
+ ┌──────────────────────────────────────────────┐
+ │  DocusignService.downloadSignedDocument()    │
+ │    GET /envelopes/{id}/documents             │
+ │    stored via DocumentStorage at             │
+ │    "Signature/{envelopeId}/signable"         │
+ └─────────┬────────────────────────────────────┘
+           │
+           ▼
+ ┌──────────────────────────────────────────────┐
+ │  SignableDocument                            │
+ │    status = SIGNED                           │
+ │    document = <signed PDF>                   │
+ │  DocusignDocumentSignature                   │
+ │    completedDateTime = <timestamp>           │
+ │    formData = { "income": "...", ... }       │
+ └──────────────────────────────────────────────┘
+----
+
+Two non-obvious properties of this pipeline:
+
+- **Idempotency via `isSigned()` guard** — `signDocumentByEnvelopeId` short-circuits if the document is already `SIGNED`. This means the webhook and polling paths can both fire (e.g. DocuSign retries a webhook after we already polled) without double-processing.
+- **No persistent `DocusignSession`** — a fresh JWT exchange happens on every top-level call (`getSession()` is invoked by every `DocusignSignatureService` method). There is no session cache. This trades a ~100–300ms JWT round-trip for simplicity and immunity to token-rotation races.
+
+=== DocusignService — The Orchestrator
+
+`DocusignService` is the low-level wrapper around the DocuSign eSign SDK (`com.docusign.esign`). It has no knowledge of `SignableDocument` workflow state — it just moves bytes to and from DocuSign.
+
+It is activated only when all five config properties are set:
+
+[source,java]
+----
+@Service
+@ConditionalOnProperty(prefix = "docusign",
+    name = {"api.base.path", "oauth.base.path", "rsa.key.file", "client.id", "user.id"})
+public class DocusignService { ... }
+----
+
+If any property is missing, the bean is not created, and every downstream bean (`DocusignSignatureService`, `DocusignUrlService`, `DocusignWebhookController`, `DocusignJpaConfiguration`) is disabled through `@ConditionalOnBean(DocusignService.class)`. This is the master kill-switch for the module.
+
+**Key entry points:**
+
+[source,java]
+----
+// JWT handshake — not cached, runs on every top-level call
+DocusignSession getSession() throws IOException;
+
+// Create envelope + upload document → returns envelopeId
+String sendToSign(DocusignSession session,
+                  List<DocusignSignerInfo> signers,
+                  String signSubject,
+                  SignableDocument signableDocument) throws IOException;
+
+// Generate embedded signing URL for one recipient
+String getSignUrl(DocusignSession session,
+                  DocusignSignerInfo signerInfo,
+                  String envelopeId,
+                  String returnUrl) throws IOException;
+
+// Pull back completed envelope data — statuses, form fields, signed PDF
+List<EnvelopeInfo> getCompletedEnvelopesInfo(DocusignSession session,
+                                             Set<String> envelopeIds) throws IOException;
+
+// Download the final signed PDF and store it via DocumentStorage
+Document downloadSignedDocument(DocusignSession session,
+                                String envelopeId) throws IOException;
+----
+
+**Document upload — HTML preferred, PDF fallback:**
+
+`sendToSign` inspects `signableDocument.getGeneratedDocuments()` (a `Map<String, Document>` keyed by MIME type) and prefers `text/html` over `application/pdf`. HTML enables Responsive Signing (see the template section above); PDF is a straight base64 upload.
+
+[source,java]
+----
+if (signableDocument.getGeneratedDocuments().containsKey(MediaType.TEXT_HTML_VALUE)) {
+    // DocumentHtmlDefinition with raw HTML source (UTF-8)
+    // fileExtension = "html"
+} else if (signableDocument.getGeneratedDocuments().containsKey(MediaType.APPLICATION_PDF_VALUE)) {
+    // documentBase64 = Base64(pdf bytes)
+    // fileExtension = "pdf"
+} else {
+    throw new RuntimeException("Unexpected content type ...");
+}
+----
+
+If the document generator produced neither HTML nor PDF, the call fails hard. See <<document-templates>> for how generated documents are produced.
+
+**Batch completion fetch — `EnvelopeInfo`:**
+
+`getCompletedEnvelopesInfo` is the efficient path. Instead of three calls per envelope (status + form data + document download), it batches the status list call (`listStatus`), then iterates only the `completed` envelopes and fetches form data + document for each. Non-completed envelopes are silently skipped — callers must treat an absent envelope as "still pending."
+
+[source,java]
+----
+public record EnvelopeInfo(
+    String envelopeId,
+    ZonedDateTime completedDate,
+    Map<String, String> formData,
+    com.timvero.structure.storage.entity.Document signedDocument
+) { }
+----
+
+Parse errors on `completedDateTime` and form-data fetch failures are logged to `System.err` and swallowed — one bad envelope doesn't break the batch.
+
+=== DocusignSignatureService — Signature Processing
+
+This is the high-level workflow orchestrator. Every public method is `@Transactional(rollbackFor = {SignatureException.class, IOException.class})` so a DocuSign API failure mid-flight rolls the `SignableDocument` back to `PENDING_SIGNATURE` rather than leaving it in a half-updated state.
+
+**Lazy envelope creation:**
+
+The core invariant: the DocuSign envelope is created on the *first* `getDocusignUrl` call, not when the `SignableDocument` is created. `ensureEnvelopeCreated()` is the dispatch point:
+
+[source,java]
+----
+private void ensureEnvelopeCreated(DocusignSigner signer, SignableDocument signableDocument)
+        throws SignatureException, IOException {
+
+    if (!signableDocument.isActive()) {
+        throw new InvalidSignatureStateException("Document is not active");
+    }
+    if (signableDocument.getStatus() != SignatureStatus.PENDING_SIGNATURE) {
+        throw new InvalidSignatureStateException("Document status is not PENDING_SIGNATURE, "
+            + "current status: " + signableDocument.getStatus());
+    }
+
+    signer = LockUtils.lock(signer, LockModeType.PESSIMISTIC_WRITE, entityManager);
+    DocusignService.DocusignSession session = docusignService.getSession();
+
+    DocumentSignature signature = EntityUtils.initializeAndUnproxy(signableDocument.getSignature());
+    if (signature == null) {
+        // First call: create envelope, persist DocusignDocumentSignature
+    } else if (signature instanceof DocusignDocumentSignature docusignSignature) {
+        // Subsequent call: poll for completion (fallback when webhook missed)
+    } else {
+        throw new SignatureConfigurationException("Unsupported signature type: ...");
+    }
+}
+----
+
+**Why pessimistic locking on the signer** — two concurrent `getDocusignUrl` calls for the same entity would otherwise create *two* DocuSign envelopes (both `sendToSign` calls succeed independently). The `PESSIMISTIC_WRITE` lock on the `DocusignSigner` serializes the check-then-create, ensuring at most one envelope exists per document. The lock is released when the transaction commits.
+
+**`initializeAndUnproxy`** — `signableDocument.getSignature()` may be a Hibernate proxy (the base `DocumentSignature`). The `instanceof DocusignDocumentSignature` check only works on the unproxied entity — this is a classic JOINED-inheritance gotcha, and skipping the unproxy step causes the branch to silently fall through to the "Unsupported signature type" error even though the underlying entity is in fact a `DocusignDocumentSignature`.
+
+**Polling fallback — when the webhook never arrives:**
+
+If `ensureEnvelopeCreated` is re-entered after the user has signed but before the webhook landed (common in dev when webhook URLs aren't reachable), the `else if` branch detects the existing `DocusignDocumentSignature`, calls `getCompletedEnvelopesInfo`, and — if DocuSign reports the envelope complete — applies the same status/document/formData update as the webhook path. Users can reload the signing page to force a status check.
+
+**Signer consistency validation:**
+
+Before creating an envelope, `validateSignersConsistency` ensures that the *primary* signer (the one implementing `DocusignSigner.getSignerName`/`getSignerEmail`/`getId`) is present in `getAllSigners()`:
+
+[source,java]
+----
+boolean primarySignerFound = signers.stream().anyMatch(signerInfo ->
+    signerInfo.userId().equals(signer.getId()) &&
+    signerInfo.name().equals(signer.getSignerName()) &&
+    signerInfo.email().equals(signer.getSignerEmail())
+);
+----
+
+This catches a common bug where `getAllSigners()` is overridden to return collaborators but the entity itself (the primary) is accidentally omitted.
+
+**Bulk status check — `checkDocusignSignature`:**
+
+Used by scheduled jobs or "Refresh" UI actions. Groups all pending documents for a signer by envelope ID, calls `getCompletedEnvelopesInfo` once, and updates every `SignableDocument` tied to each completed envelope. Returns `true` if no pending documents remain. This is the path you'd wire into a cron if webhooks are unreliable in your deployment.
+
+**Envelope-driven completion — `signDocumentByEnvelopeId`:**
+
+The terminal method both webhooks and polling converge on:
+
+[source,java]
+----
+@Transactional(rollbackFor = {SignatureException.class, IOException.class})
+public void signDocumentByEnvelopeId(String envelopeId) throws SignatureException, IOException {
+    SignableDocument signableDocument = signableDocumentRepository.findBySignatureEnvelopeId(envelopeId);
+    if (signableDocument == null) {
+        throw new SignatureConfigurationException("No document found for envelope ID: " + envelopeId);
+    }
+    if (!signableDocument.isSigned()) {
+        // Pull completed envelope, save signed PDF via storage, flip status to SIGNED
+    }
+}
+----
+
+The `isSigned()` guard is what makes the webhook + polling combination safe: the second arrival is a no-op.
+
+=== DocusignUrlService — Envelope and URL Generation
+
+This service is the web-UI bridge. It sits between Thymeleaf action templates and `DocusignSignatureService`, handling signer/document validation and DocuSign error extraction.
+
+**Availability check:**
+
+[source,java]
+----
+public <T extends DocusignSigner & HasDocuments> boolean isAvailable(T entity, UserAccount user) {
+    return !entity.getAllSigners().isEmpty() &&
+        signableDocumentService.getAllDocuments(entity)
+            .stream()
+            .anyMatch(doc -> doc.getStatus() == SignatureStatus.PENDING_SIGNATURE && doc.isActive());
+}
+----
+
+The generic constraint `T extends DocusignSigner & HasDocuments` is the type-level contract for "this entity can drive DocuSign UI actions." `HasDocuments` gives `SignableDocumentService` a hook to find the candidate documents; `DocusignSigner` gives signer metadata.
+
+**URL generation + model population:**
+
+`generateSigningUrl(entity, signerId, documentId, returnUrl, model)` is what the Thymeleaf action template calls. It:
+
+1. Validates that `signerId` appears in `entity.getAllSigners()` — errors set `errorCode = "docusign.url.error.invalidSigner"`.
+2. Validates that `documentId` is a `PENDING_SIGNATURE` + `isActive()` document — errors set `errorCode = "docusign.url.error.invalidDocument"`.
+3. Delegates to `DocusignSignatureService.getDocusignUrl(entity, signerId, selectedDocument, returnUrl)`.
+4. On success, populates `signingUrl`, `selectedSigner`, `selectedDocument` model attributes.
+5. Returns the fragment template path `"/integration/docusign/action/docusign-url-fragment :: url-content"`.
+
+All errors are caught and turned into template-rendered error codes — the controller never sees an exception. Error codes are localizable via `messages.properties` keys like `docusign.url.error.noSigners`, `docusign.url.error.invalidDocument`, etc.
+
+**DocuSign error extraction:**
+
+When DocuSign returns a JSON error body (e.g. `"The token for an out of sequence recipient cannot be generated."`), the raw exception message is a wrapped stack with the JSON buried inside. `extractDocusignErrorMessage` does a primitive JSON-unaware string scrape:
+
+[source,java]
+----
+if (fullErrorMessage.contains("\"message\":\"")) {
+    int messageStart = fullErrorMessage.indexOf("\"message\":\"") + 11;
+    int messageEnd = fullErrorMessage.indexOf("\"", messageStart);
+    if (messageEnd > messageStart) {
+        return fullErrorMessage.substring(messageStart, messageEnd);
+    }
+}
+----
+
+Good enough for current DocuSign error payloads; replace with a real JSON parser if DocuSign starts returning messages with embedded quotes.
+
+=== DocusignDocumentSignature — JOINED Table Inheritance
+
+`DocusignDocumentSignature` is the persisted state for a DocuSign-backed signature. It participates in the `DocumentSignature` JOINED-inheritance hierarchy defined in the <<documents>> module.
+
+[source,java]
+----
+@Entity
+@Table(name = "docusign_document_signature")
+@DiscriminatorValue("DOCUSIGN")
+public class DocusignDocumentSignature extends DocumentSignature {
+
+    @Column(name = "envelope_id")
+    private String envelopeId;
+
+    @Column(name = "completed_date_time")
+    private ZonedDateTime completedDateTime;
+
+    @Column(name = "form_data")
+    @JdbcTypeCode(SqlTypes.JSON)
+    private Map<String, String> formData;
+    // getters/setters...
+}
+----
+
+**How the JOINED mapping works:**
+
+- The parent `DocumentSignature` (defined in `com.timvero.ground.document.signable`) owns `@Inheritance(strategy = InheritanceType.JOINED)` and `@DiscriminatorColumn(name = "type")`. It stores the common fields (`id`, `signer`, `email`, audit columns, base `DocumentSignature` relationship).
+- `DocusignDocumentSignature` is a subclass with `@DiscriminatorValue("DOCUSIGN")`. Hibernate generates **two tables**: `document_signature` (parent, shared PK) and `docusign_document_signature` (child, only DocuSign-specific columns, shares PK via FK to parent).
+- A query for `DocumentSignature` returns rows from the parent table; Hibernate joins the correct child table based on the discriminator.
+- `signableDocument.getSignature()` returns a Hibernate proxy typed as `DocumentSignature`. To access envelope-specific fields, you must `initializeAndUnproxy` and `instanceof` check — this is why `DocusignSignatureService` does that dance in three places.
+
+**Why JOINED vs. SINGLE_TABLE:**
+
+The base `DocumentSignature` is designed to support multiple signing backends (DocuSign today; could be Adobe Sign, DocHub, HelloSign tomorrow). Each backend has fundamentally different metadata (DocuSign has `envelopeId`; a different provider has a `requestId` and a `workflowId`). `SINGLE_TABLE` would accumulate sparse, nullable columns for every backend on one table; `JOINED` gives each backend its own child table with only its own fields and no nulls.
+
+**The `form_data` column — JSONB in PostgreSQL:**
+
+`@JdbcTypeCode(SqlTypes.JSON)` tells Hibernate to persist the `Map<String, String>` as a JSON column (on PostgreSQL this is `jsonb`). This keeps form fields queryable (`SELECT ... WHERE form_data->>'income' > '50000'`) without schema changes when templates add new fields.
+
+**Cross-reference:** see <<documents>> for the full `DocumentSignature` hierarchy, how `SignableDocument.signature` is wired, and how status transitions are audited.
+
+=== DocusignSigner and DocusignSignerInfo
+
+`DocusignSigner` is the contract an entity implements to participate in DocuSign flows. It composes two existing framework interfaces:
+
+[source,java]
+----
+public interface DocusignSigner extends HasDocuments, Persistable<UUID> {
+    String getSignerName();
+    String getSignerEmail();
+    default Locale getLocale() { return Locale.getDefault(); }
+    default List<DocusignSignerInfo> getAllSigners() {
+        return List.of(new DocusignSignerInfo(getId(), getSignerName(), getSignerEmail(), 1, "signer"));
+    }
+    default boolean isMultipleSigner() { return getAllSigners().size() > 1; }
+}
+----
+
+- **`HasDocuments`** — same contract used by `SignableDocumentService` to locate documents for the entity. See <<documents>>.
+- **`Persistable<UUID>`** — guarantees the entity has a UUID identity, which `DocusignSignerInfo.userId()` uses to generate unique DocuSign role names and client user IDs.
+- **`getLocale()`** — controls the `docusign.email.subject` message-source lookup. Defaults to system default; override to carry per-applicant locale (cross-ref: <<user-management>> for where locale typically lives).
+- **`getAllSigners()`** — default returns a single signer with `timveroRole = "signer"`. Override to add co-signers, guarantors, authorized corporate officers, etc. Routing order controls who signs first.
+
+**`DocusignSignerInfo` — role-name generation:**
+
+[source,java]
+----
+public record DocusignSignerInfo(
+    UUID userId, String name, String email,
+    int routingOrder, String timveroRole
+) {
+    public String clientUserId() { return userId.toString(); }
+    public String dsRole() { return timveroRole + userId; }
+    public String recipientId() { return userId.toString(); }
+}
+----
+
+**The `dsRole()` trick** — DocuSign requires role names to be unique per envelope. A simple `"borrower"` string fails when two people both map to the borrower role. The SDK composes `timveroRole + userId` (e.g. `"borrower7b2c...-..."`) to guarantee uniqueness while keeping the `timveroRole` prefix available for template `data-ds-role` matching. The template author writes `data-ds-role="borrower"`; the SDK handles the prefix match internally at envelope creation.
+
+**`clientUserId` as the embedded-signer key** — Setting `clientUserId` on the DocuSign `Signer` tells DocuSign "this is an embedded signer, not an email-invited one." DocuSign won't email the signing link; instead, the embedded URL returned by `createRecipientView` is the only way this signer can reach the ceremony. This is how the integration avoids DocuSign's default email-based workflow.
+
+=== DocusignWebhookController and WebhookData
+
+The webhook endpoint is a single-method `@RestController`:
+
+[source,java]
+----
+@RestController
+@RequestMapping(value = DocusignWebhookController.PATH, produces = MediaType.APPLICATION_JSON_VALUE)
+@ConditionalOnBean(DocusignSignatureService.class)
+public class DocusignWebhookController {
+    protected static final String PATH = "/callback/docusign";
+
+    @Value("${docusign.user.id}")
+    private String userId;
+
+    @Autowired
+    private DocusignSignatureService docusignSignatureService;
+
+    @PostMapping(value = "/webhook", produces = "application/json;charset=UTF-8")
+    public void handleWebhook(@RequestBody DocusignWebhookResponse payload) throws IOException {
+        if (payload.getData() != null) {
+            if (payload.getData().getUserId().equals(userId)) {
+                String envelopeId = payload.getData().getEnvelopeId();
+                try {
+                    docusignSignatureService.signDocumentByEnvelopeId(envelopeId);
+                } catch (SignatureException e) {
+                    logger.error("Failed to sign document by envelope ID: {}", envelopeId, e);
+                }
+            }
+        }
+    }
+}
+----
+
+**Payload shape — `DocusignWebhookResponse`:**
+
+`DocusignWebhookResponse` (the outer envelope) carries `event`, `apiVersion`, `uri`, `retryCount`, `configurationId`, `generatedDateTime`, and a nested `DocusignWebhookData` with `accountId`, `userId`, `envelopeId`. Only `userId` and `envelopeId` are read — everything else is captured for observability (you can log `retryCount` to spot DocuSign retry storms) but ignored for dispatch.
+
+**UserId filtering — not HMAC verification:**
+
+The controller checks that `payload.getData().getUserId()` matches the configured `docusign.user.id`. This is **ownership verification**, not cryptographic webhook signature verification. An attacker who knows your DocuSign user ID can forge a webhook payload.
+
+If you need stronger verification:
+
+- Put the webhook endpoint behind an allow-list of DocuSign's published IP ranges.
+- Enable **HMAC signing** in the DocuSign Connect configuration (DocuSign signs the POST body with a shared secret; DocuSign's "X-DocuSign-Signature-1" header is then verifiable). The SDK does not yet implement this; add it in a custom webhook controller that overrides the default.
+
+**Graceful handling of unknown envelopes:**
+
+`signDocumentByEnvelopeId` throws `SignatureConfigurationException` when no `SignableDocument` has the given envelope ID. The controller catches this and logs at `error` level — but it does **not** return a 4xx to DocuSign. This is intentional: DocuSign retries on non-2xx responses, and returning 4xx for unknown envelopes would create endless retry loops (e.g. after a DB restore that drops signatures but DocuSign still has the envelope).
+
+**Response type:**
+
+`DocusignWebhookResponse` is used both as the *inbound payload* DTO (the POST body from DocuSign) despite the "Response" suffix in its name. The `DocusignWebhookData` is the nested data object. Neither is exposed to application code — they are internal to the webhook pipeline.
+
+=== Repository — DocusignSignableDocumentRepository
+
+A single custom query extends `CrudRepository<SignableDocument, UUID>`:
+
+[source,java]
+----
+public interface DocusignSignableDocumentRepository extends CrudRepository<SignableDocument, UUID> {
+
+    @Query(value = """
+        select d
+        from SignableDocument d
+        join DocusignDocumentSignature ds on d.signature.id = ds.id
+        where ds.envelopeId = :envelopeId
+        """)
+    SignableDocument findBySignatureEnvelopeId(String envelopeId);
+}
+----
+
+**Why a dedicated repo** — the base `SignableDocumentRepository` (in <<documents>>) doesn't know about DocuSign envelope IDs; they live on the child JOINED table. A JPQL join with the concrete `DocusignDocumentSignature` child is needed to resolve envelope ID → document. Placing this query here keeps the `documents` module DocuSign-agnostic.
+
+**`on d.signature.id = ds.id`** — the JPA relationship walks `SignableDocument.signature` (typed as `DocumentSignature`) and joins to the concrete `DocusignDocumentSignature` by primary key. The base and child share the same `id` by virtue of `@Inheritance(JOINED)`.
+
+Returns `null` (not `Optional`) when no envelope matches — webhook handling and `signDocumentByEnvelopeId` both treat `null` as the signal to raise `SignatureConfigurationException`.
+
+=== DocusignJpaConfiguration
+
+A trivial configuration class — the whole file is eight lines:
+
+[source,java]
+----
+@TimveroEnableJpa
+@Configuration
+@ConditionalOnBean(DocusignService.class)
+public class DocusignJpaConfiguration {
+}
+----
+
+`@TimveroEnableJpa` is the framework's composite annotation that pulls this package into the JPA scan: it enables `DocusignDocumentSignature` as a managed entity and enables `DocusignSignableDocumentRepository` as a Spring Data repository under the same `EntityManagerFactory` as the rest of the app. Without it, the `@Entity` would be invisible to Hibernate and the repository interface would have no implementation at runtime.
+
+The `@ConditionalOnBean(DocusignService.class)` chain means the JPA wiring is skipped entirely when DocuSign is not configured — no empty tables on the schema scan, no unused repositories in the context.
+
+== Anti-Patterns
+
+* {bad} **Calling `getDocusignUrl` from a read-only transaction** — the method creates the envelope on first call and writes `DocusignDocumentSignature` to the DB. A `@Transactional(readOnly = true)` wrapping context throws `TransactionException` on flush; make sure the caller is in a writable transaction (the service method is already `@Transactional` — just don't suppress it from outside).
+* {bad} **Overriding `getAllSigners()` without including the primary signer** — `validateSignersConsistency` throws `SignatureConfigurationException` at envelope creation time. Common mistake: returning `List.of(guarantor, cosigner)` from a borrower entity forgetting the borrower themselves.
+* {bad} **Reusing the same `timveroRole` string for multiple signers** — template `data-ds-role="borrower"` is matched by prefix; if two signers both have `timveroRole = "borrower"`, DocuSign places both signature blocks on the same fields and the ceremony fails validation. Use distinct roles (`"borrower"`, `"cosigner"`, `"guarantor"`).
+* {bad} **Assuming the webhook always fires** — DocuSign Connect can be mis-configured, the endpoint can be behind a firewall, retry budgets can exhaust. Wire `DocusignSignatureService.checkDocusignSignature(signer)` into a scheduled job or an "I just signed, refresh" UI action so completion is recoverable without DB surgery.
+* {bad} **Returning a proxy from `SignableDocument.getSignature()` and skipping `initializeAndUnproxy`** — `instanceof DocusignDocumentSignature` on a Hibernate proxy returns `false` even when the underlying entity is one. Always run through `EntityUtils.initializeAndUnproxy` before the `instanceof` check, exactly as `DocusignSignatureService` does.
+* {bad} **Calling `DocusignService.sendToSign` directly** — it bypasses the lock, the state validation, and the signature persistence. Always go through `DocusignSignatureService.getDocusignUrl` / `sign` / `signDocumentByEnvelopeId`.
+* {bad} **Creating a `SignableDocument` without a generated HTML *or* PDF body** — `sendToSign` throws `RuntimeException("Unexpected content type ...")` if neither MIME type is populated in `getGeneratedDocuments()`. Ensure the document-generation pipeline (see <<document-templates>>) runs before the signing URL request.
+* {bad} **Storing the private key in the Git repo under `src/main/resources/docusign/private.key`** — it works in dev and leaks in prod. Use `file:${DOCUSIGN_KEY_PATH}` pointing at a path injected by the secrets manager.
+* {bad} **Trusting `DocusignWebhookData.userId` as authentication** — it's metadata, not a signature. Layer network-level protection (IP allow-list, mTLS, or DocuSign Connect HMAC verification) in front of the endpoint if your threat model includes forged webhooks.
+
+== Production Checklist
+
+* {todo} `docusign.rsa.key.file` points at a path managed by your secrets system; the private key is **not** in source control
+* {todo} `docusign.api.base.path` and `docusign.oauth.base.path` point at production DocuSign (not the `demo.docusign.net` / `account-d.docusign.com` sandbox)
+* {todo} `docusign.client.id` and `docusign.user.id` are the production integration's values; the integration has Admin consent granted (one-time) for JWT impersonation
+* {todo} DocuSign Connect is configured with the production webhook URL (`https://<host>/callback/docusign/webhook`) and subscribed to at least "Envelope Completed"
+* {todo} Webhook endpoint is reachable from DocuSign's IP ranges (firewall / WAF rules reviewed)
+* {todo} A scheduled fallback job invokes `DocusignSignatureService.checkDocusignSignature(signer)` for signers with `PENDING_SIGNATURE` documents — covers webhook delivery failures
+* {todo} Responsive Signing is enabled for the DocuSign account (if HTML templates are used) — verified by contacting DocuSign support
+* {todo} Every `timveroRole` used in `getAllSigners()` has a matching `data-ds-role=` in the corresponding HTML template, and vice-versa
+* {todo} `messages.properties` has `docusign.email.subject` entries for every locale returned by `getLocale()`
+* {todo} `messages.properties` has entries for all `docusign.url.error.*` codes (`noSigners`, `noDocuments`, `invalidSigner`, `invalidDocument`, `signatureFailed`)
+* {todo} Status transitions on `SignableDocument` are surfaced in the entity history tab (cross-ref: <<audit-module-sdk-reference-internals>> — `DocusignDocumentSignature` is audited)
+* {todo} Signed PDFs land in durable storage (not ephemeral container disks) — verify `DocumentStorage` backend in <<storage>>
+* {todo} Webhook endpoint returns 2xx for unknown envelopes (current behavior) so DocuSign retries don't storm after data restores
+* {todo} Logs from `DocusignUrlService` (entity/signer/document IDs + duration) are shipped to the log aggregator — these are the primary debugging signal for signing failures
+* {todo} JWT token lifetime (3600s hard-coded in `getSession`) is acceptable for your audit policy; if not, shorten by forking `DocusignService`
+
+**Related:** <<documents>> (signable-document subsystem and the `DocumentSignature` JOINED hierarchy that `DocusignDocumentSignature` extends), <<notifications>> (completion of a signature typically triggers a notification event), <<storage>> (signed PDFs persist via `DocumentStorage` as a `Document`), <<audit-module-sdk-reference-internals>> (every signature status transition is Envers-audited), <<user-management>> (signer name/email/locale resolve from `UserAccount`), <<api-integration>> (the JWT-based machine-to-machine auth pattern mirrors DocuSign's), <<document-templates>> (the HTML and PDF bodies uploaded to DocuSign are generated here).
+
+**Next:** <<documents>>, <<audit-module-sdk-reference-internals>>, <<notifications>>.

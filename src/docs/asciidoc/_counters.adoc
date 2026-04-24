@@ -1,3 +1,4 @@
+[[counters]]
 = Entity Counters and Launchpad Integration
 
 :sourcedir: ../../main/java/com/timvero/example/admin
@@ -40,19 +41,65 @@ The integration works as follows:
 
 == Core Concepts
 
-=== EntityCounter Interface
+=== EntityMarker — The Base Abstraction
 
-The `EntityCounter` interface defines how to identify and count entities:
+Before diving into counters, understand the unifying interface — `EntityMarker<T>` (from `com.timvero.ground.entity_marker`):
 
 [source,java]
 ----
-public interface EntityCounter<T> {
-    boolean isEntityMarked(T entity);
-    String getName();
+public interface EntityMarker<T extends Persistable<?>> {
+
+    boolean isEntityMarked(T entity);     // <1>
+
+    String getName();                     // <2>
 }
 ----
+<1> Check entity state — should this entity be marked (labeled / counted)?
+<2> Marker name — used for i18n, template lookup, and UI wiring
 
-**Key Methods:**
+Two branches descend from `EntityMarker`:
+
+[source]
+----
+    EntityMarker<T>                              (base abstraction)
+         │
+         ├── EntityLabel<T>          (label/)    UI decoration
+         │      │
+         │      └── EntityStatusLabel<T>         convenience for status-based labels
+         │
+         └── EntityCounter<T>        (counter/)  dashboard tiles with counts
+                │
+                (+ optional DailyUpdateCounter interface for date-sensitive counters)
+----
+
+The same `isEntityMarked()` predicate does double duty:
+
+- **Labels** — the predicate decides whether to render a badge/tag next to the entity
+- **Counters** — the predicate decides whether this entity is included in the dashboard count
+
+This is why counters and labels are often paired: declare the business condition once (in a label) and reuse it in a counter via `@Autowired` + delegation.
+
+=== EntityCounter Interface
+
+The `EntityCounter` interface extends `EntityMarker` with two optional methods for advanced counting:
+
+[source,java]
+----
+public interface EntityCounter<T extends Persistable<?>> extends EntityMarker<T> {
+
+    default Specification<T> getCandidateSpecification() {    // <1>
+        return null;
+    }
+
+    default List<DependentEntity<?, T>> getDependentEntities() {    // <2>
+        return Collections.emptyList();
+    }
+}
+----
+<1> Narrows the candidate set **at the DB level** before applying `isEntityMarked()`. Without this, initial setup scans all entities of this type. See <<advanced-counter-patterns>>.
+<2> Declares related entities whose changes should trigger re-evaluation of this counter. Essential for counters that depend on data in child entities. See <<advanced-counter-patterns>>.
+
+**Key Methods (inherited from EntityMarker):**
 
 * **`isEntityMarked(T entity)`**: Returns `true` if entity should be counted
 * **`getName()`**: Returns counter identifier used for templates and internationalization
@@ -113,6 +160,460 @@ include::{sourcedir}/credit/label/CreditPaidLabel.java[]
 2. **Status Validation**: Verifies credit is in `ACTIVE` status
 3. **Debt Calculation**: Confirms total debt is empty (paid off)
 4. **Monetary Handling**: Works with `MonetaryAmount` for financial calculations
+
+== Labels Subsystem
+
+The label subsystem reuses the same `EntityMarker` contract to render UI decorations (badges, status pills, warning markers) next to entities in lists and detail pages.
+
+=== EntityLabel<T>
+
+[source,java]
+----
+public interface EntityLabel<T extends Persistable<?>> extends EntityMarker<T> {
+
+    default String getGroup() { return "label"; }         // <1>
+
+    default Object getName(T entity) { return getName(); }  // <2>
+}
+----
+<1> Grouping for template rendering. Default `"label"` puts it in the generic badge area; override (e.g. `"status"`) to render in a specific UI slot.
+<2> Per-entity name override — allows the displayed label to vary by entity state (e.g., show the current status value rather than a constant).
+
+=== EntityStatusLabel<T> — Status-Based Convenience
+
+The most common label case: "show the entity's status as a colored pill". The SDK provides a convenience base:
+
+[source,java]
+----
+public abstract class EntityStatusLabel<T extends Persistable<?>> implements EntityLabel<T> {
+
+    private final Function<T, ?> statusFunction;
+
+    public EntityStatusLabel(Function<T, ?> statusFunction) {
+        this.statusFunction = statusFunction;
+    }
+
+    @Override public boolean isEntityMarked(T entity) { return getName(entity) != null; }
+    @Override public String getGroup() { return "status"; }            // <1>
+    @Override public Object getName(T entity) { return statusFunction.apply(entity); }
+    @Override public String getName() { throw new RuntimeException("Must not be used"); }  // <2>
+}
+----
+<1> Always `"status"` — pins this to the status-badge UI slot
+<2> The no-argument `getName()` is intentionally broken — `EntityStatusLabel` requires the entity-aware overload, because the label text IS the status value
+
+Real usage from `timvero-example`:
+
+[source,java]
+----
+@Component
+@Order(1000)
+public class CreditProductStateLabel extends EntityStatusLabel<ExampleCreditProduct> {
+
+    public CreditProductStateLabel() {
+        super(ExampleCreditProduct::getState);
+    }
+
+    @Override
+    public boolean isEntityMarked(ExampleCreditProduct entity) {
+        return entity.getState() != null;
+    }
+}
+----
+
+i18n keys follow the pattern `<group>Label.<status>`:
+
+[source,properties]
+----
+statusLabel.DRAFT=Draft
+statusLabel.ACTIVE=Active
+statusLabel.INACTIVE=Inactive
+----
+
+For custom (non-status) labels — i.e., direct `EntityLabel` implementations with `getGroup() == "label"` — the key pattern is `label.<name>`.
+
+=== When to Use Labels vs Counters
+
+[cols="2,3", options="header"]
+|===
+|Use |For
+
+|**`EntityLabel`** / `EntityStatusLabel`
+|Per-entity UI decoration in lists, detail pages, search results. Renders once per row.
+
+|**`EntityCounter`**
+|Dashboard tiles with aggregate counts + drilldown. Global per-user view.
+
+|**Both** (paired via delegation)
+|Business condition that needs both a visual marker AND a dashboard count. Declare in the label, delegate from the counter.
+|===
+
+=== EntityLabelService — Web-Layer Label Resolution
+
+`EntityLabel` beans declare the rule; they do not render themselves. The web layer has a singleton `EntityLabelService` (`com.timvero.web.common.label.EntityLabelService`) that collects every `EntityLabel<?>` bean at startup and — given a concrete entity instance — returns the list of labels that currently apply, together with i18n keys ready to feed into the template.
+
+[source,java]
+----
+@Service
+public class EntityLabelService {
+
+    @Autowired(required = false)
+    public void addLabels(List<EntityLabel<?>> labels) {           // <1>
+        for (EntityLabel<?> label : labels) {
+            Class<?>[] typeArguments = GenericTypeResolver
+                .resolveTypeArguments(label.getClass(), EntityLabel.class);
+            Class<?> entityClass = typeArguments[0];
+
+            String entityPath = pathRegistry.getPath(entityClass);
+            String nameGroup = entityPath.substring(1).replace('/', '.')
+                + "." + label.getGroup();                          // <2>
+            String colorGroup = nameGroup + ".color";
+            labelDetails.add(new LabelDetails(entityClass, label, nameGroup, colorGroup));
+        }
+        labelMap.clear();
+    }
+
+    public List<LabelDescription> getLabelsForEntity(Persistable<?> entity) {  // <3>
+        Class<?> clazz = EntityUtils.getClassWithoutInitializingProxy(entity);
+        return labelMap.computeIfAbsent(clazz, this::findLabels).stream()
+            .filter(d -> ((EntityLabel) d.label).isEntityMarked(entity))
+            .map(d -> new LabelDescription(
+                ((EntityLabel) d.label).getName(entity),
+                d.nameGroup, d.colorGroup))
+            .collect(Collectors.toList());
+    }
+}
+----
+<1> Spring injects every `EntityLabel<?>` bean. The service resolves the generic type parameter so it knows which entity class each label applies to.
+<2> i18n key groups are derived from the entity path + `getGroup()` — e.g. an `EntityStatusLabel<Application>` with default `"status"` group produces name key prefix `application.status` and color key `application.status.color`. Templates use these groups with `#{...}` lookups.
+<3> Called from Thymeleaf fragments: `#{entityLabelService.getLabelsForEntity(entity)}` — returns a `List<LabelDescription>` (record-like holder exposing `name`, `nameGroup`, `colorGroup`). A proxy-safe class lookup guards against Hibernate lazy proxies returning the wrong class.
+
+**Caching behaviour:** the per-class label list is memoized in `labelMap` (a `ConcurrentHashMap`). Adding a new label bean invalidates the cache via `labelMap.clear()`.
+
+**Template invocation pattern** (Thymeleaf list/row fragment):
+
+[source,html]
+----
+<span th:each="label : ${@entityLabelService.getLabelsForEntity(entity)}"
+      th:class="'label label-' + #{${label.colorGroup} + '.' + ${label.name}}"
+      th:text="#{${label.nameGroup} + '.' + ${label.name}}">
+</span>
+----
+
+The template does two i18n lookups per label — one for the display text (using `nameGroup`) and one for the colour class (using `colorGroup`). This is why `EntityStatusLabel` intentionally breaks the no-arg `getName()`: the rendered label text is the per-entity status value, fetched via `getName(entity)`.
+
+See <<thymeleaf-helpers-expression-objects-lazy-unwrapping>> for how the `entity` passed in is unwrapped from lazy proxies, and <<pebble-filters>> for the parallel rendering path used by Pebble-based templates. {ok}
+
+[[advanced-counter-patterns]]
+== Advanced Counter Patterns
+
+=== DependentEntity — Refresh on Related Entity Changes
+
+Many counters depend on data that lives in a related entity. Example: "count credits whose **latest operation** is failing". When a `CreditOperation` changes, the parent `Credit`'s counter status changes — but the counter registered against `Credit.class` wouldn't normally react to `CreditOperation` events.
+
+`DependentEntity<D, E>` declares the dependency:
+
+[source,java]
+----
+public class DependentEntity<D extends Persistable<?>, E extends Persistable<?>> {
+
+    private final Class<D> entityClass;                          // <1>
+    private final Function<D, E> getCounterEntityFunction;       // <2>
+
+    public DependentEntity(Class<D> entityClass, Function<D, E> getCounterEntityFunction) { /* ... */ }
+}
+----
+<1> The **dependent** entity class — the one whose changes should trigger re-evaluation
+<2> How to navigate from the dependent entity back to the counter's target entity
+
+Usage:
+
+[source,java]
+----
+@Component
+public class CreditWithFailingOperationCounter implements EntityCounter<ExampleCredit> {
+
+    @Override
+    public boolean isEntityMarked(ExampleCredit credit) {
+        return credit.getLatestOperation() != null
+            && credit.getLatestOperation().getStatus() == OperationStatus.FAILED;
+    }
+
+    @Override
+    public List<DependentEntity<?, ExampleCredit>> getDependentEntities() {
+        return List.of(
+            new DependentEntity<>(CreditOperation.class, CreditOperation::getCredit)  // <1>
+        );
+    }
+
+    @Override public String getName() { return "creditWithFailingOperation"; }
+}
+----
+<1> "When any `CreditOperation` changes, get its parent `Credit` via `::getCredit` and re-evaluate THIS counter for that credit"
+
+Without `DependentEntity`, the counter would only refresh on direct `Credit` changes — a failing operation would never flip the counter state.
+
+=== DailyUpdateCounter — Date-Sensitive Counters
+
+For counters whose result depends on "today's date" — e.g., "credits overdue as of today", "applications expiring in 7 days":
+
+[source,java]
+----
+public interface DailyUpdateCounter {
+    void setDate(LocalDate date);
+}
+----
+
+Implement on the counter class:
+
+[source,java]
+----
+@Component
+public class OverdueCreditCounter implements EntityCounter<ExampleCredit>, DailyUpdateCounter {
+
+    private LocalDate today = LocalDate.now();    // <1>
+
+    @Override
+    public void setDate(LocalDate date) {
+        this.today = date;
+    }
+
+    @Override
+    public boolean isEntityMarked(ExampleCredit credit) {
+        return credit.getDueDate() != null && credit.getDueDate().isBefore(today);
+    }
+
+    @Override public String getName() { return "creditOverdue"; }
+}
+----
+<1> Initial value in case `setDate` hasn't been called yet (e.g., during startup scan)
+
+`EntityCounterService` calls `setDate(LocalDate.now())` at startup and on every scheduled daily refresh (via `counters.daily.cron` property). Between midnight ticks, the date stays fixed — so overdue status is stable within a day even as entities are evaluated repeatedly.
+
+=== CounterUpdateConsumer — Frontend Push
+
+When a counter value changes, notify the frontend to update without a page reload:
+
+[source,java]
+----
+public interface CounterUpdateConsumer {
+    void update(Map<String, Integer> counters);
+}
+----
+
+Register consumers with `EntityCounterService.addConsumer(consumer)`. Typical implementation publishes to an SSE stream or WebSocket:
+
+[source,java]
+----
+@Component
+public class CounterSseConsumer implements CounterUpdateConsumer {
+
+    @Autowired private SseEmitterRegistry sseRegistry;
+
+    @Override
+    public void update(Map<String, Integer> counters) {
+        sseRegistry.broadcast("counter-update", counters);
+    }
+}
+----
+
+The SDK's Launchpad already wires this up — see <<launchpad>>. Register your own consumer only if you need alternative delivery (Slack bot, email digest, custom push).
+
+=== EntityCounterFilterService — Per-User Filtering
+
+Some counters should show different totals per user — e.g., "my assigned applications" instead of "all applications". Extend `EntityCounterFilterService`:
+
+[source,java]
+----
+@Service
+public class UserAwareCounterFilterService extends EntityCounterFilterService {
+
+    @Override
+    public Predicate<Persistable<?>> getFilterByUser(String counterName, UserAccount user) {
+        return entity -> {
+            if ("myApplications".equals(counterName) && entity instanceof Application app) {
+                return app.getAssignee() != null && app.getAssignee().equals(user);
+            }
+            return true;
+        };
+    }
+}
+----
+
+The base class scans `@Autowired` `EntityCounter` beans and resolves their generic types via `GenericTypeResolver` for type-safe filtering. Per-user counts are computed on demand — not cached — so each user sees their own view without cache-pollution.
+
+== Counter Internals
+
+Understanding the mechanics helps debug counter bugs and size infrastructure correctly.
+
+=== EntityCounterService — The Orchestrator
+
+`EntityCounterService` is the `@Service` that owns the full lifecycle:
+
+[source]
+----
+                  Startup (@PostConstruct)
+                         │
+                         ▼
+               ┌────────────────────────┐
+               │ 1. Register all        │
+               │    EntityCounter beans │
+               │    in counterSetsMap   │
+               └───────────┬────────────┘
+                           │
+                           ▼
+               ┌────────────────────────┐
+               │ 2. Schedule:           │
+               │    - setupCounters     │
+               │      (+60s from start) │
+               │    - refreshCounters   │
+               │      (daily cron)      │
+               └───────────┬────────────┘
+                           │
+                           ▼
+      Runtime:   EntityChangeEvent<T>  (from EntityChangeIntegrator)
+                           │
+                           ▼
+               ┌────────────────────────────┐
+               │ handle(event) {            │
+               │   find counters matching   │
+               │   entity class or via      │
+               │   DependentEntity mapping  │
+               │ }                          │
+               └───────────┬────────────────┘
+                           │
+                           ▼ async on counterExecutor pool
+               ┌────────────────────────┐
+               │ CounterRefreshTask     │
+               │ .refreshCountersForEntity│
+               │ → counter.isEntityMarked│
+               │ → struct.add/removeId  │
+               └───────────┬────────────┘
+                           │
+                           ▼ JCache CAS update
+               ┌────────────────────────┐
+               │ CounterDataStruct      │
+               │ (cache-backed storage) │
+               └───────────┬────────────┘
+                           │ cache entry changed
+                           ▼
+               ┌────────────────────────┐
+               │ CounterCacheEntryListener│
+               │ → sendUpdate(counters) │
+               │ → each CounterUpdate   │
+               │   Consumer.update()    │
+               └────────────────────────┘
+----
+
+Key points:
+
+- **Initial setup is deferred 60 seconds after startup** — gives the application time to fully warm up before an expensive scan
+- **Daily refresh** runs on `counters.daily.cron` — resets the cache from an authoritative DB scan
+- **Event-driven updates** run on a dedicated thread pool (`counterExecutor`) — counter logic doesn't block the commit path
+- **Cache-entry listeners** propagate changes to frontend consumers
+
+=== CounterDataStruct — JCache Storage with CAS
+
+Counter state is stored in a JCache instance (default cache name: `"counters"`, configurable via `counters.cache.name`). One cache entry per counter, encoded as a string:
+
+[source]
+----
+Key:    counterName (e.g., "applicationManualReview")
+Value:  "//@<id1>#@<id2>#@<id3>#..."
+----
+
+Format:
+
+- `"//"` — initialization sentinel; absence means "not initialized yet"
+- `"@<id>#"` — one entry per marked entity ID
+
+Why a string rather than a `Set<UUID>`? JCache requires serializable values and the Redisson backend serializes every operation — a raw string with token-based encoding is cheaper than round-tripping a full collection. Updates use **compare-and-swap retry** (up to `counters.max.retries`, default 100):
+
+[source,java]
+----
+for (int i = 0; i < maxRetries; i++) {
+    String oldValue = cache.get(cacheName);
+    String newValue = oldValue + "@" + entityId + "#";
+
+    if (cache.replace(cacheName, oldValue, newValue)) {
+        return true;     // success
+    }
+    // someone else updated — retry
+}
+throw new IllegalStateException("Failed to update cache after " + maxRetries + " retries");
+----
+
+This avoids lock contention when many entities mutate concurrently. If the failure mode (100 retries exhausted) appears in logs, tune `counters.max.retries` upward OR review whether the counter is too hot for the cluster.
+
+=== CounterRefreshTask — Async Per-Entity Updates
+
+Every entity change triggers `CounterRefreshTask.refreshCountersForEntity`, which runs:
+
+- **`@Async(counterExecutor)`** — off the commit thread, on a dedicated pool
+- **`@Transactional`** — reads the committed entity via `entityManager.find()`
+
+The task receives the list of relevant counters (matched by entity class or `DependentEntity`), re-evaluates `isEntityMarked()` for each, and calls `addEntityId` / `removeEntityId` on the cache struct. A mismatch (exception) de-initializes the counter so the next scheduled refresh rescans from scratch.
+
+=== CounterThreadConfiguration
+
+Dedicated thread pool for counter work:
+
+[source,java]
+----
+@Configuration
+public class CounterThreadConfiguration {
+    protected static final String EXECUTOR_NAME = "counterExecutor";
+
+    @Value("${counter.core.pool.size}") private int corePoolSize;
+    @Value("${counter.max.pool.size}") private int maxPoolSize;
+
+    @Bean(name = EXECUTOR_NAME)
+    TaskExecutor counterTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(corePoolSize);
+        executor.setMaxPoolSize(maxPoolSize);
+        executor.setThreadNamePrefix("counterExecutor-");
+        executor.initialize();
+        return executor;
+    }
+}
+----
+
+Required properties — **must be set** in `application.properties`:
+
+[source,properties]
+----
+counter.core.pool.size=4
+counter.max.pool.size=16
+counters.daily.cron=0 0 1 * * *             # 01:00 every day
+counters.cache.name=counters                # optional, default "counters"
+counters.max.retries=100                    # optional, default 100
+----
+
+If pool sizes aren't set, the application won't start — they have no defaults on `@Value`.
+
+=== RefreshCountersControlButton — Manual Refresh
+
+SDK provides an operator button to force a full rescan via `EntityCounterService.refreshCounters()`:
+
+[source,java]
+----
+@Component
+public class RefreshCountersControlButton implements ControlButton {
+    @Override public String code() { return "refresh-counters"; }
+    @Override public String caption() { return "Refresh counters"; }
+    @Override public String permission() { return SYSTEM_CONTROL; }
+    @Override public void execute() { entityCounterService.refreshCounters(); }
+}
+----
+
+Appears in the admin "System Control" panel. Use when:
+
+- Counter values look wrong after a bulk DB migration
+- An event listener was temporarily misfiring and state drifted
+- Testing — verify `isEntityMarked` logic against fresh data
+
+Does not skip the async pipeline — it just re-runs the full scan path that the daily cron uses.
 
 == Configuration and Setup
 
@@ -230,6 +731,104 @@ The main dashboard template integrates all counters:
 2. **Dynamic URLs**: Builds counter-specific endpoints
 3. **Internationalization**: Uses counter names for i18n lookup
 4. **JavaScript Integration**: Provides hooks for dynamic counter updates
+
+=== EntityCounterController — HTTP Endpoint
+
+The `data-counter-url` attribute used by the dashboard JS resolves to a Spring MVC controller — `com.timvero.web.common.dashboard.EntityCounterController` — that serves the drilldown table for a single counter.
+
+[source,java]
+----
+@Controller
+@RequestMapping(value = EntityCounterController.URL)           // "/counter"
+public class EntityCounterController {
+
+    public static final String URL = "/counter";
+    public static final String PATH = "/dashboard/counter";
+    public static final String TABLE_PATH = "/counter-table";
+    public static final String DEFAULT_ENTITY_VIEW_PATH = "/default";
+
+    @GetMapping("/{counterName}")                              // <1>
+    public String getCounterEntitiesTable(
+        @PathVariable String counterName,
+        @RequestParam(required = false) Optional<Integer> count,
+        Model model, UserAccount user) {
+
+        List<? extends Persistable<?>> counterEntities = count.isPresent()
+            ? counterService.getCounterEntities(counterName, count.get())
+            : counterService.getCounterEntities(counterName);
+
+        if (counterEntities != null) {
+            Predicate<Persistable<?>> filterByUser = getFilterByUser(counterName, user);   // <2>
+            counterEntities = counterEntities.stream().filter(filterByUser).toList();
+            model.addAttribute("entities", counterEntities);
+        }
+        model.addAttribute("totalCount", counterEntities != null ? counterEntities.size() : -1);
+
+        String entityPath = entityActionPathRegistry.getPath(
+            counterService.getCounterEntityClass(counterName));
+        model.addAttribute("url", entityPath);
+        model.addAttribute("entityListView",
+            PATH + (entityPath == null ? DEFAULT_ENTITY_VIEW_PATH : entityPath));    // <3>
+
+        return PATH + TABLE_PATH;                              // /dashboard/counter/counter-table
+    }
+
+    @GetMapping("/{counterName}/count")                        // <4>
+    public @ResponseBody Long getCounterEntitiesCount(
+        @PathVariable String counterName, UserAccount user) { /* ... */ }
+}
+----
+<1> URL pattern `GET /counter/{counterName}?count=10` — returns the rendered drilldown table fragment. `count` is the page-size hint used by the JS "show more" button; omitted means "use the counter's default cap".
+<2> Per-user filtering — if `EntityCounterFilterService` is defined, it produces a `Predicate` that strips entities the current user is not authorised to see. See <<user-roles>> for how user roles control counter visibility.
+<3> `entityListView` resolves to a per-entity-class template fragment (e.g. `/dashboard/counter/application`); falls back to `/default` when no custom fragment exists. The path is derived from `EntityActionPathRegistry`, so it respects the same URL layout used by edit/view links elsewhere.
+<4> URL pattern `GET /counter/{counterName}/count` — returns a plain JSON `Long` for AJAX polling. Returns `-1L` if the counter is not registered or not available to the user.
+
+**Permission check:** neither endpoint requires an explicit `@Secured` annotation — access is gated upstream by Spring Security mapping for `/counter/**`, plus the per-counter visibility rules from `EntityCounterService.getCounterNamesListAvailableForUser(...)`. {ok}
+
+=== NoticeHandler — WebSocket Push for Dashboard Counters
+
+Polling every counter would be wasteful. `com.timvero.web.common.dashboard.NoticeHandler` bridges the server-side counter cache to a per-user STOMP queue so that the dashboard tile numbers update in real time.
+
+[source,java]
+----
+@Controller
+public class NoticeHandler {
+    private static final String DASHBOARD_COUNTER_URL = "/dashboard-counter";
+    private static final String TOPIC_PREFIX = "/topic";
+    private static final String QUEUE_PREFIX  = "/queue";
+
+    @PostConstruct
+    protected void init() {
+        if (entityChangeHandlerEnabled) {                                   // <1>
+            eventService.addListener(this.new EntityChangeHandler());
+        }
+        counterService.addConsumer(this::updateCounter);                    // <2>
+    }
+
+    @SubscribeMapping(DASHBOARD_COUNTER_URL)                                // <3>
+    public Map<String, Integer> subscribeOnCounters(Authentication token) {
+        return getCounters((BackOfficeUserDetails) token.getPrincipal());
+    }
+
+    private void updateCounter(Map<String, Integer> map) {                  // <4>
+        map.forEach(counterMap::put);
+        simpUserRegistry.getUsers().forEach(user -> {
+            BackOfficeUserDetails u = (BackOfficeUserDetails)
+                ((Authentication) user.getPrincipal()).getPrincipal();
+            template.convertAndSendToUser(
+                u.getAccount().getLogin(),
+                QUEUE_PREFIX + DASHBOARD_COUNTER_URL,
+                getCounters(u));
+        });
+    }
+}
+----
+<1> Gated by `application.entityChangeHandler.enabled` (default `false`). When enabled, every `EntityChangeEvent` publishes a cache-bust notice on `/topic{entityPath}` (and, if the entity is viewable, on `/topic{entityPath}/{id}`) so open list/detail pages can reload themselves. This is the SSE-adjacent counterpart described in <<reload-infrastructure-live-ui-updates-on-entity-changes>>.
+<2> Registers as a `CounterUpdateConsumer` — whenever `EntityCounterService` publishes new counter values, `updateCounter` fires.
+<3> Initial snapshot: when the dashboard JS connects to `/app/dashboard-counter`, `NoticeHandler` replies with the current counter values visible to that user. This is the first tile value the user sees on login.
+<4> Fan-out on update: iterates over every connected STOMP user, filters the full counter map down to that user's visible counter set, and pushes via the per-user queue `/user/queue/dashboard-counter`. This is why the Launchpad tile counts tick without a page reload (see <<launchpad>>).
+
+`counterMap` is a `ConcurrentHashMap<String, Integer>` — it's an in-memory fan-out buffer, not a source of truth; the durable store remains `CounterDataStruct`. {ok}
 
 == Performance Considerations
 
@@ -384,3 +983,46 @@ propagation to avoid race conditions.
 ```
 
 Entity counters provide powerful workflow command centers that seamlessly integrate dashboard visibility with Launchpad decision-making. They enable efficient workflow management by surfacing entities requiring attention and providing direct access to decision processing interfaces.
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Heavy logic or DB queries inside `isEntityMarked()`** — runs on every entity change and during full rescans; a slow predicate multiplies across thousands of entities
+* {bad} **Forgetting `DependentEntity` declarations** when the counter depends on related entity state — counter goes stale until the next daily refresh (up to 24 hours)
+* {bad} **Mutating state inside `isEntityMarked()`** — runs inside a read-only transaction on the scan path; any writes fail or corrupt; also fires unpredictably many times per commit
+* {bad} **Using `EntityCounter` for per-user views without `EntityCounterFilterService`** — the cache is global; all users see the same total
+* {bad} **Creating counters for very-high-churn entities** (audit log rows, metric samples) — every change triggers async evaluation; the `counterExecutor` pool may back up
+* {bad} **Forgetting `DailyUpdateCounter` on date-sensitive counters** — result is evaluated against an arbitrary past `LocalDate`; on day N the counter silently uses day N-30's date
+* {bad} **Depending on counter value being instantly consistent** — updates are async via thread pool + cache CAS; expect ~100ms-1s lag. Don't use counters as source-of-truth for business decisions
+* {bad} **Returning `null` from `getName()`** — breaks registration, i18n, and cache key; always return a unique, stable, kebab/camel-case identifier
+* {bad} **Calling `EntityCounterService.refreshCounters()` from application code** — it's a heavyweight operator operation. Use `EntityChangeEvent` triggers and the scheduled daily refresh; invoke full refresh only from the SDK control button
+* {bad} **Catching `DataIntegrityViolationException` in the counter path** — cache CAS failures are part of normal operation; the retry loop handles them; intercepting breaks the retry
+
+== Production Checklist
+
+[.unstyled]
+* {todo} `counter.core.pool.size` and `counter.max.pool.size` set in `application.properties` (no defaults)
+* {todo} `counters.daily.cron` set to a low-traffic window (default shows in logs; should not collide with your other scheduled tasks)
+* {todo} `counters.cache.name` (optional, default `counters`) — confirm the JCache provider (EhCache / Redisson) is configured
+* {todo} For multi-node deployments: cache uses Redisson (distributed) — otherwise each node has its own counter view and totals drift
+* {todo} Every `EntityCounter` bean has `@Component` + unique `getName()`
+* {todo} `@Order` values grouped logically (applications: 1000-1999, credits: 2000-2999, etc.)
+* {todo} i18n `counter.{name}=...` keys defined for every counter
+* {todo} `DependentEntity` declared wherever the counter's logic depends on related entity state
+* {todo} `DailyUpdateCounter` implemented on date-sensitive counters
+* {todo} `EntityCounterFilterService` override present if per-user views are required
+* {todo} Dashboard template wired up (see Dashboard Integration above)
+* {todo} `isEntityMarked()` is read-only and fast (no DB queries; delegate to labels for reuse)
+* {todo} Launchpad navigation from counter drilldown works (see <<launchpad>>)
+* {todo} `@NotTrackable` applied to entities that should NOT trigger counter re-evaluation (see <<reload-infrastructure-live-ui-updates-on-entity-changes>>)
+* {todo} Monitoring: alert on `counterExecutor` queue depth — indicates back-pressure
+* {todo} Monitoring: alert on repeated `"Failed to update cache after N retries"` — indicates counter cache contention
+* {todo} `/counter/**` URL space permission-gated by Spring Security (counter-visibility role) — see <<user-roles>>; `EntityCounterFilterService` applied on top for per-user row filtering
+* {todo} `application.entityChangeHandler.enabled=true` in environments where open list/detail pages must self-refresh on change; STOMP broker (`/topic`, `/user/queue`) reachable from the dashboard JS
+* {todo} `EntityLabelService` i18n keys defined for every label group — `{entityPath}.{group}.{name}` for text and `{entityPath}.{group}.color.{name}` for the colour class
+
+---
+
+**Related:** <<reload-infrastructure-live-ui-updates-on-entity-changes>>, <<launchpad>>, <<entity-module-sdk-reference-hierarchy>>, <<entity-history>>
+
+**Next:** <<launchpad>>, <<bi-dashboard>>
