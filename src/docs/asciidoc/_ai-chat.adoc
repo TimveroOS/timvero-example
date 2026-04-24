@@ -1,0 +1,240 @@
+= AI Chat Panel — setup & usage
+
+The AI Chat Panel is an LLM-powered assistant embedded in the platform's editor pages. It streams responses in real time, renders markdown with syntax-highlighted code blocks, and lets users apply generated code directly to the editor with a single click. The panel is context-aware — it knows the language, available variables, and business rules for each editor type.
+
+The panel appears on the following pages when the feature is enabled:
+
+* **Notification Template editor** — generates Pebble templates for email, SMS, and letter content
+* **Document Template editor** — generates Pebble templates for contracts and agreements
+* **Offer Engine Script editor** — generates JavaScript scoring and pricing logic
+* **Metric Mapping editor** — generates JavaScript metric calculation expressions
+* **Covenant Specification editor** — generates JavaScript compliance rule expressions
+
+Users can attach reference documents (PDF, DOCX, XLSX, CSV, TXT, MD) and images alongside their messages for additional context.
+
+== Enabling the Feature
+
+The feature is disabled by default. Add three properties to `application.properties`:
+
+[source,properties]
+----
+ai.chat.enabled=true
+ai.chat.provider=anthropic
+spring.ai.anthropic.api-key=${ANTHROPIC_API_KEY}
+----
+
+Then add the provider dependency to `pom.xml` (see <<provider-configuration>>). All other properties have sensible defaults.
+
+== Provider Configuration [[provider-configuration]]
+
+Add exactly one provider starter. Each starter auto-configures all its model beans at startup and will fail if its API key is missing — do not include a starter without a configured key.
+
+=== Anthropic (Claude)
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-model-anthropic</artifactId>
+</dependency>
+----
+
+[source,properties]
+----
+ai.chat.provider=anthropic
+spring.ai.anthropic.api-key=${ANTHROPIC_API_KEY}
+spring.ai.anthropic.chat.options.model=claude-sonnet-4-5-20250929
+spring.ai.anthropic.chat.options.temperature=0.3
+spring.ai.anthropic.chat.options.max-tokens=4096
+----
+
+=== OpenAI (GPT)
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-model-openai</artifactId>
+</dependency>
+----
+
+[source,properties]
+----
+ai.chat.provider=openai
+spring.ai.openai.api-key=${OPENAI_API_KEY}
+spring.ai.openai.chat.options.model=gpt-4o
+spring.ai.openai.chat.options.temperature=0.3
+spring.ai.openai.chat.options.max-tokens=4096
+----
+
+=== Gemini (Google)
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-model-google-genai</artifactId>
+</dependency>
+----
+
+[source,properties]
+----
+ai.chat.provider=gemini
+spring.ai.google.genai.api-key=${GEMINI_API_KEY}
+spring.ai.google.genai.chat.options.model=gemini-2.0-flash
+----
+
+NOTE: Gemini uses the Google Generative AI API with a simple API key — no GCP project, Vertex AI, or IAM setup required.
+
+== Document Upload
+
+To allow users to attach reference documents to their messages, add the Tika dependency:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-tika-document-reader</artifactId>
+</dependency>
+----
+
+Without this dependency the upload button remains visible but the server returns an error when a file is submitted. Omit the dependency if document upload is not needed — Tika pulls in Apache POI and PDFBox, which add significant classpath weight.
+
+== Configuration Reference
+
+=== Feature Properties (`ai.chat.*`)
+
+[cols="2,1,1,3",options="header"]
+|===
+|Property |Type |Default |Description
+
+|`ai.chat.enabled`
+|boolean
+|`false`
+|Master toggle. When `false`, no beans are created and no panel HTML is rendered.
+
+|`ai.chat.provider`
+|String
+|_(auto)_
+|Provider bean name prefix: `anthropic`, `openai`, `gemini`. When blank, the single available `ChatModel` bean is used automatically.
+
+|`ai.chat.rate-limit-per-minute`
+|int
+|`10`
+|Maximum LLM requests per user per minute.
+
+|`ai.chat.rate-limit-per-hour`
+|int
+|`100`
+|Maximum LLM requests per user per hour.
+
+|`ai.chat.max-message-length`
+|int
+|`10000`
+|Maximum user message length in characters. Longer messages are silently truncated.
+
+|`ai.chat.max-conversation-messages`
+|int
+|`50`
+|Maximum messages kept in conversation history. Oldest are trimmed first.
+
+|`ai.chat.max-file-size-bytes`
+|int
+|`10485760`
+|Maximum document file size before text extraction (10 MB). Larger files are rejected.
+
+|`ai.chat.max-document-chars`
+|int
+|`50000`
+|Maximum characters extracted per document. Text beyond this limit is truncated.
+
+|`ai.chat.max-documents-per-message`
+|int
+|`3`
+|Maximum documents a user can attach per message.
+
+|`ai.chat.max-images-per-message`
+|int
+|`5`
+|Maximum images a user can attach per message.
+
+|`ai.chat.max-image-bytes`
+|int
+|`5242880`
+|Maximum image file size in bytes (5 MB).
+
+|`ai.chat.system-prompt`
+|String
+|_(built-in)_
+|Base system prompt prepended to every LLM request. Override only if the built-in prompt does not fit your deployment.
+|===
+
+=== LLM Provider Properties (`spring.ai.*`)
+
+The most commonly configured options per provider:
+
+[cols="2,2,2",options="header"]
+|===
+|Property |Example value |Description
+
+|`spring.ai.anthropic.api-key`
+|`${ANTHROPIC_API_KEY}`
+|Anthropic API key.
+
+|`spring.ai.anthropic.chat.options.model`
+|`claude-sonnet-4-5-20250929`
+|Model ID. Pin to a specific version.
+
+|`spring.ai.anthropic.chat.options.temperature`
+|`0.3`
+|Sampling temperature (0.0–1.0).
+
+|`spring.ai.anthropic.chat.options.max-tokens`
+|`4096`
+|Maximum tokens per response.
+
+|`spring.ai.openai.api-key`
+|`${OPENAI_API_KEY}`
+|OpenAI API key.
+
+|`spring.ai.openai.chat.options.model`
+|`gpt-4o`
+|Model ID.
+
+|`spring.ai.openai.chat.options.temperature`
+|`0.3`
+|Sampling temperature.
+
+|`spring.ai.openai.chat.options.max-tokens`
+|`4096`
+|Maximum tokens per response.
+
+|`spring.ai.google.genai.api-key`
+|`${GEMINI_API_KEY}`
+|Google Generative AI API key.
+
+|`spring.ai.google.genai.chat.options.model`
+|`gemini-2.0-flash`
+|Model ID.
+|===
+
+== Observability
+
+To log full prompts and LLM responses:
+
+[source,properties]
+----
+logging.level.org.springframework.ai.chat.client.advisor=DEBUG
+----
+
+WARNING: This logs the complete system prompt and all user messages. Prompts contain editor variable definitions and user-submitted code — do not enable in environments where this data is sensitive.
+
+== Anti-Patterns
+
+[.unstyled]
+* {bad} **Multiple provider starters on the classpath** — each starter fails at startup if its API key is absent. Include exactly one.
+* {bad} **Hardcoded API keys in `application.properties`** — always use environment variable references (`${ANTHROPIC_API_KEY}`) and keep keys out of version control.
+* {bad} **`ai.chat.provider` set to a value with no matching bean** — causes `IllegalStateException` at startup. The value must match the starter included: `anthropic`, `openai`, or `gemini`.
+* {bad} **Enabling advisor DEBUG logging in production** — see <<observability>>.
+
+**Related:** <<_document-templates>> | <<_notifications>> | <<_offer-engine>> | <<_metric-covenant>>
