@@ -1,6 +1,8 @@
 package com.timvero.example.admin.client.entity;
 
 import com.timvero.base.entity.AbstractAuditable;
+import com.timvero.example.admin.application.entity.Application;
+import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.participant.entity.Participant;
 import com.timvero.example.admin.participant.entity.Participant_;
 import com.timvero.ground.entity.NamedEntity;
@@ -10,7 +12,11 @@ import jakarta.persistence.Embedded;
 import jakarta.persistence.Entity;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
+import java.util.LinkedHashSet;
+import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.hibernate.envers.Audited;
 import org.hibernate.search.mapper.pojo.mapping.definition.annotation.Indexed;
 import org.hibernate.search.mapper.pojo.mapping.definition.annotation.IndexedEmbedded;
@@ -50,6 +56,22 @@ public class Client extends AbstractAuditable implements NamedEntity, Notifiable
 
     public Set<Participant> getParticipants() {
         return participants;
+    }
+
+    @Transient
+    public Set<Application> getApplications() {
+        return getParticipants().stream()
+            .map(Participant::getApplication)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    @Transient
+    public Set<ExampleCredit> getCredits() {
+        return getApplications().stream()
+            .map(Application::getCredit)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     @Override

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:th="http://www.thymeleaf.org">
+<table class="table">
+    <thead>
+        <tr role="row">
+            <th style="width: 25%;" th:text="#{symbol.id}"></th>
+            <th style="width: 25%;" th:text="#{application.status}"></th>
+            <th style="width: 25%;" th:text="#{application.condition.amount}"></th>
+            <th style="width: 25%;" th:text="#{common.createdAt}"></th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr role="row" th:each="credit, iterStat : ${clientCredits}" th:object="${credit}">
+            <td>
+                <a th:href="@{'/credit/' + *{id}}"><span th:text="*{id}"></span></a>
+            </td>
+            <td>
+                <span th:text="*{#enums.name(actualSnapshot?.status)}" th:style="'color: '+*{#enums.name('credit.status.color', actualSnapshot?.status)}">Primary</span>
+            </td>
+            <td th:text="*{#monetary.format(application?.condition?.principal)}">
+                EUR 10000
+            </td>
+            <td th:text="*{#ldates.format(createdAt)}">
+                12/12/12 12:12
+            </td>
+        </tr>
+    </tbody>
+</table>
+</html>
