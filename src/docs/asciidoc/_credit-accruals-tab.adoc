@@ -166,38 +166,9 @@ Returns day count methods for time calculations (Actual/360, 30/360, etc.).
   - Calculating accruals for each range segment
   - Creating `AccrualRecord` for each period
 
-=== AbstractAccrualEngine - Simplification Example
-
-Example project provides `AbstractAccrualEngine` that simplifies `RangeBasedAccrualEngine` for the common case: **single fixed rate for entire credit term**.
-
-**Simplifies to 3 methods**:
-
-[source,java]
-----
-public abstract String getAccrualAccount();
-protected abstract Set<String> getBasisAccounts();
-protected abstract BigDecimal getFeeRate(ExampleCredit credit);
-----
-
-**What it implements**:
-
-* **`getBasisRanges()`** - sums balances from `getBasisAccounts()`
-* **`getLoanRateRanges()`** - returns single rate from `getFeeRate()` starting at credit start date
-* **`getFixAccuralDays()`** - uses payment schedule dates
-* **`getDayCounters()`** - creates `DayCounter` from credit conditions
-
-**When to use**: Most typical accrual scenarios (interest on principal, late fees on overdue amounts) with constant rates.
-
 == Complete Accrual Engine Implementation Examples
 
-=== Example 1: Abstract Accrual Engine
-
-[source,java]
-----
-include::{sourcedir}/operation/accrual/AbstractAccrualEngine.java[tags=class]
-----
-
-=== Example 2: Interest Accrual Engine
+=== Example 1: Interest Accrual Engine
 
 This example shows a complete implementation for calculating interest accruals on principal balance:
 
@@ -211,9 +182,9 @@ Key points:
 * **Basis Accounts**: `PRINCIPAL` - interest accrues on principal balance
 * **Fee Rate**: Uses the interest rate from credit condition
 
-=== Example 3: Late Fee Accrual Engine
+=== Example 2: Late Fee Accrual Engine
 
-This example shows implementation for calculating late fees on past due amounts:
+This example shows implementation for calculating late fees on past due amounts. Late fees use a different base interface (`AccrualEngine` directly, not `RecordableAccrualEngine`) because they only accrue when past-due debt exists — so they are calculated separately and do not appear in the accruals tab.
 
 [source,java]
 ----

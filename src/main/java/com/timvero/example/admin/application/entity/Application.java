@@ -28,6 +28,7 @@ import jakarta.persistence.Table;
 import java.util.HashSet;
 import java.util.Set;
 import org.hibernate.envers.Audited;
+import org.hibernate.envers.NotAudited;
 
 @Entity
 @Table
@@ -52,6 +53,7 @@ public class Application extends AbstractAuditable implements NamedEntity, HasNo
     private PaymentSchedule paymentSchedule;
 
     @OneToOne(fetch = FetchType.LAZY, mappedBy = ExampleCredit_.APPLICATION)
+    @NotAudited
     private ExampleCredit credit;
 
     public ApplicationStatus getStatus() {
