@@ -1,12 +1,15 @@
 package com.timvero.example.admin.operation.pastdue;
 
 
+import com.timvero.example.admin.credit.CreditCalculationConfiguration;
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.product.engine.SimpleScheduledEngine;
 import com.timvero.example.admin.scheduled.ExampleCreditCondition;
 import com.timvero.ground.util.EntityUtils;
 import com.timvero.ground.util.Lang;
 import com.timvero.loan.engine.mutator.Mutator;
+import com.timvero.scheduled.entity.PaymentSchedule;
+import com.timvero.scheduled.entity.PaymentSegment;
 import com.timvero.servicing.PreCalculateSynchronizer;
 import com.timvero.servicing.credit.entity.Credit;
 import com.timvero.servicing.credit.entity.CreditSnapshot;
@@ -31,6 +34,7 @@ import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.SequencedMap;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import javax.money.MonetaryAmount;
@@ -171,6 +175,37 @@ public class PastDueOperationService implements CreditOperationHandler<PastDueOp
     public boolean isPastDue(SnapshotRecord creditSnapshot) {
         final Map<String, MonetaryAmount> accounts = creditSnapshot.debt().getAccounts();
         return SHIFT_ACCOUNTS.values().stream().anyMatch(accounts::containsKey);
+    }
+
+    public LocalDate getPaidUntil(ExampleCredit credit) {
+        if (credit.getActualSnapshot() == null) {
+            return null;
+        }
+        LocalDate pastDue = null;
+        for (CreditSnapshot snapshot : new TreeMap<>(credit.getCreditSnapshots()).descendingMap().values()) {
+            if (isPastDue(snapshot)) {
+                pastDue = snapshot.getDate().minusDays(1);
+            } else {
+                break;
+            }
+        }
+        if (pastDue != null) {
+            return pastDue;
+        }
+        MonetaryAmount principal = credit.getActualSnapshot().getDebt().getAccounts()
+            .get(CreditCalculationConfiguration.PRINCIPAL);
+        if (principal != null) {
+            PaymentSchedule schedule = credit.getApplication().getPaymentSchedule();
+            if (schedule != null) {
+                for (PaymentSegment payment : schedule.getPayments()
+                    .tailMap(credit.getActualSnapshot().getDate(), true).values()) {
+                    if (payment.getRemainingPrincipal().isLessThan(principal)) {
+                        return payment.getDate();
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     public Optional<MonetaryAmount> getPastDueTotal(CreditSnapshot creditSnapshot) {

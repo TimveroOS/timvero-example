@@ -21,6 +21,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import javax.money.MonetaryAmount;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -34,6 +35,9 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
     private PaymentTransactionRepository transactionRepository;
     @Autowired
     private ChargeOperationService chargeOperationService;
+    @Autowired
+    @Lazy
+    private BorrowerTransactionService self;
 
     @Transactional(propagation = Propagation.MANDATORY)
     public void proceedCustom(ExampleCredit credit, TransactionType type, PaymentMethod paymentMethod,
@@ -56,38 +60,43 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
     @Override
     public void handle(PaymentTransaction t) {
         t = EntityUtils.initializeAndUnproxy(t);
-        if (t instanceof BorrowerTransaction transaction) {
-            if (transaction.getStatus() == TransactionStatus.SUCCEED) {
-                ExampleCredit credit = transaction.getCredit();
-                if (credit == null) {
-                    credit = findApplicableCredit(transaction);
-                }
-                if (transaction.getOperation() != null) {
-                    transaction.getOperation().setStatus(OperationStatus.APPROVED);
-                }
-                LocalDate date;
-                if (transaction.getPaymentMethod() != null && transaction
-                    .getPaymentMethod() instanceof LiquidityClientPaymentMethod LiquidityClientPaymentMethod) {
-                    date = LiquidityClientPaymentMethod.getProcessedDate();
-                    transaction.setService(LiquidityClientPaymentMethod.getType());
-                } else {
-                    date = (transaction.getCompletedAt() != null ? transaction.getCompletedAt() : Instant.now())
-                        .atZone(ZoneId.systemDefault()).toLocalDate();
-                }
-
-                if (transaction.getOperation() != null) {
-                    return;
-                }
-
-                transactionRepository.saveAndFlush(transaction);
-                CreditOperation operation = switch (transaction.getType()) {
-                    case OUTGOING -> handleOutgoing(credit, transaction, date);
-                    default -> throw new IllegalArgumentException(
-                        "Unexpected transaction type: " + transaction.getType());
-                };
-                transaction.setOperation(operation);
-            }
+        if (t instanceof BorrowerTransaction transaction
+            && transaction.getStatus() == TransactionStatus.SUCCEED) {
+            Long transactionId = transaction.getId();
+            TransactionUtils.afterTransaction(() -> self.applyOperation(transactionId));
         }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void applyOperation(Long transactionId) {
+        BorrowerTransaction transaction = (BorrowerTransaction) transactionRepository.getSync(transactionId);
+        if (transaction.getStatus() != TransactionStatus.SUCCEED) {
+            return;
+        }
+        if (transaction.getOperation() != null) {
+            transaction.getOperation().setStatus(OperationStatus.APPROVED);
+            return;
+        }
+        ExampleCredit credit = transaction.getCredit();
+        if (credit == null) {
+            credit = findApplicableCredit(transaction);
+        }
+        LocalDate date;
+        if (transaction.getPaymentMethod() instanceof LiquidityClientPaymentMethod lcpm) {
+            date = lcpm.getProcessedDate();
+        } else {
+            date = (transaction.getCompletedAt() != null ? transaction.getCompletedAt() : Instant.now())
+                .atZone(ZoneId.systemDefault()).toLocalDate();
+        }
+        CreditOperation operation = switch (transaction.getType()) {
+            case OUTGOING -> handleOutgoing(credit, transaction, date);
+            default -> throw new IllegalArgumentException(
+                "Unexpected transaction type: " + transaction.getType());
+        };
+        if (transaction.getPaymentMethod() instanceof LiquidityClientPaymentMethod lcpm) {
+            transaction.setService(lcpm.getType());
+        }
+        transaction.setOperation(operation);
     }
 
     private ExampleCredit findApplicableCredit(BorrowerTransaction transaction) {
