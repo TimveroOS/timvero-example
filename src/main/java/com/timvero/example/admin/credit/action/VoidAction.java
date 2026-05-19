@@ -1,5 +1,7 @@
 package com.timvero.example.admin.credit.action;
 
+import static com.timvero.example.admin.credit.CreditCalculationConfiguration.PENDING;
+
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.operation.void_credit.VoidOperationService;
 import com.timvero.ground.action.EntityAction;
@@ -21,7 +23,8 @@ public class VoidAction extends SimpleActionController<UUID, ExampleCredit> {
 
     @Override
     protected EntityAction<? super ExampleCredit, Object> action() {
-        return when(c -> c.getActualSnapshot() != null && !c.getActualSnapshot().getStatus().isEnding() && c.getActualSnapshot().getDebt().getTotal().isEmpty())
+        return when(c -> c.getActualSnapshot() != null && c.getActualSnapshot().getStatus().equals(PENDING)
+                && c.getActualSnapshot().getDate().equals(LocalDate.now()))
             .then((c, f, u) -> {
                 voidOperationService.createAndSaveOperation(c.getId(), LocalDate.now());
             });
