@@ -1081,21 +1081,21 @@ public class AddTransactionClientAction
     protected EntityAction<? super Client, ClientTransactionForm> action() {
         return when(client -> true)
             .then((client, form, user) -> {
-                // 1. Create transaction
-                PaymentHubTransaction transaction = new PaymentHubTransaction();
-                transaction.setType(TransactionType.INCOMING);
+                // 1. Create transaction (constructor-based init — v8.2)
+                PaymentHubTransaction transaction = new PaymentHubTransaction(
+                    client.getId(),
+                    CreditCalculationConfiguration.GENERAL_PURPOSE,
+                    TransactionType.INCOMING,
+                    form.getAmount(),
+                    form.getDocumentNumber(),
+                    new HubPaymentMethod(form.getDocumentNumber())
+                );
                 transaction.setStatus(TransactionStatus.SUCCEED);
-                transaction.setPurpose(CreditCalculationConfiguration.GENERAL_PURPOSE);
-                transaction.setAmount(form.getAmount());
-                transaction.setOwnerId(client.getId());
 
-                // 2. Optional: payment document data
-                transaction.setPaymentMethod(new HubPaymentMethod(form.getDocumentNumber()));
-
-                // 3. Save
+                // 2. Save
                 transaction = transactionRepository.save(transaction);
 
-                // 4. Redirect to transaction page
+                // 3. Redirect to transaction page
                 setRedirectToPath("/transaction/" + transaction.getId());
             });
     }

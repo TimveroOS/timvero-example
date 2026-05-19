@@ -20,5 +20,5 @@ public interface ExampleCreditRepository extends JpaRepository<ExampleCredit, UU
         """)
     Stream<ExampleCredit> getAllByAdditiveId(Long additiveId);
 
-    ExampleCredit findByOperationsIn(CreditOperation... operation);
+    ExampleCredit findByOperationsContaining(CreditOperation operation);
 }

@@ -81,7 +81,7 @@ public class GithubDataSource implements MappedDataSource<GithubDataSourceSubjec
     public static final String DATASOURCE_NAME = "github";
     
     private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final JsonMapper objectMapper = JsonMapper.builder().build();
     private final String GITHUB_API_BASE_URL = "https://api.github.com";
 ----
 
@@ -90,7 +90,7 @@ public class GithubDataSource implements MappedDataSource<GithubDataSourceSubjec
 * **`@Service` with name** - Makes DataSource discoverable by the platform
 * **Constant naming** - Consistent reference for DataSource identification
 * **RestTemplate** - Spring's HTTP client for API calls
-* **ObjectMapper** - Jackson for JSON parsing with flexible configuration
+* **JsonMapper** - Jackson 3 JSON mapper built via builder for flexible configuration
 
 === HTTP Configuration
 

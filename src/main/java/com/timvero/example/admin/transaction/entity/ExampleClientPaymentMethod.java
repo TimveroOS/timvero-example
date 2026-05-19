@@ -12,10 +12,10 @@ import javax.money.MonetaryAmount;
 import org.hibernate.annotations.Type;
 
 @Entity
-@DiscriminatorValue(LiquidityClientPaymentMethod.TYPE)
-public class LiquidityClientPaymentMethod extends PaymentMethod {
+@DiscriminatorValue(ExampleClientPaymentMethod.TYPE)
+public class ExampleClientPaymentMethod extends PaymentMethod {
 
-    public static final String TYPE = LiquidityPaymentGateway.GATEWAY_TYPE;
+    public static final String TYPE = ExamplePaymentGateway.GATEWAY_TYPE;
 
     @Column(name = "processed_date")
     private LocalDate processedDate;
@@ -30,10 +30,10 @@ public class LiquidityClientPaymentMethod extends PaymentMethod {
     @Column(name = "transaction_type")
     private TransactionType transactionType;
 
-    protected LiquidityClientPaymentMethod() {
+    protected ExampleClientPaymentMethod() {
     }
 
-    public LiquidityClientPaymentMethod(LocalDate processedDate, MonetaryAmount amount, TransactionType transactionType,
+    public ExampleClientPaymentMethod(LocalDate processedDate, MonetaryAmount amount, TransactionType transactionType,
         String ownerName) {
         super(TYPE);
         this.processedDate = processedDate;

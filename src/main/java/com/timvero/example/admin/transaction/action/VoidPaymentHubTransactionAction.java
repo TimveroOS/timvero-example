@@ -47,7 +47,7 @@ public class VoidPaymentHubTransactionAction extends EntityActionController<Long
                 entityManager.clear();
 
                 for (CreditPayment payment : payments) {
-                    ExampleCredit credit = creditRepository.findByOperationsIn(payment);
+                    ExampleCredit credit = creditRepository.findByOperationsContaining(payment);
                     creditCalculationService.calculate(credit.getId(), credit.getStartDate(), credit.getCalculationDate());
                 }
             });

@@ -29,14 +29,12 @@ public class BorrowerTransaction extends PaymentTransaction {
     @NotAudited
     private CreditOperation operation;
 
-    public BorrowerTransaction() {}
+    protected BorrowerTransaction() {}
 
     public BorrowerTransaction(TransactionType type, MonetaryAmount amount, PaymentMethod paymentMethod,
         ExampleCredit credit) {
-        setType(type);
-        setAmount(amount);
+        super(type, amount, credit.getId().toString(), paymentMethod);
         this.credit = credit;
-        setPaymentMethod(paymentMethod);
     }
 
     public ExampleCredit getCredit() {
@@ -49,11 +47,6 @@ public class BorrowerTransaction extends PaymentTransaction {
 
     public void setOperation(CreditOperation operation) {
         this.operation = operation;
-    }
-
-    @Override
-    public String getOrderId() {
-        return getCredit().getId().toString();
     }
 
 }

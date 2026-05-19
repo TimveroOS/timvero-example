@@ -4,7 +4,7 @@ import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.operation.charge.ChargeOperation;
 import com.timvero.example.admin.operation.charge.ChargeOperationService;
 import com.timvero.example.admin.transaction.entity.BorrowerTransaction;
-import com.timvero.example.admin.transaction.entity.LiquidityClientPaymentMethod;
+import com.timvero.example.admin.transaction.entity.ExampleClientPaymentMethod;
 import com.timvero.ground.util.EntityUtils;
 import com.timvero.ground.util.TransactionUtils;
 import com.timvero.servicing.credit.entity.operation.CreditOperation;
@@ -82,7 +82,7 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
             credit = findApplicableCredit(transaction);
         }
         LocalDate date;
-        if (transaction.getPaymentMethod() instanceof LiquidityClientPaymentMethod lcpm) {
+        if (transaction.getPaymentMethod() instanceof ExampleClientPaymentMethod lcpm) {
             date = lcpm.getProcessedDate();
         } else {
             date = (transaction.getCompletedAt() != null ? transaction.getCompletedAt() : Instant.now())
@@ -93,9 +93,6 @@ public class BorrowerTransactionService implements PaymentTransactionHandler {
             default -> throw new IllegalArgumentException(
                 "Unexpected transaction type: " + transaction.getType());
         };
-        if (transaction.getPaymentMethod() instanceof LiquidityClientPaymentMethod lcpm) {
-            transaction.setService(lcpm.getType());
-        }
         transaction.setOperation(operation);
     }
 

@@ -41,14 +41,15 @@ public class AddTransactionClientAction extends EntityActionController<UUID, Cli
     protected EntityAction<? super Client, ClientTransactionForm> action() {
         return when(client -> true)
             .then((c, f, u) -> {
-                PaymentHubTransaction transaction = new PaymentHubTransaction();
-
-                transaction.setType(TransactionType.INCOMING);
+                PaymentHubTransaction transaction = new PaymentHubTransaction(
+                    c.getId(),
+                    CreditCalculationConfiguration.GENERAL_PURPOSE,
+                    TransactionType.INCOMING,
+                    f.getAmount(),
+                    f.getDocumentNumber(),
+                    new HubPaymentMethod(f.getDocumentNumber())
+                );
                 transaction.setStatus(TransactionStatus.SUCCEED);
-                transaction.setPurpose(CreditCalculationConfiguration.GENERAL_PURPOSE);
-                transaction.setAmount(f.getAmount());
-                transaction.setPaymentMethod(new HubPaymentMethod(f.getDocumentNumber()));
-                transaction.setOwnerId(c.getId());
 
                 transaction = transactionRepository.save(transaction);
 

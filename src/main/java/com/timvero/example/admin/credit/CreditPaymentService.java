@@ -22,12 +22,12 @@ public class CreditPaymentService {
 
     //@todo it breaks action  @Transactional(propagation = Propagation.MANDATORY)
     public Credit getCreditForPayment(CreditPayment payment) {
-        return creditRepository.findByOperationsIn(payment);
+        return creditRepository.findByOperationsContaining(payment);
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
     public boolean movePaymentDate(CreditPayment payment, LocalDate newDate) {
-        Credit credit = creditRepository.findByOperationsIn(payment);
+        Credit credit = creditRepository.findByOperationsContaining(payment);
         LocalDate calcDate = Lang.min(payment.getDate(), newDate);
         payment.setDate(newDate);
         calculationService.calculate(credit.getId(), calcDate, credit.getCalculationDate());

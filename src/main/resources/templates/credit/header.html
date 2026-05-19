@@ -8,13 +8,15 @@
         <li class="card-info__item d-flex">
           <span class="card-info__property" th:text="#{credit.application}"></span>
           <span class="card-info__value">
-            <a th:href="@{*{@pathRegistry.getPath(application)}}">link</a>
+            <a th:with="applicationPath = *{@pathRegistry.getPath(application)}"
+               th:href="@{${applicationPath}}">link</a>
           </span>
         </li>
         <li class="card-info__item d-flex">
           <span class="card-info__property" th:text="#{credit.borrower}"></span>
           <span class="card-info__value">
-            <a th:href="@{*{@pathRegistry.getPath(application.borrowerParticipant.client)}}"
+            <a th:with="borrowerPath = *{@pathRegistry.getPath(application.borrowerParticipant.client)}"
+               th:href="@{${borrowerPath}}"
                th:text="*{application.borrowerParticipant.client.displayedName}"></a>
           </span>
         </li>
@@ -72,66 +74,6 @@
           <span class="card-info__property" th:text="#{credit.product.lateFeeRate}"></span>
           <span class="card-info__value" th:text="${product.lateFeeRate + '%'}"></span>
         </li>
-      </ul>
-    </div>
-    <div class="card-info d-flex pl-20 pb-15">
-      <ul class="card-info__body d-flex">
-        <!-- <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.paidPrincipal}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPaidPrincipal(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.paidInterest}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPaidInterest(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.paidTotal}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPaidTotal(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.outstandingPrincipal}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getOutstandingPrincipal(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.outstandingInterest}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getOutstandingInterest(liquidityCredit))}"></span>
-        </li> -->
-      </ul>
-    </div>
-    <div class="card-info d-flex pl-20 pb-15">
-      <ul class="card-info__body d-flex">
-        <!-- <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.pastDuePrincipal}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPastDuePrincipal(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.pastDueInterest}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPastDueInterest(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.pastDueTotal}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getPastDueTotal(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.delayDays}"></span>
-          <span class="card-info__value" th:text="${@creditSummaryService.getDaysPastDue(liquidityCredit)}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.unpaidLateFee}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getUnpaidLateFee(liquidityCredit))}"></span>
-        </li> -->
-      </ul>
-    </div>
-    <div class="card-info d-flex pl-20 pb-15">
-      <ul class="card-info__body d-flex">
-        <!-- <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.unpaidMonitoringFee}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getUnpaidMonitoringFee(liquidityCredit))}"></span>
-        </li>
-        <li class="card-info__item d-flex">
-          <span class="card-info__property" th:text="#{credit.overpayment}"></span>
-          <span class="card-info__value" th:text="${#monetary.format(@creditSummaryService.getOverpayment(liquidityCredit).negate())}"></span>
-        </li> -->
       </ul>
     </div>
   </div>

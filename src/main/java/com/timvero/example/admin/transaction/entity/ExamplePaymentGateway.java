@@ -8,7 +8,7 @@ import javax.money.MonetaryAmount;
 import org.springframework.stereotype.Component;
 
 @Component
-public class LiquidityPaymentGateway implements PaymentGateway {
+public class ExamplePaymentGateway implements PaymentGateway {
 
     public static final String GATEWAY_TYPE = "XMPL";
 

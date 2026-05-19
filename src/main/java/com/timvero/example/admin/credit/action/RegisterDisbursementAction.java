@@ -6,7 +6,7 @@ import static com.timvero.example.admin.credit.CreditCalculationConfiguration.PE
 import com.timvero.example.admin.credit.action.RegisterDisbursementAction.ManualDisbursementForm;
 import com.timvero.example.admin.credit.entity.ExampleCredit;
 import com.timvero.example.admin.transaction.BorrowerTransactionService;
-import com.timvero.example.admin.transaction.entity.LiquidityClientPaymentMethod;
+import com.timvero.example.admin.transaction.entity.ExampleClientPaymentMethod;
 import com.timvero.ground.action.EntityAction;
 import com.timvero.transfer.transaction.entity.TransactionType;
 import com.timvero.web.common.action.EntityActionController;
@@ -33,8 +33,8 @@ public class RegisterDisbursementAction extends EntityActionController<UUID, Exa
     protected EntityAction<? super ExampleCredit, ManualDisbursementForm> action() {
         return when(c -> c.getActualSnapshot() != null && c.getActualSnapshot().getStatus().equals(PENDING))
             .then((c, f, u) -> {
-                LiquidityClientPaymentMethod paymentMethod =
-                    new LiquidityClientPaymentMethod(f.getProcessedDate(), c.getCondition().getPrincipal(), TransactionType.OUTGOING,
+                ExampleClientPaymentMethod paymentMethod =
+                    new ExampleClientPaymentMethod(f.getProcessedDate(), c.getCondition().getPrincipal(), TransactionType.OUTGOING,
                         c.getApplication().getBorrowerParticipant().getClient().getIndividualInfo().getFullName());
                 borrowerTransactionService.proceedCustom(c, TransactionType.OUTGOING, paymentMethod,
                     paymentMethod.getAmount(), true, f.getDescription());
