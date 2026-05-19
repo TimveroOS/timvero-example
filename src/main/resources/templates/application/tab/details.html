@@ -14,7 +14,8 @@
         </th:block>
         <th:block th:if="*{credit}">
             <dt th:text="#{application.credit}">Credit</dt>
-            <dd><a th:href="@{*{@pathRegistry.getPath(credit)}}">link</a></dd>
+            <dd><a th:with="creditPath = *{@pathRegistry.getPath(credit)}"
+                   th:href="@{${creditPath}}">link</a></dd>
         </th:block>
     </dl>
 </section>
