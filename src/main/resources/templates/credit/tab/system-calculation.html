@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
+<div
+    th:unless="${#lists.isEmpty(snapshots)}"
+    class="card-body"
+>
+    <table class="table table-layout-fixed">
+        <thead>
+        <tr>
+            <th th:text="#{credit.snapshot.date}"></th>
+            <th th:text="#{credit.snapshot.operation}"></th>
+            <th class="text-right" th:each="account : ${accounts}" th:text="${#enums.name('debt.account', account)}"></th>
+        </tr>
+        </thead>
+        <tbody>
+            <th:block th:each="snapshot, snapshotIdx : ${snapshots}">
+                <!-- Snapshot debt row -->
+                <tr th:styleappend="${snapshot.date == today ? 'border: 1px solid gray;' : ''}">
+                    <td th:text="${#ldates.format(snapshot.date)}"></td>
+                    <td></td>
+                    <td class="text-right" th:each="account : ${accounts}">
+                        <span th:if="${snapshot.debt}" th:text="${#monetary.format(snapshot.debt?.accounts.get(account))?:'-'}"></span>
+                    </td>
+                </tr>
+                <!-- Operation row + distribution rows -->
+                <th:block th:each="operation, opIdx : ${snapshot.operations}">
+                    <tr class="collapsed" th:attr="data-toggle=${not #lists.isEmpty(operation.distributions) ? 'collapse' : null},data-target=${not #lists.isEmpty(operation.distributions) ? '.dist-' + snapshotIdx.index + '-' + opIdx.index : null}"
+                        th:styleappend="${not #lists.isEmpty(operation.distributions) ? 'cursor: pointer;' : ''}">
+                        <td>
+                            <th:block th:if="${not #lists.isEmpty(operation.distributions)}">
+                                <div class="collapse-btn">
+                                    <th:block th:insert="~{/icons/icons :: toggleArrow}"></th:block>
+                                </div>
+                            </th:block>
+                        </td>
+                        <td>
+                            <span class="text-muted"
+                                th:text="${operation.type == null}
+                                ? #{credit.operation.accruing-obligations}
+                                : ${#enums.name('credit.operation', operation.type)}"></span>
+                        </td>
+                        <td class="text-right" th:each="account : ${accounts}">
+                            <span class="text-muted" th:text="${#monetary.format(operation.change?.accounts.get(account))?:'-'}"></span>
+                        </td>
+                    </tr>
+                    <tr th:each="dist : ${operation.distributions}"
+                        th:classappend="${'collapse multi-collapse dist-' + snapshotIdx.index + '-' + opIdx.index}">
+                        <td></td>
+                        <td th:title="${#ldates.format(dist.ditributedAt)}" th:text="${#ldates.format(dist.ditributedAt)}"></td>
+                        <td class="text-right" th:each="account : ${accounts}"
+                            th:text="${#monetary.format(dist.debt?.accounts.get(account))?:'-'}"></td>
+                    </tr>
+                </th:block>
+            </th:block>
+        </tbody>
+    </table>
+</div>
+</html>
