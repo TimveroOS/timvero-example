@@ -23,8 +23,7 @@ public class VoidAction extends SimpleActionController<UUID, ExampleCredit> {
 
     @Override
     protected EntityAction<? super ExampleCredit, Object> action() {
-        return when(c -> c.getActualSnapshot() != null && c.getActualSnapshot().getStatus().equals(PENDING)
-                && c.getActualSnapshot().getDate().equals(LocalDate.now()))
+        return when(c -> c.getActualSnapshot() != null && c.getActualSnapshot().getStatus().equals(PENDING))
             .then((c, f, u) -> {
                 voidOperationService.createAndSaveOperation(c.getId(), LocalDate.now());
             });
