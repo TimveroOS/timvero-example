@@ -35,8 +35,7 @@ public class CloseAction extends EntityActionController<UUID, ExampleCredit, Clo
 
     @Override
     protected EntityAction<? super ExampleCredit, CloseForm> action() {
-        return when(c -> creditPaidLabel.isEntityMarked(c) && !c.getActualSnapshot().getStatus().isEnding()
-                && c.getActualSnapshot().getDate().equals(LocalDate.now()))
+        return when(c -> creditPaidLabel.isEntityMarked(c) && !c.getActualSnapshot().getStatus().isEnding())
             .then((c, f, u) -> {
                 closeOperationService.createAndSaveOperation(c.getId(), f.getCloseDate());
             });
